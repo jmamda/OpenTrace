@@ -260,6 +260,107 @@ impl Store {
         Ok(results)
     }
 
+    /// Query without a row limit — returns all matching records ordered oldest first.
+    /// Intended for `trace export` where the caller streams results to stdout.
+    pub fn query_all_filtered(&self, filter: &QueryFilter) -> Result<Vec<CallRecord>> {
+        let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
+        let model_filter: Option<String> = filter.model.as_deref()
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let since: Option<String> = filter.since.clone();
+        let until: Option<String> = filter.until.clone();
+
+        let sql = format!("
+            SELECT {SELECT_COLS}
+            FROM calls
+            WHERE (?1 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
+              AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
+              AND (?3 IS NULL OR timestamp >= ?3)
+              AND (?4 IS NULL OR timestamp <= ?4)
+            ORDER BY timestamp ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![errors_only_flag, model_filter, since, until],
+            row_to_record,
+        )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Compute p50 / p95 / p99 latency (in ms) across all matching calls.
+    /// Returns (0.0, 0.0, 0.0) when the database is empty.
+    pub fn latency_percentiles(&self, filter: &QueryFilter) -> Result<(f64, f64, f64)> {
+        let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
+        let model_filter: Option<String> = filter.model.as_deref()
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let since = filter.since.clone();
+        let until = filter.until.clone();
+
+        let sql = "
+            SELECT latency_ms FROM calls
+            WHERE (?1 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
+              AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
+              AND (?3 IS NULL OR timestamp >= ?3)
+              AND (?4 IS NULL OR timestamp <= ?4)
+            ORDER BY latency_ms ASC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let latencies: Vec<u64> = stmt
+            .query_map(params![errors_only_flag, model_filter, since, until], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if latencies.is_empty() {
+            return Ok((0.0, 0.0, 0.0));
+        }
+
+        let n = latencies.len();
+        let p50 = latencies[(n * 50 / 100).min(n - 1)] as f64;
+        let p95 = latencies[(n * 95 / 100).min(n - 1)] as f64;
+        let p99 = latencies[(n * 99 / 100).min(n - 1)] as f64;
+
+        Ok((p50, p95, p99))
+    }
+
+    /// Returns a map of model → (p50, p95, p99) latency in ms.
+    /// Used by `trace stats --breakdown` to add a p99 column per model.
+    pub fn latency_percentiles_per_model(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (f64, f64, f64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT model, latency_ms FROM calls ORDER BY model ASC, latency_ms ASC")?;
+
+        let rows: Vec<(String, u64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut by_model: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (model, latency) in rows {
+            by_model.entry(model).or_default().push(latency);
+        }
+
+        let mut result = std::collections::HashMap::new();
+        for (model, latencies) in by_model {
+            let n = latencies.len();
+            let p50 = latencies[(n * 50 / 100).min(n - 1)] as f64;
+            let p95 = latencies[(n * 95 / 100).min(n - 1)] as f64;
+            let p99 = latencies[(n * 99 / 100).min(n - 1)] as f64;
+            result.insert(model, (p50, p95, p99));
+        }
+        Ok(result)
+    }
+
     /// Fetch a single record by full ID or unambiguous prefix.
     pub fn get_by_id(&self, id: &str) -> Result<Option<CallRecord>> {
         let sql = format!("SELECT {SELECT_COLS} FROM calls WHERE id LIKE ?1 || '%' LIMIT 1");
@@ -960,6 +1061,131 @@ mod tests {
         store.insert(&make_record("after", "gpt-4o", 200)).unwrap();
         let total = store.total_calls().unwrap();
         assert_eq!(total, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // total_calls
+    // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // query_all_filtered
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn query_all_filtered_returns_all_without_limit() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..15u32 {
+            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+        }
+        // query_filtered with limit=10 would only return 10; query_all_filtered returns all.
+        let all = store.query_all_filtered(&QueryFilter::default()).unwrap();
+        assert_eq!(all.len(), 15, "should return all records without a limit");
+    }
+
+    #[test]
+    fn query_all_filtered_model_filter_applied() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5u32 {
+            store.insert(&make_record(&format!("gpt-{i}"), "gpt-4o", 200)).unwrap();
+        }
+        for i in 0..3u32 {
+            store.insert(&make_record(&format!("cl-{i}"), "claude-opus-4", 200)).unwrap();
+        }
+        let filter = QueryFilter { model: Some("gpt".to_string()), ..Default::default() };
+        let results = store.query_all_filtered(&filter).unwrap();
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|r| r.model == "gpt-4o"));
+    }
+
+    #[test]
+    fn query_all_filtered_ordered_oldest_first() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mut r1 = make_record("first", "gpt-4o", 200);
+        r1.timestamp = "2024-01-01T00:00:00.000Z".to_string();
+        store.insert(&r1).unwrap();
+
+        let mut r2 = make_record("second", "gpt-4o", 200);
+        r2.timestamp = "2024-06-01T00:00:00.000Z".to_string();
+        store.insert(&r2).unwrap();
+
+        let results = store.query_all_filtered(&QueryFilter::default()).unwrap();
+        assert_eq!(results[0].id, "first");
+        assert_eq!(results[1].id, "second");
+    }
+
+    // -------------------------------------------------------------------------
+    // latency_percentiles
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn latency_percentiles_empty_db_returns_zeroes() {
+        let store = Store::open_in_memory().unwrap();
+        let (p50, p95, p99) = store.latency_percentiles(&QueryFilter::default()).unwrap();
+        assert_eq!(p50, 0.0);
+        assert_eq!(p95, 0.0);
+        assert_eq!(p99, 0.0);
+    }
+
+    #[test]
+    fn latency_percentiles_correct() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Insert 100 records with latencies 1..=100 ms.
+        // p50 index = 100*50/100 = 50 → latencies[50] = 51
+        // p95 index = 100*95/100 = 95 → latencies[95] = 96
+        // p99 index = 100*99/100 = 99 → latencies[99] = 100
+        for i in 1u64..=100u64 {
+            let mut r = make_record(&format!("id-{i}"), "gpt-4o", 200);
+            r.latency_ms = i;
+            store.insert(&r).unwrap();
+        }
+
+        let (p50, p95, p99) = store.latency_percentiles(&QueryFilter::default()).unwrap();
+        assert_eq!(p50, 51.0, "p50 should be 51ms");
+        assert_eq!(p95, 96.0, "p95 should be 96ms");
+        assert_eq!(p99, 100.0, "p99 should be 100ms");
+    }
+
+    #[test]
+    fn latency_percentiles_single_record() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("only", "gpt-4o", 200);
+        r.latency_ms = 500;
+        store.insert(&r).unwrap();
+        let (p50, p95, p99) = store.latency_percentiles(&QueryFilter::default()).unwrap();
+        assert_eq!(p50, 500.0);
+        assert_eq!(p95, 500.0);
+        assert_eq!(p99, 500.0);
+    }
+
+    #[test]
+    fn latency_percentiles_per_model_groups_correctly() {
+        let store = Store::open_in_memory().unwrap();
+
+        // 2 models, each with 10 records
+        for i in 1u64..=10u64 {
+            let mut r = make_record(&format!("gpt-{i}"), "gpt-4o", 200);
+            r.latency_ms = i * 100; // 100, 200, ..., 1000 ms
+            store.insert(&r).unwrap();
+        }
+        for i in 1u64..=10u64 {
+            let mut r = make_record(&format!("cl-{i}"), "claude-opus-4", 200);
+            r.latency_ms = i * 50; // 50, 100, ..., 500 ms
+            store.insert(&r).unwrap();
+        }
+
+        let map = store.latency_percentiles_per_model().unwrap();
+        assert!(map.contains_key("gpt-4o"), "gpt-4o should have percentiles");
+        assert!(map.contains_key("claude-opus-4"), "claude-opus-4 should have percentiles");
+
+        // gpt-4o p99 (10 records: 100..1000ms): index 10*99/100 = 9 → latencies[9] = 1000ms
+        let (_, _, gpt_p99) = map["gpt-4o"];
+        assert_eq!(gpt_p99, 1000.0);
+
+        // claude p99 (10 records: 50..500ms): latencies[9] = 500ms
+        let (_, _, cl_p99) = map["claude-opus-4"];
+        assert_eq!(cl_p99, 500.0);
     }
 
     // -------------------------------------------------------------------------

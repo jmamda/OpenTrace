@@ -229,8 +229,12 @@ pub fn extract_response_text_from_chunks(chunks: &[Bytes]) -> String {
 pub fn detect_provider(upstream: &str) -> String {
     if upstream.contains("anthropic") {
         "anthropic".to_string()
+    } else if upstream.contains("openai.azure.com") || upstream.contains("azure.com/openai") {
+        "azure-openai".to_string()
     } else if upstream.contains("openai") {
         "openai".to_string()
+    } else if upstream.contains("openrouter") {
+        "openrouter".to_string()
     } else if upstream.contains("together") {
         "together".to_string()
     } else if upstream.contains("groq") {
@@ -241,6 +245,14 @@ pub fn detect_provider(upstream: &str) -> String {
         "cohere".to_string()
     } else if upstream.contains("google") || upstream.contains("generativelanguage") {
         "google".to_string()
+    } else if upstream.contains("deepseek") {
+        "deepseek".to_string()
+    } else if upstream.contains("ollama")
+        || upstream.contains("localhost")
+        || upstream.contains("127.0.0.1")
+        || upstream.contains("::1")
+    {
+        "ollama".to_string()
     } else {
         "unknown".to_string()
     }
@@ -854,5 +866,33 @@ mod tests {
     fn detect_provider_anthropic_takes_priority_over_openai_if_both_present() {
         // Anthropic check comes first in the if-else chain.
         assert_eq!(detect_provider("https://anthropic-openai-bridge.example.com"), "anthropic");
+    }
+
+    #[test]
+    fn detect_provider_deepseek() {
+        assert_eq!(detect_provider("https://api.deepseek.com"), "deepseek");
+        assert_eq!(detect_provider("https://api.deepseek.com/v1"), "deepseek");
+    }
+
+    #[test]
+    fn detect_provider_azure_openai() {
+        assert_eq!(
+            detect_provider("https://myresource.openai.azure.com/openai/deployments/gpt-4o"),
+            "azure-openai"
+        );
+        // azure-openai must take priority over plain openai (more specific match first)
+        assert_eq!(detect_provider("https://foo.azure.com/openai/models"), "azure-openai");
+    }
+
+    #[test]
+    fn detect_provider_ollama_by_name() {
+        assert_eq!(detect_provider("http://ollama:11434"), "ollama");
+        assert_eq!(detect_provider("http://localhost:11434"), "ollama");
+        assert_eq!(detect_provider("http://127.0.0.1:11434"), "ollama");
+    }
+
+    #[test]
+    fn detect_provider_openrouter() {
+        assert_eq!(detect_provider("https://openrouter.ai/api/v1"), "openrouter");
     }
 }

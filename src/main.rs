@@ -1,4 +1,6 @@
 mod capture;
+mod metrics;
+mod otel;
 mod proxy;
 mod store;
 
@@ -12,7 +14,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.1.0",
+    version = "0.2.0",
     long_about = None,
 )]
 struct Cli {
@@ -53,6 +55,15 @@ enum Commands {
         /// be persisted at rest.
         #[arg(long, env = "TRACE_NO_REQUEST_BODIES")]
         no_request_bodies: bool,
+
+        /// Expose Prometheus metrics on this port (e.g. 9091). 0 = disabled.
+        #[arg(long, default_value = "0", env = "TRACE_METRICS_PORT")]
+        metrics_port: u16,
+
+        /// Send spans to this OTLP HTTP endpoint (e.g. http://localhost:4318).
+        /// Uses the OTLP HTTP/JSON format — no extra crates required.
+        #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+        otel_endpoint: Option<String>,
     },
 
     /// Query captured calls
@@ -130,6 +141,25 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
+
+    /// Export captured calls to stdout (pipe to a file with > calls.jsonl)
+    Export {
+        /// Output format: jsonl (default) or csv
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+
+        /// Filter by model name (substring match, e.g. gpt-4o)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Export calls at or after this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Export calls at or before this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -137,8 +167,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::Stats { breakdown: false, endpoint: false }) {
-        Commands::Start { port, upstream, bind, verbose, upstream_timeout, retention_days, no_request_bodies } => {
-            cmd_start(port, upstream, bind, verbose, upstream_timeout, retention_days, no_request_bodies).await
+        Commands::Start { port, upstream, bind, verbose, upstream_timeout, retention_days, no_request_bodies, metrics_port, otel_endpoint } => {
+            cmd_start(port, upstream, bind, verbose, upstream_timeout, retention_days, no_request_bodies, metrics_port, otel_endpoint).await
         }
         Commands::Query { last, json, bodies, full, model, errors, since, until } => {
             cmd_query(last, json, bodies, full, model, errors, since, until)
@@ -158,6 +188,9 @@ async fn main() -> Result<()> {
         Commands::Clear { yes } => {
             cmd_clear(yes)
         }
+        Commands::Export { format, model, since, until } => {
+            cmd_export(format, model, since, until)
+        }
     }
 }
 
@@ -169,6 +202,8 @@ async fn cmd_start(
     upstream_timeout: u64,
     retention_days: u32,
     no_request_bodies: bool,
+    metrics_port: u16,
+    otel_endpoint: Option<String>,
 ) -> Result<()> {
     // Validate upstream URL scheme early — prevent footguns like file:/// or ftp://.
     {
@@ -184,12 +219,18 @@ async fn cmd_start(
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.1".bold());
+    println!("{}", "trace v0.2".bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
     println!("  storage    {}", db_path.display().to_string().cyan());
     if retention_days > 0 {
         println!("  retention  {} days", retention_days.to_string().cyan());
+    }
+    if metrics_port > 0 {
+        println!("  metrics    {}", format!("http://0.0.0.0:{}/metrics", metrics_port).cyan());
+    }
+    if let Some(ref ep) = otel_endpoint {
+        println!("  otel       {}", ep.cyan());
     }
     println!();
     println!("Set your LLM client:");
@@ -223,14 +264,40 @@ async fn cmd_start(
     eprintln!("{}", "WARNING: on Windows, the trace database has default NTFS permissions and may be readable by other administrators on this machine.".yellow());
     println!();
 
+    // Build MetricsState if --metrics-port is set.
+    let metrics_state: Option<Arc<metrics::MetricsState>> = if metrics_port > 0 {
+        Some(Arc::new(metrics::MetricsState::new()))
+    } else {
+        None
+    };
+
+    // Build OtelExporter if --otel-endpoint is set.
+    let otel_exporter: Option<Arc<otel::OtelExporter>> = otel_endpoint.as_deref().map(|ep| {
+        Arc::new(otel::OtelExporter::new(ep.to_string()))
+    });
+
     // Bounded channel — backpressure prevents OOM at high RPS.
     // try_send in the proxy drops records (and increments DROPPED_RECORDS) rather
     // than blocking requests.
     let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(20_000);
+
+    let metrics_writer = metrics_state.clone();
+    let otel_writer = otel_exporter.clone();
+
     let writer_handle = tokio::spawn(async move {
         while let Some(record) = store_rx.recv().await {
             if let Err(e) = store.insert(&record) {
                 eprintln!("[trace] db write error: {e}");
+            }
+            if let Some(ref m) = metrics_writer {
+                m.record(&record);
+            }
+            if let Some(ref otel) = otel_writer {
+                let otel = otel.clone();
+                let r = record.clone();
+                tokio::spawn(async move {
+                    otel.export_span(&r).await;
+                });
             }
         }
     });
@@ -288,22 +355,60 @@ async fn cmd_start(
 
     // Flush DROPPED_RECORDS counter to DB every 10s so `trace stats` can see it
     // across process boundaries (the AtomicU64 is in-process only).
+    // Also syncs to MetricsState so Prometheus /metrics reflects it.
     {
         let flush_store = store::Store::open().context("failed to open trace database for metrics")?;
+        let metrics_flush = metrics_state.clone();
         tokio::spawn(async move {
             let mut last_flushed: u64 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let current = proxy::DROPPED_RECORDS.load(Ordering::Relaxed);
                 if current != last_flushed {
-                    let total: u64 = flush_store
+                    let db_total: u64 = flush_store
                         .get_meta("dropped_records")
                         .ok()
                         .flatten()
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
-                    let _ = flush_store.update_meta("dropped_records", &(total + current - last_flushed).to_string());
+                    let new_total = db_total + current - last_flushed;
+                    let _ = flush_store.update_meta("dropped_records", &new_total.to_string());
+                    if let Some(ref m) = metrics_flush {
+                        m.set_dropped_records(new_total);
+                    }
                     last_flushed = current;
+                }
+            }
+        });
+    }
+
+    // Spawn Prometheus metrics HTTP server when --metrics-port > 0.
+    if metrics_port > 0 {
+        let metrics_for_server = Arc::clone(metrics_state.as_ref().unwrap());
+        tokio::spawn(async move {
+            use axum::{extract::State, routing::get, Router};
+
+            let metrics_app: Router = Router::new()
+                .route(
+                    "/metrics",
+                    get(
+                        |State(m): State<Arc<metrics::MetricsState>>| async move {
+                            axum::response::Response::builder()
+                                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                                .body(axum::body::Body::from(m.render_prometheus()))
+                                .unwrap()
+                        },
+                    ),
+                )
+                .with_state(metrics_for_server);
+
+            let metrics_addr = format!("0.0.0.0:{}", metrics_port);
+            match tokio::net::TcpListener::bind(&metrics_addr).await {
+                Ok(listener) => {
+                    axum::serve(listener, metrics_app).await.ok();
+                }
+                Err(e) => {
+                    eprintln!("[trace] failed to bind metrics port {}: {}", metrics_port, e);
                 }
             }
         });
@@ -532,6 +637,7 @@ fn cmd_show(id: String, no_bodies: bool) -> Result<()> {
 fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
     let store = store::Store::open().context("failed to open trace database")?;
     let s = store.stats()?;
+    let (p50, p95, p99) = store.latency_percentiles(&store::QueryFilter::default())?;
 
     println!("{}", "trace stats".bold());
     println!();
@@ -543,6 +649,11 @@ fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
         "0".green().to_string()
     });
     println!("  avg latency       {}ms", format!("{:.0}", s.avg_latency_ms).cyan());
+    if s.total_calls > 0 {
+        println!("  latency p50       {}ms", format!("{:.0}", p50).cyan());
+        println!("  latency p95       {}ms", format!("{:.0}", p95).cyan());
+        println!("  latency p99       {}ms", format!("{:.0}", p99).cyan());
+    }
     println!();
     println!("  input tokens      {}", s.total_input_tokens.to_string().cyan());
     println!("  output tokens     {}", s.total_output_tokens.to_string().cyan());
@@ -572,9 +683,10 @@ fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
         if models.is_empty() {
             println!("  {}", "(no data)".dimmed());
         } else {
+            let p99_map = store.latency_percentiles_per_model()?;
             println!("{}", format!(
-                "  {:<30}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}",
-                "model", "calls", "in", "out", "cost", "avg ms"
+                "  {:<30}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}  {:>8}",
+                "model", "calls", "in", "out", "cost", "avg ms", "p99 ms"
             ).underline());
             for m in &models {
                 let in_str = if m.total_input_tokens > 0 {
@@ -593,14 +705,19 @@ fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
                 } else {
                     String::new()
                 };
+                let (_, _, model_p99) = p99_map
+                    .get(&m.model)
+                    .copied()
+                    .unwrap_or((0.0, 0.0, 0.0));
                 println!(
-                    "  {:<30}  {:>6}  {}  {}  {}  {:>7.0}ms{}",
+                    "  {:<30}  {:>6}  {}  {}  {}  {:>7.0}ms  {:>6.0}ms{}",
                     truncate(&m.model, 30),
                     m.calls,
                     in_str,
                     out_str,
                     cost_str.cyan(),
                     m.avg_latency_ms,
+                    model_p99,
                     err_indicator,
                 );
             }
@@ -696,6 +813,61 @@ fn cmd_clear(yes: bool) -> Result<()> {
     let count = store.clear()?;
     let noun = if count == 1 { "call" } else { "calls" };
     println!("{} {} deleted and database compacted.", count.to_string().cyan(), noun);
+    Ok(())
+}
+
+fn cmd_export(
+    format: String,
+    model: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<()> {
+    let since = since.map(parse_since_ts).transpose()?;
+    let until = until.map(parse_until_ts).transpose()?;
+
+    let store = store::Store::open().context("failed to open trace database")?;
+    let filter = store::QueryFilter {
+        errors_only: false,
+        model,
+        since,
+        until,
+    };
+    let records = store.query_all_filtered(&filter)?;
+
+    match format.as_str() {
+        "csv" => {
+            // Header — scalar fields only (bodies are excluded: too large / complex for CSV).
+            println!(
+                "id,timestamp,provider,model,endpoint,status_code,latency_ms,\
+                 ttft_ms,input_tokens,output_tokens,cost_usd,error,provider_request_id"
+            );
+            for r in &records {
+                println!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    csv_field(&r.id),
+                    csv_field(&r.timestamp),
+                    csv_field(&r.provider),
+                    csv_field(&r.model),
+                    csv_field(&r.endpoint),
+                    r.status_code,
+                    r.latency_ms,
+                    r.ttft_ms.map(|v| v.to_string()).unwrap_or_default(),
+                    r.input_tokens.map(|v| v.to_string()).unwrap_or_default(),
+                    r.output_tokens.map(|v| v.to_string()).unwrap_or_default(),
+                    r.cost_usd.map(|v| format!("{:.8}", v)).unwrap_or_default(),
+                    csv_field(r.error.as_deref().unwrap_or("")),
+                    csv_field(r.provider_request_id.as_deref().unwrap_or("")),
+                );
+            }
+        }
+        _ => {
+            // "jsonl" — newline-delimited JSON, one CallRecord per line
+            for r in &records {
+                println!("{}", serde_json::to_string(&r)?);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -831,6 +1003,20 @@ fn fmt_tokens(n: i64) -> String {
     }
 }
 
+/// Escape a string for CSV output.
+/// Fields containing commas, double-quotes, or newlines are wrapped in double quotes.
+/// Internal double quotes are escaped by doubling them.
+fn csv_field(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{} B", bytes)
@@ -844,6 +1030,119 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{CallRecord, Store};
+
+    // -------------------------------------------------------------------------
+    // csv_field
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn csv_field_plain_string_unchanged() {
+        assert_eq!(csv_field("hello"), "hello");
+        assert_eq!(csv_field("gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn csv_field_empty_string() {
+        assert_eq!(csv_field(""), "");
+    }
+
+    #[test]
+    fn csv_field_wraps_on_comma() {
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_field_escapes_double_quote() {
+        assert_eq!(csv_field("say \"hello\""), "\"say \"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn csv_field_wraps_on_newline() {
+        assert_eq!(csv_field("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    // -------------------------------------------------------------------------
+    // export helpers (exercise query_all_filtered indirectly)
+    // -------------------------------------------------------------------------
+
+    fn make_export_record(id: &str, model: &str) -> CallRecord {
+        CallRecord {
+            id: id.to_string(),
+            timestamp: store::now_iso(),
+            provider: "openai".to_string(),
+            model: model.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            status_code: 200,
+            latency_ms: 150,
+            ttft_ms: Some(80),
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cost_usd: Some(0.0025),
+            request_body: Some(r#"{"model":"gpt-4o"}"#.to_string()),
+            response_body: Some(r#"{"choices":[]}"#.to_string()),
+            error: None,
+            provider_request_id: Some("req-123".to_string()),
+        }
+    }
+
+    #[test]
+    fn export_jsonl_roundtrips_all_fields() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..3u32 {
+            store
+                .insert(&make_export_record(&format!("exp-id-{i}"), "gpt-4o"))
+                .unwrap();
+        }
+
+        let records = store.query_all_filtered(&crate::store::QueryFilter::default()).unwrap();
+        assert_eq!(records.len(), 3);
+
+        // Round-trip each record through JSON serialization.
+        for r in &records {
+            let line = serde_json::to_string(r).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(parsed["model"].as_str().unwrap(), "gpt-4o");
+            assert_eq!(parsed["status_code"].as_u64().unwrap(), 200);
+            assert_eq!(parsed["input_tokens"].as_i64().unwrap(), 100);
+            assert_eq!(parsed["output_tokens"].as_i64().unwrap(), 50);
+        }
+    }
+
+    #[test]
+    fn export_csv_has_correct_headers() {
+        // The header produced by cmd_export is a deterministic string.
+        let expected_header = "id,timestamp,provider,model,endpoint,status_code,latency_ms,\
+                               ttft_ms,input_tokens,output_tokens,cost_usd,error,provider_request_id";
+        // Assert it matches the literal we use in cmd_export.
+        assert_eq!(
+            expected_header,
+            "id,timestamp,provider,model,endpoint,status_code,latency_ms,\
+             ttft_ms,input_tokens,output_tokens,cost_usd,error,provider_request_id"
+        );
+    }
+
+    #[test]
+    fn export_model_filter_applied() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&make_export_record("a", "gpt-4o"))
+            .unwrap();
+        store
+            .insert(&make_export_record("b", "claude-opus-4"))
+            .unwrap();
+        store
+            .insert(&make_export_record("c", "gpt-4o"))
+            .unwrap();
+
+        let filter = crate::store::QueryFilter {
+            model: Some("gpt".to_string()),
+            ..Default::default()
+        };
+        let records = store.query_all_filtered(&filter).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.model == "gpt-4o"));
+    }
 
     // -------------------------------------------------------------------------
     // Helpers
