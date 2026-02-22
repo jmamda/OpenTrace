@@ -275,6 +275,9 @@ pub fn detect_provider(upstream: &str) -> String {
         "xai".to_string()
     } else if upstream.contains("perplexity") {
         "perplexity".to_string()
+    // Moonshot AI — Kimi models (platform.moonshot.ai / api.moonshot.cn)
+    } else if upstream.contains("moonshot") {
+        "moonshot".to_string()
     } else if upstream.contains("fireworks") {
         "fireworks".to_string()
     // NVIDIA NIM API: integrate.api.nvidia.com
@@ -340,11 +343,19 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         m if m.contains("o3-mini")                   => (1.10,   4.40),
         m if m.contains("o3")                        => (10.00,  40.00),
 
+        // ── OpenAI GPT-5 series ───────────────────────────────────────────
+        // Ordering: specific versions before generic; gpt-5.1-codex before
+        // gpt-5.1 (since the former contains the latter as a substring).
+        m if m.contains("gpt-5.2")                  => (1.75,   14.00),
+        m if m.contains("gpt-5.1-codex")            => (0.25,    2.00),
+        m if m.contains("codex-mini")               => (1.50,    6.00),  // codex-mini-latest
+        m if m.contains("gpt-5.1")                  => (1.25,   10.00),
+        m if m.contains("gpt-5")                    => (1.25,   10.00),  // gpt-5 / gpt-5.0 generic
+
         // ── OpenAI GPT-4.1 (before gpt-4o and gpt-4) ─────────────────────
-        // gpt-4.1 is a substring of gpt-4.1-mini / gpt-4.1-nano, so this
-        // single arm covers all GPT-4.1 variants at the same price tier
-        // until OpenAI publishes mini/nano pricing.
-        m if m.contains("gpt-4.1")                  => (2.00,   8.00),
+        m if m.contains("gpt-4.1-mini")             => (0.40,    1.60),
+        m if m.contains("gpt-4.1-nano")             => (0.10,    0.40),
+        m if m.contains("gpt-4.1")                  => (2.00,    8.00),
 
         // ── OpenAI GPT-4o (mini before base) ──────────────────────────────
         m if m.contains("gpt-4o-mini")               => (0.15,   0.60),
@@ -355,8 +366,11 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         m if m.contains("gpt-4")                     => (30.00,  60.00),
         m if m.contains("gpt-3.5")                   => (0.50,   1.50),
 
-        // ── Anthropic Claude 4 (opus > sonnet > haiku) ────────────────────
-        m if m.contains("claude-opus-4")             => (15.00,  75.00),
+        // ── Anthropic Claude 4 ────────────────────────────────────────────
+        // Opus 4.x (4.5, 4.6, 4.6-thinking) is $5/$25 — distinct from
+        // Claude 3 Opus which was $15/$75 and is matched further below.
+        // Thinking variants share the same token price as base models.
+        m if m.contains("claude-opus-4")             => (5.00,   25.00),
         m if m.contains("claude-sonnet-4")           => (3.00,   15.00),
         m if m.contains("claude-haiku-4")            => (1.00,   5.00),
 
@@ -371,6 +385,15 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         m if m.contains("claude-3-opus")             => (15.00,  75.00),
         m if m.contains("claude-3-sonnet")           => (3.00,   15.00),
         m if m.contains("claude-3-haiku")            => (0.25,   1.25),
+
+        // ── Google Gemini 3.1 (before 2.5) ───────────────────────────────
+        m if m.contains("gemini-3.1-pro")            => (2.00,   12.00),
+        m if m.contains("gemini-3.1-flash")          => (0.10,    0.40),
+        m if m.contains("gemini-3.1")                => (2.00,   12.00),  // generic 3.1
+
+        // ── Google Gemini 3.0 (before 2.5) ───────────────────────────────
+        m if m.contains("gemini-3-pro")              => (2.00,   12.00),
+        m if m.contains("gemini-3")                  => (2.00,   12.00),
 
         // ── Google Gemini 2.5 ─────────────────────────────────────────────
         m if m.contains("gemini-2.5-pro")            => (1.25,   10.00),
@@ -428,6 +451,10 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         // ── Perplexity Sonar (pro before base) ────────────────────────────
         m if m.contains("sonar-pro")                 => (3.00,   15.00),
         m if m.contains("sonar")                     => (1.00,   5.00),
+
+        // ── Kimi / Moonshot AI ────────────────────────────────────────────
+        m if m.contains("kimi-k2.5")                 => (0.60,    3.00),
+        m if m.contains("kimi")                      => (0.60,    3.00),  // generic kimi
 
         // ── Google Gemma ──────────────────────────────────────────────────
         m if m.contains("gemma")                     => (0.10,   0.10),
@@ -835,10 +862,29 @@ mod tests {
 
     #[test]
     fn estimate_cost_claude_opus_4() {
-        // claude-opus-4: $15.00/M input, $75.00/M output
+        // Claude Opus 4.x (4.5, 4.6, 4.6-thinking) is $5.00/$25.00 per M tokens.
+        // Claude 3 Opus was $15/$75 — that era is matched by "claude-3-opus" arm.
         let cost = estimate_cost("claude-opus-4-5", 2_000, 1_000);
-        let expected = (2_000.0 * 15.00 + 1_000.0 * 75.00) / 1_000_000.0;
+        let expected = (2_000.0 * 5.00 + 1_000.0 * 25.00) / 1_000_000.0;
         assert!((cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_cost_claude_opus_4_6_thinking() {
+        // Thinking mode is same price as base opus 4.x: $5/$25.
+        let cost46 = estimate_cost("claude-opus-4-6-20260205", 1_000_000, 1_000_000);
+        let cost46t = estimate_cost("claude-opus-4-6-thinking-20260205", 1_000_000, 1_000_000);
+        assert!((cost46 - cost46t).abs() < 1e-6, "thinking mode should cost same as base");
+        // Both should be $5 + $25 = $30 for 1M/1M tokens
+        assert!((cost46 - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn claude_opus_4_cheaper_than_claude_3_opus() {
+        // Claude 3 Opus was $15/$75; Claude 4 Opus is $5/$25.
+        let c4 = estimate_cost("claude-opus-4-5", 1_000_000, 1_000_000);
+        let c3 = estimate_cost("claude-3-opus-20240229", 1_000_000, 1_000_000);
+        assert!(c4 < c3, "claude-opus-4 should be cheaper than claude-3-opus");
     }
 
     #[test]
@@ -1099,10 +1145,12 @@ mod tests {
     }
 
     #[test]
-    fn model_prices_gpt41_mini_uses_gpt41_arm() {
-        // Until mini/nano get dedicated pricing, they match the gpt-4.1 arm.
-        let (inp, _) = model_prices("gpt-4.1-mini");
-        assert_eq!(inp, 2.00, "gpt-4.1-mini should fall through to gpt-4.1 pricing");
+    fn model_prices_gpt41_mini_cheaper_than_gpt41() {
+        // gpt-4.1-mini has its own arm at $0.40/$1.60 — cheaper than full gpt-4.1.
+        let (inp_mini, out_mini) = model_prices("gpt-4.1-mini");
+        let (inp_full, _) = model_prices("gpt-4.1");
+        assert_eq!((inp_mini, out_mini), (0.40, 1.60));
+        assert!(inp_mini < inp_full, "gpt-4.1-mini should be cheaper than gpt-4.1");
     }
 
     #[test]
@@ -1218,5 +1266,120 @@ mod tests {
     #[test]
     fn is_known_model_claude_37_is_known() {
         assert!(is_known_model("claude-3-7-sonnet-20250219"));
+    }
+
+    // ── GPT-5 series ─────────────────────────────────────────────────────
+
+    #[test]
+    fn model_prices_gpt52_more_expensive_than_gpt51() {
+        let (i52, o52) = model_prices("gpt-5.2");
+        let (i51, o51) = model_prices("gpt-5.1");
+        assert!(i52 > i51, "gpt-5.2 input should cost more than gpt-5.1");
+        assert!(o52 > o51, "gpt-5.2 output should cost more than gpt-5.1");
+    }
+
+    #[test]
+    fn model_prices_gpt52_correct() {
+        assert_eq!(model_prices("gpt-5.2"), (1.75, 14.00));
+        assert_eq!(model_prices("gpt-5.2-pro"), (1.75, 14.00));
+    }
+
+    #[test]
+    fn model_prices_gpt51_correct() {
+        assert_eq!(model_prices("gpt-5.1"), (1.25, 10.00));
+    }
+
+    #[test]
+    fn model_prices_gpt51_codex_cheaper_than_gpt51() {
+        let (ci, _) = model_prices("gpt-5.1-codex-mini");
+        let (i, _) = model_prices("gpt-5.1");
+        assert!(ci < i, "gpt-5.1-codex-mini should be cheaper input than gpt-5.1");
+    }
+
+    #[test]
+    fn model_prices_codex_mini_latest() {
+        assert_eq!(model_prices("codex-mini-latest"), (1.50, 6.00));
+    }
+
+    #[test]
+    fn model_prices_gpt5_does_not_match_gpt51() {
+        // "gpt-5" arm is separate from "gpt-5.1"; both have same price so
+        // what matters is that "gpt-5.1" model names are not forced through
+        // the fallback (i.e., they are matched by some arm, not the _ default).
+        let (i5, _)  = model_prices("gpt-5");
+        let (i51, _) = model_prices("gpt-5.1");
+        // Both should have known prices, not the $1.00 fallback
+        assert!(i5  >= 1.20, "gpt-5 should have a known price > fallback");
+        assert!(i51 >= 1.20, "gpt-5.1 should have a known price > fallback");
+    }
+
+    #[test]
+    fn is_known_model_gpt52_is_known() {
+        assert!(is_known_model("gpt-5.2"));
+    }
+
+    #[test]
+    fn is_known_model_gpt51_is_known() {
+        assert!(is_known_model("gpt-5.1"));
+    }
+
+    // ── Gemini 3.x ───────────────────────────────────────────────────────
+
+    #[test]
+    fn model_prices_gemini_31_pro() {
+        assert_eq!(model_prices("gemini-3.1-pro-preview"), (2.00, 12.00));
+    }
+
+    #[test]
+    fn model_prices_gemini_31_more_expensive_than_25_pro() {
+        let (i31, _) = model_prices("gemini-3.1-pro");
+        let (i25, _) = model_prices("gemini-2.5-pro");
+        assert!(i31 > i25, "gemini-3.1-pro should cost more than gemini-2.5-pro");
+    }
+
+    #[test]
+    fn is_known_model_gemini_31_is_known() {
+        assert!(is_known_model("gemini-3.1-pro-preview"));
+    }
+
+    // ── Kimi / Moonshot ──────────────────────────────────────────────────
+
+    #[test]
+    fn model_prices_kimi_k25() {
+        assert_eq!(model_prices("kimi-k2.5"), (0.60, 3.00));
+        assert_eq!(model_prices("kimi-k2.5-instant"), (0.60, 3.00));
+    }
+
+    #[test]
+    fn model_prices_kimi_k25_cheaper_than_claude_sonnet() {
+        let (ki, _) = model_prices("kimi-k2.5");
+        let (si, _) = model_prices("claude-sonnet-4-6");
+        assert!(ki < si, "kimi-k2.5 should be cheaper than claude-sonnet-4");
+    }
+
+    #[test]
+    fn detect_provider_moonshot() {
+        assert_eq!(detect_provider("https://platform.moonshot.ai/v1"), "moonshot");
+        assert_eq!(detect_provider("https://api.moonshot.cn/v1"), "moonshot");
+    }
+
+    #[test]
+    fn is_known_model_kimi_k25_is_known() {
+        assert!(is_known_model("kimi-k2.5-instant"));
+    }
+
+    // ── Claude Opus 4 price correction ───────────────────────────────────
+
+    #[test]
+    fn model_prices_claude_opus_4_is_5_per_million() {
+        assert_eq!(model_prices("claude-opus-4-6"), (5.00, 25.00));
+        assert_eq!(model_prices("claude-opus-4-5"), (5.00, 25.00));
+        assert_eq!(model_prices("claude-opus-4-6-thinking-20260205"), (5.00, 25.00));
+    }
+
+    #[test]
+    fn model_prices_claude_3_opus_is_15_per_million() {
+        // The $15/$75 price is for Claude 3 Opus (not Claude 4).
+        assert_eq!(model_prices("claude-3-opus-20240229"), (15.00, 75.00));
     }
 }
