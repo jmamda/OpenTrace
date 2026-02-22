@@ -51,7 +51,7 @@ trace start
 Output at startup:
 
 ```
-trace v0.24.1
+trace v0.25.0
   listening  http://127.0.0.1:4000
   upstream   https://api.openai.com
   storage    /home/user/.trace/trace.db
@@ -59,6 +59,10 @@ trace v0.24.1
 
 Set your LLM client:
   OPENAI_BASE_URL=http://localhost:4000/v1
+
+Note: full request/response bodies (including prompts) are stored in /home/user/.trace/trace.db
+
+Listening on 127.0.0.1:4000
 ```
 
 **3. Point your app at it and run:**
@@ -118,12 +122,59 @@ The proxy path adds no observable latency. DB writes happen on a bounded backgro
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Send OTLP HTTP/JSON spans to this endpoint (e.g. `http://localhost:4318`) |
 | `--budget-alert-usd` | `TRACE_BUDGET_ALERT_USD` | — | Emit a stderr warning when spend exceeds this USD amount in the period |
 | `--budget-period` | `TRACE_BUDGET_PERIOD` | `month` | Budget period: `day`, `week`, or `month` |
+| `--route PATH=URL` | — | — | Route a path prefix to a different upstream. May be specified multiple times. More specific paths must come first. |
 
 ```bash
 trace start --upstream https://api.anthropic.com --port 4001 --verbose
 trace start --redact-fields messages,system_prompt
 trace start --budget-alert-usd 50.0 --budget-period month --metrics-port 9091
+
+# Multi-provider in one process: Anthropic messages + OpenAI everything else
+trace start \
+  --route "/v1/messages=https://api.anthropic.com" \
+  --upstream https://api.openai.com
 ```
+
+**Multi-upstream routing**
+
+Point one proxy instance at multiple LLM providers simultaneously. Traffic is fanned to the correct upstream based on the request path prefix; the default upstream catches everything else.
+
+```
+trace start --port 4000 \
+  --route "/v1/messages=https://api.anthropic.com" \
+  --upstream https://api.openai.com
+
+trace v0.25.0
+  listening  http://127.0.0.1:4000
+  upstream   https://api.openai.com
+  routes     1 rule(s):
+               /v1/messages -> https://api.anthropic.com
+               * -> https://api.openai.com (default)
+
+Set your LLM client:
+  OPENAI_BASE_URL=http://localhost:4000/v1     # gpt-* models
+  ANTHROPIC_BASE_URL=http://localhost:4000     # claude-* models
+
+Note: full request/response bodies (including prompts) are stored in /home/user/.trace/trace.db
+
+Listening on 127.0.0.1:4000
+```
+
+Routes can also be set in `.trace.toml`:
+
+```toml
+[[start.routes]]
+path = "/v1/messages"
+upstream = "https://api.anthropic.com"
+```
+
+Routing rules:
+- First prefix match wins — list more specific paths before less specific ones
+- A prefix match requires a path-segment boundary: `/v1/messages` matches `/v1/messages/stream` but **not** `/v1/messages2`
+- A shadowed route (a longer prefix listed after a shorter prefix that covers it) emits a startup warning: `WARNING: route "/v1/messages" is shadowed by earlier route "/v1" — it will never match`
+- Routes checked in CLI order first, then config file order
+- Route path must start with `/`; route upstream must use `http://` or `https://` — otherwise trace exits at startup with an error
+- Routes cannot be set via a single environment variable; use `--route` flags or `[[start.routes]]` in the config file
 
 ---
 
@@ -214,6 +265,11 @@ retention_days = 90
 # redact_fields = ["messages"]
 # budget_alert_usd = 50.0
 # budget_period = "month"
+
+# Route specific path prefixes to different upstreams:
+# [[start.routes]]
+# path = "/v1/messages"
+# upstream = "https://api.anthropic.com"
 
 [serve]
 port = 8080
@@ -603,7 +659,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 Bug reports and pull requests are welcome.
 
 ```bash
-cargo test   # 488 tests, no external dependencies required
+cargo test   # 500+ tests, no external dependencies required
 ```
 
 ## License

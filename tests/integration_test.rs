@@ -67,6 +67,7 @@ async fn start_proxy(upstream_url: String, db_path: &PathBuf) -> u16 {
 
     let state = proxy::ProxyState {
         upstream: std::sync::Arc::new(upstream_url),
+        routes: vec![],
         client,
         store_tx,
         verbose: false,
@@ -527,6 +528,286 @@ async fn provider_request_id_stored() {
         record.provider_request_id,
         Some("req-abc-123".to_string()),
         "provider_request_id should be stored from x-request-id header"
+    );
+
+    std::fs::remove_file(&db_path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Routing helpers
+// ---------------------------------------------------------------------------
+
+/// Like `start_proxy` but accepts a routing table.
+async fn start_proxy_with_routes(
+    default_upstream: String,
+    routes: Vec<proxy::UpstreamRoute>,
+    db_path: &PathBuf,
+) -> u16 {
+    let writer_store = store::Store::open_at(db_path).expect("open writer store");
+    let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(1024);
+    tokio::spawn(async move {
+        while let Some(record) = store_rx.recv().await {
+            if let Err(e) = writer_store.insert(&record) {
+                eprintln!("[test] db write error: {e}");
+            }
+        }
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("build http client");
+    let state = proxy::ProxyState {
+        upstream: std::sync::Arc::new(default_upstream),
+        routes,
+        client,
+        store_tx,
+        verbose: false,
+        no_request_bodies: false,
+        redact_fields: vec![],
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let proxy_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    proxy_port
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: path routing sends request to the routed upstream
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn path_routing_sends_request_to_routed_upstream() {
+    use axum::{response::IntoResponse, routing::any, Router};
+
+    // Mock A — the routed upstream (responds to anything with a distinct body)
+    let mock_a = Router::new().route("/*path", any(|| async {
+        (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            r#"{"mock":"upstream_a","choices":[{"message":{"content":"from_a"}}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+        ).into_response()
+    })).route("/", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], "{}").into_response()
+    }));
+
+    // Mock B — the default upstream
+    let mock_b = Router::new().route("/*path", any(|| async {
+        (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            r#"{"mock":"upstream_b","choices":[{"message":{"content":"from_b"}}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+        ).into_response()
+    })).route("/", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], "{}").into_response()
+    }));
+
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_a, mock_a).await.ok(); });
+
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_b, mock_b).await.ok(); });
+
+    let db_path = temp_db_path();
+    let routes = vec![proxy::UpstreamRoute {
+        path: "/v1/messages".to_string(),
+        upstream: std::sync::Arc::new(format!("http://127.0.0.1:{}", port_a)),
+    }];
+    let proxy_port = start_proxy_with_routes(
+        format!("http://127.0.0.1:{}", port_b),
+        routes,
+        &db_path,
+    ).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/messages", proxy_port))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
+        .send()
+        .await
+        .expect("POST to proxy");
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("upstream_a"), "response should come from mock A, got: {}", body);
+
+    let record = wait_for_record(&db_path).await;
+    assert!(
+        record.response_body.as_deref().unwrap_or("").contains("upstream_a"),
+        "DB response_body should show upstream_a was hit, got: {:?}", record.response_body
+    );
+
+    std::fs::remove_file(&db_path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: path routing falls back to default when no route matches
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn path_routing_fallback_uses_default_upstream() {
+    use axum::{response::IntoResponse, routing::any, Router};
+
+    let mock_a = Router::new().route("/*path", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"mock":"upstream_a","usage":{"prompt_tokens":1,"completion_tokens":1}}"#).into_response()
+    }));
+    let mock_b = Router::new().route("/*path", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"mock":"upstream_b","choices":[{"message":{"content":"from_b"}}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).into_response()
+    }));
+
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_a, mock_a).await.ok(); });
+
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_b, mock_b).await.ok(); });
+
+    let db_path = temp_db_path();
+    // Route /v1/messages → mock A, everything else → mock B (default)
+    let routes = vec![proxy::UpstreamRoute {
+        path: "/v1/messages".to_string(),
+        upstream: std::sync::Arc::new(format!("http://127.0.0.1:{}", port_a)),
+    }];
+    let proxy_port = start_proxy_with_routes(
+        format!("http://127.0.0.1:{}", port_b),
+        routes,
+        &db_path,
+    ).await;
+
+    // POST to /v1/chat/completions — no matching route, should hit mock B
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .expect("POST to proxy");
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("upstream_b"), "response should come from mock B (default), got: {}", body);
+
+    let record = wait_for_record(&db_path).await;
+    assert!(
+        record.response_body.as_deref().unwrap_or("").contains("upstream_b"),
+        "DB response_body should show upstream_b (default) was hit, got: {:?}", record.response_body
+    );
+
+    std::fs::remove_file(&db_path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: sub-path of routed prefix still routes correctly
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn path_routing_subpath_matches_prefix() {
+    use axum::{response::IntoResponse, routing::any, Router};
+
+    let mock_a = Router::new().route("/*path", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"mock":"upstream_a","usage":{"prompt_tokens":1,"completion_tokens":1}}"#).into_response()
+    }));
+
+    // Default is a dead port — if routing works, we should never hit it
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_a, mock_a).await.ok(); });
+
+    let ephemeral = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = ephemeral.local_addr().unwrap().port();
+    drop(ephemeral);
+
+    let db_path = temp_db_path();
+    let routes = vec![proxy::UpstreamRoute {
+        path: "/v1/messages".to_string(),
+        upstream: std::sync::Arc::new(format!("http://127.0.0.1:{}", port_a)),
+    }];
+    let proxy_port = start_proxy_with_routes(
+        format!("http://127.0.0.1:{}", dead_port), // default is dead
+        routes,
+        &db_path,
+    ).await;
+
+    // POST to /v1/messages/count — starts with /v1/messages, should hit mock A not dead default
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/messages/count", proxy_port))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-sonnet-4-6"}"#)
+        .send()
+        .await
+        .expect("POST to proxy");
+
+    // Should succeed (200) because mock A handled it, not the dead default
+    assert_eq!(resp.status(), 200, "subpath /v1/messages/count should route to mock A");
+
+    std::fs::remove_file(&db_path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: path-segment boundary — /v1/messages2 must NOT route to /v1/messages
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn path_routing_boundary_no_sibling_bleed() {
+    use axum::{response::IntoResponse, routing::any, Router};
+
+    // Mock A: the routed upstream for /v1/messages
+    let mock_a = Router::new().route("/*path", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"mock":"upstream_a","usage":{"prompt_tokens":1,"completion_tokens":1}}"#).into_response()
+    }));
+    // Mock B: the default upstream — should handle /v1/messages2
+    let mock_b = Router::new().route("/*path", any(|| async {
+        (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"mock":"upstream_b","usage":{"prompt_tokens":1,"completion_tokens":1}}"#).into_response()
+    }));
+
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_a, mock_a).await.ok(); });
+
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener_b, mock_b).await.ok(); });
+
+    let db_path = temp_db_path();
+    let routes = vec![proxy::UpstreamRoute {
+        path: "/v1/messages".to_string(),
+        upstream: std::sync::Arc::new(format!("http://127.0.0.1:{}", port_a)),
+    }];
+    let proxy_port = start_proxy_with_routes(
+        format!("http://127.0.0.1:{}", port_b),
+        routes,
+        &db_path,
+    ).await;
+
+    let client = reqwest::Client::new();
+    // /v1/messages2 must NOT match the /v1/messages route — the '2' is not a '/'
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/messages2", proxy_port))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[]}"#)
+        .send()
+        .await
+        .expect("POST to proxy");
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("upstream_b"),
+        "/v1/messages2 should fall through to default (upstream_b), got: {}",
+        body
     );
 
     std::fs::remove_file(&db_path).ok();

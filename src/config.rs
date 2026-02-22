@@ -9,6 +9,13 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// A single `[[start.routes]]` entry in the config file.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RouteEntry {
+    pub path: String,
+    pub upstream: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct StartConfig {
     pub port: Option<u16>,
@@ -23,6 +30,7 @@ pub struct StartConfig {
     pub upstream_timeout: Option<u64>,
     pub no_request_bodies: Option<bool>,
     pub verbose: Option<bool>,
+    pub routes: Option<Vec<RouteEntry>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -93,6 +101,11 @@ retention_days = 90
 # budget_alert_usd = 50.0
 # budget_period = "month"
 
+# Route specific path prefixes to different upstreams:
+# [[start.routes]]
+# path = "/v1/messages"
+# upstream = "https://api.anthropic.com"
+
 [serve]
 port = 8080
 "#;
@@ -158,5 +171,32 @@ mod tests {
         let cfg = load_config_from(path);
         assert!(cfg.start.is_none());
         assert!(cfg.serve.is_none());
+    }
+
+    #[test]
+    fn config_parses_routes_from_toml() {
+        let toml = r#"
+[[start.routes]]
+path = "/v1/messages"
+upstream = "https://api.anthropic.com"
+
+[[start.routes]]
+path = "/v1/chat"
+upstream = "https://api.openai.com"
+"#;
+        let cfg = parse(toml);
+        let routes = cfg.start.and_then(|s| s.routes).unwrap_or_default();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].path, "/v1/messages");
+        assert_eq!(routes[0].upstream, "https://api.anthropic.com");
+        assert_eq!(routes[1].path, "/v1/chat");
+        assert_eq!(routes[1].upstream, "https://api.openai.com");
+    }
+
+    #[test]
+    fn config_routes_none_when_not_present() {
+        let cfg = parse("[start]\nport = 4000\n");
+        let routes = cfg.start.and_then(|s| s.routes);
+        assert!(routes.is_none(), "routes should be None when not in config");
     }
 }

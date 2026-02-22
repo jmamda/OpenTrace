@@ -1,0 +1,14 @@
+{
+  "name": "@opentrace/trace-win32-x64",
+  "version": "0.25.0",
+  "description": "Windows x64 binary for @opentrace/trace",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmamda/OpenTrace.git"
+  },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["trace.exe"],
+  "publishConfig": { "access": "public" }
+}

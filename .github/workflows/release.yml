@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            pkg: linux-x64
+            bin: trace
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            pkg: linux-arm64
+            bin: trace
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            pkg: darwin-x64
+            bin: trace
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            pkg: darwin-arm64
+            bin: trace
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            pkg: win32-x64
+            bin: trace.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux ARM64)
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.pkg }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  publish-platforms:
+    name: Publish @opentrace/trace-${{ matrix.pkg }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.pkg }}
+          path: /tmp/binary
+
+      - name: Stage platform package
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          PKG_DIR="npm/platforms/${{ matrix.pkg }}"
+
+          # Update version in platform package.json to match the git tag
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('./${PKG_DIR}/package.json', 'utf8'));
+            p.version = '${VERSION}';
+            fs.writeFileSync('./${PKG_DIR}/package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+
+          # Place binary in the right location
+          if [[ "${{ matrix.pkg }}" == win32* ]]; then
+            cp /tmp/binary/trace.exe "${PKG_DIR}/trace.exe"
+          else
+            mkdir -p "${PKG_DIR}/bin"
+            cp /tmp/binary/trace "${PKG_DIR}/bin/trace"
+            chmod +x "${PKG_DIR}/bin/trace"
+          fi
+
+      - name: Publish platform package
+        run: npm publish npm/platforms/${{ matrix.pkg }} --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-root:
+    name: Publish @opentrace/trace (root)
+    needs: publish-platforms
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Bump root package version and optionalDependencies
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('./npm/package.json', 'utf8'));
+            p.version = '${VERSION}';
+            for (const dep of Object.keys(p.optionalDependencies)) {
+              p.optionalDependencies[dep] = '${VERSION}';
+            }
+            fs.writeFileSync('./npm/package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+
+      - name: Publish root package
+        run: npm publish npm --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

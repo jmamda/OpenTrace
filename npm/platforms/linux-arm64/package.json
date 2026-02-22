@@ -1,0 +1,14 @@
+{
+  "name": "@opentrace/trace-linux-arm64",
+  "version": "0.25.0",
+  "description": "Linux ARM64 binary for @opentrace/trace",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmamda/OpenTrace.git"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin"],
+  "publishConfig": { "access": "public" }
+}

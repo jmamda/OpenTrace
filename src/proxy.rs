@@ -38,9 +38,19 @@ const MAX_ACCUMULATION_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 /// Visible via `trace stats` when > 0.
 pub static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 
+/// A single routing rule: requests whose path starts with `path` are forwarded
+/// to `upstream` instead of the default.
+#[derive(Clone, Debug)]
+pub struct UpstreamRoute {
+    pub path: String,
+    pub upstream: Arc<String>,
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub upstream: Arc<String>,
+    /// Path-prefix routing table — empty means all requests go to `upstream`.
+    pub routes: Vec<UpstreamRoute>,
     pub client: reqwest::Client,
     /// Bounded sender — DB writes happen in a background task.
     pub store_tx: mpsc::Sender<CallRecord>,
@@ -74,6 +84,29 @@ fn try_store(store_tx: &mpsc::Sender<CallRecord>, record: CallRecord, verbose: b
     }
 }
 
+/// Return the upstream URL to use for this request path.
+/// Evaluates routes in insertion order; first prefix match wins.
+/// Falls back to `default` when no route matches or the table is empty.
+///
+/// Matching rules (same logic used in the shadowing-detection pass):
+/// - The literal `"/"` route matches every path (catch-all).
+/// - An exact match always wins.
+/// - A prefix match only wins when the next character after the prefix is `'/'`,
+///   preventing `/v1/messages` from accidentally matching `/v1/messages2`.
+fn resolve_upstream<'a>(
+    default: &'a Arc<String>,
+    routes: &'a [UpstreamRoute],
+    path: &str,
+) -> &'a Arc<String> {
+    for route in routes {
+        let p = route.path.as_str();
+        if p == "/" || path == p || (path.starts_with(p) && path[p.len()..].starts_with('/')) {
+            return &route.upstream;
+        }
+    }
+    default
+}
+
 async fn handle(
     State(state): State<ProxyState>,
     method: Method,
@@ -89,7 +122,7 @@ async fn handle(
     let verbose = state.verbose;
     let no_request_bodies = state.no_request_bodies;
     let redact_fields = state.redact_fields.clone();
-    let upstream = state.upstream.clone();
+    let upstream = resolve_upstream(&state.upstream, &state.routes, uri.path()).clone();
     let client = state.client.clone();
     let store_tx = state.store_tx.clone();
     let provider = capture::detect_provider(&upstream);
@@ -397,5 +430,115 @@ async fn handle(
         try_store(&store_tx, record, verbose);
 
         Ok(builder.body(Body::from(resp_bytes)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(path: &str, upstream: &str) -> UpstreamRoute {
+        UpstreamRoute { path: path.to_string(), upstream: Arc::new(upstream.to_string()) }
+    }
+
+    #[test]
+    fn resolve_upstream_empty_routes_always_default() {
+        let default = Arc::new("https://api.openai.com".to_string());
+        let result = resolve_upstream(&default, &[], "/v1/chat/completions");
+        assert_eq!(result.as_str(), "https://api.openai.com");
+    }
+
+    #[test]
+    fn resolve_upstream_matching_route_takes_precedence() {
+        let default = Arc::new("https://api.openai.com".to_string());
+        let routes = vec![route("/v1/messages", "https://api.anthropic.com")];
+        let result = resolve_upstream(&default, &routes, "/v1/messages");
+        assert_eq!(result.as_str(), "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn resolve_upstream_non_matching_path_uses_default() {
+        let default = Arc::new("https://api.openai.com".to_string());
+        let routes = vec![route("/v1/messages", "https://api.anthropic.com")];
+        let result = resolve_upstream(&default, &routes, "/v1/chat/completions");
+        assert_eq!(result.as_str(), "https://api.openai.com");
+    }
+
+    #[test]
+    fn resolve_upstream_first_match_wins() {
+        let default = Arc::new("https://default.example.com".to_string());
+        let routes = vec![
+            route("/v1", "https://first.example.com"),
+            route("/v1/messages", "https://second.example.com"),
+        ];
+        // /v1 is listed first and is a prefix of /v1/messages → first wins
+        let result = resolve_upstream(&default, &routes, "/v1/messages");
+        assert_eq!(result.as_str(), "https://first.example.com");
+    }
+
+    #[test]
+    fn resolve_upstream_subpath_matches_prefix() {
+        let default = Arc::new("https://api.openai.com".to_string());
+        let routes = vec![route("/v1/messages", "https://api.anthropic.com")];
+        let result = resolve_upstream(&default, &routes, "/v1/messages/stream");
+        assert_eq!(result.as_str(), "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn resolve_upstream_root_matches_all() {
+        let default = Arc::new("https://api.openai.com".to_string());
+        let routes = vec![route("/", "https://api.anthropic.com")];
+        let result = resolve_upstream(&default, &routes, "/v1/chat/completions");
+        assert_eq!(result.as_str(), "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn resolve_upstream_no_boundary_bleed_to_sibling() {
+        // /v1/messages must NOT match /v1/messages2 — no segment boundary after prefix.
+        let default = Arc::new("https://api.openai.com".to_string());
+        let routes = vec![route("/v1/messages", "https://api.anthropic.com")];
+        let result = resolve_upstream(&default, &routes, "/v1/messages2");
+        assert_eq!(
+            result.as_str(), "https://api.openai.com",
+            "/v1/messages should not match /v1/messages2 — no path-segment boundary"
+        );
+    }
+
+    #[test]
+    fn resolve_upstream_slash_terminated_route_does_not_match_sibling() {
+        // /v1 must NOT match /v1-legacy — hyphen is not a path separator.
+        let default = Arc::new("https://default.example.com".to_string());
+        let routes = vec![route("/v1", "https://routed.example.com")];
+        // /v1/anything DOES match (segment boundary present)
+        assert_eq!(
+            resolve_upstream(&default, &routes, "/v1/chat").as_str(),
+            "https://routed.example.com"
+        );
+        // /v1-legacy does NOT match (no boundary at position 3)
+        assert_eq!(
+            resolve_upstream(&default, &routes, "/v1-legacy").as_str(),
+            "https://default.example.com"
+        );
+    }
+
+    #[test]
+    fn resolve_upstream_multiple_routes_correct_dispatch() {
+        let default = Arc::new("https://default.example.com".to_string());
+        let routes = vec![
+            route("/v1/messages", "https://anthropic.example.com"),
+            route("/v1/chat", "https://openai.example.com"),
+        ];
+        assert_eq!(
+            resolve_upstream(&default, &routes, "/v1/messages").as_str(),
+            "https://anthropic.example.com"
+        );
+        assert_eq!(
+            resolve_upstream(&default, &routes, "/v1/chat/completions").as_str(),
+            "https://openai.example.com"
+        );
+        assert_eq!(
+            resolve_upstream(&default, &routes, "/v1/embeddings").as_str(),
+            "https://default.example.com"
+        );
     }
 }

@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.24.1",
+    version = "0.25.0",
     long_about = None,
 )]
 struct Cli {
@@ -76,6 +76,12 @@ enum Commands {
         /// Budget period for --budget-alert-usd: day | week | month [default: month]
         #[arg(long, env = "TRACE_BUDGET_PERIOD")]
         budget_period: Option<String>,
+
+        /// Route a path prefix to a different upstream. Format: PATH=URL.
+        /// May be specified multiple times. More specific paths must come first.
+        /// Example: --route /v1/messages=https://api.anthropic.com
+        #[arg(long = "route", value_name = "PATH=URL")]
+        route: Vec<String>,
     },
 
     /// Query captured calls
@@ -232,12 +238,12 @@ async fn main() -> Result<()> {
         Commands::Start {
             port, upstream, bind, verbose, upstream_timeout, retention_days,
             no_request_bodies, metrics_port, otel_endpoint,
-            redact_fields, budget_alert_usd, budget_period,
+            redact_fields, budget_alert_usd, budget_period, route,
         } => {
             cmd_start(
                 port, upstream, bind, verbose, upstream_timeout, retention_days,
                 no_request_bodies, metrics_port, otel_endpoint,
-                redact_fields, budget_alert_usd, budget_period,
+                redact_fields, budget_alert_usd, budget_period, route,
                 &cfg,
             ).await
         }
@@ -292,6 +298,7 @@ async fn cmd_start(
     redact_fields_str: Option<String>,
     budget_alert_usd: Option<f64>,
     budget_period: Option<String>,
+    route_args: Vec<String>,
     cfg: &config::TraceConfig,
 ) -> Result<()> {
     // Merge CLI/env args with config file defaults. Priority: CLI > env > config > hardcoded.
@@ -335,12 +342,84 @@ async fn cmd_start(
         }
     }
 
+    // Build routing table from --route CLI flags and [[start.routes]] in config.
+    // CLI flags take priority (evaluated first); config file entries are appended.
+    let routes: Vec<proxy::UpstreamRoute> = {
+        let mut entries: Vec<proxy::UpstreamRoute> = Vec::new();
+
+        for arg in &route_args {
+            let parts: Vec<&str> = arg.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                anyhow::bail!(
+                    "--route {:?} must be in PATH=URL format\n  Example: --route /v1/messages=https://api.anthropic.com",
+                    arg
+                );
+            }
+            let path = parts[0].to_string();
+            let url = parts[1].to_string();
+            if !path.starts_with('/') {
+                anyhow::bail!("--route path {:?} must start with '/'", path);
+            }
+            let scheme = url.splitn(2, "://").next().unwrap_or("");
+            if !matches!(scheme, "http" | "https") {
+                anyhow::bail!("--route URL {:?} must use http:// or https://", url);
+            }
+            entries.push(proxy::UpstreamRoute { path, upstream: Arc::new(url) });
+        }
+
+        if let Some(cfg_routes) = start_cfg.and_then(|s| s.routes.as_ref()) {
+            for r in cfg_routes {
+                if !r.path.starts_with('/') {
+                    anyhow::bail!("config route path {:?} must start with '/'", r.path);
+                }
+                let scheme = r.upstream.splitn(2, "://").next().unwrap_or("");
+                if !matches!(scheme, "http" | "https") {
+                    anyhow::bail!(
+                        "config route upstream {:?} must use http:// or https://",
+                        r.upstream
+                    );
+                }
+                entries.push(proxy::UpstreamRoute {
+                    path: r.path.clone(),
+                    upstream: Arc::new(r.upstream.clone()),
+                });
+            }
+        }
+
+        // Warn on obviously shadowed routes (longer prefix listed after shorter one).
+        // Uses the same boundary logic as resolve_upstream so false positives are avoided.
+        for i in 0..entries.len() {
+            for j in (i + 1)..entries.len() {
+                let p_i = entries[i].path.as_str();
+                let p_j = entries[j].path.as_str();
+                let shadowed = p_i == "/"
+                    || p_j == p_i
+                    || (p_j.starts_with(p_i) && p_j[p_i.len()..].starts_with('/'));
+                if shadowed {
+                    eprintln!(
+                        "WARNING: route {:?} is shadowed by earlier route {:?} — it will never match",
+                        entries[j].path, entries[i].path
+                    );
+                }
+            }
+        }
+
+        entries
+    };
+
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.21".bold());
+    println!("{}", "trace v0.25.0".bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
+    if !routes.is_empty() {
+        println!("  routes     {} rule(s):", routes.len());
+        for r in &routes {
+            println!("               {} -> {}", r.path.cyan(), r.upstream.as_ref().cyan());
+        }
+        println!("               * -> {} (default)", upstream.cyan());
+    }
     println!("  storage    {}", db_path.display().to_string().cyan());
     if retention_days > 0 {
         println!("  retention  {} days", retention_days.to_string().cyan());
@@ -359,7 +438,12 @@ async fn cmd_start(
     }
     println!();
     println!("Set your LLM client:");
-    println!("  {}", format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow());
+    if routes.is_empty() {
+        println!("  {}", format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow());
+    } else {
+        println!("  {}  # gpt-* models", format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow());
+        println!("  {}  # claude-* models", format!("ANTHROPIC_BASE_URL=http://localhost:{}", port).yellow());
+    }
     println!();
 
     // Warn when binding on non-localhost.
@@ -379,6 +463,15 @@ async fn cmd_start(
             upstream
         ).yellow());
         eprintln!();
+    }
+
+    for r in &routes {
+        if !r.upstream.starts_with("https://") {
+            eprintln!("{}", format!(
+                "WARNING: route upstream '{}' ({}) is not HTTPS — traffic may be unencrypted.",
+                r.upstream, r.path
+            ).yellow());
+        }
     }
 
     println!("{}", format!("Note: full request/response bodies (including prompts) are stored in {}", db_path.display()).dimmed());
@@ -449,7 +542,9 @@ async fn cmd_start(
         .build()
         .context("failed to build HTTP client")?;
 
-    // Non-blocking startup connectivity check.
+    // Non-blocking startup connectivity check — default upstream only.
+    // Route upstreams are intentionally NOT probed: probing arbitrary URLs from a
+    // config file would allow SSRF reconnaissance of internal networks.
     if let Ok(check_client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -470,6 +565,7 @@ async fn cmd_start(
 
     let state = proxy::ProxyState {
         upstream: Arc::new(upstream),
+        routes,
         client,
         store_tx,
         verbose,
@@ -1251,6 +1347,11 @@ fn cmd_config(
                 if let Some(ref v) = s.redact_fields { println!("  redact_fields   = {:?}", v); }
                 if let Some(v) = s.budget_alert_usd { println!("  budget_alert_usd = {}", v); }
                 if let Some(ref v) = s.budget_period { println!("  budget_period   = {}", v); }
+                if let Some(ref routes) = s.routes {
+                    for r in routes {
+                        println!("  route           {} -> {}", r.path, r.upstream);
+                    }
+                }
             } else {
                 println!("  (using all defaults)");
             }
