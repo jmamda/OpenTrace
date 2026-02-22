@@ -3,7 +3,12 @@
 **The strace of LLM calls.** A single Rust binary that acts as a local reverse proxy, recording every request and response to a SQLite file on your machine. No cloud. No infra. No data leaving your machine.
 
 ```bash
+# Install (npm — no Rust required)
+npm install -g @opentrace/trace
+
+# Or build from source
 cargo build --release && ./target/release/trace start
+
 OPENAI_BASE_URL=http://localhost:4000/v1 python my_app.py
 trace stats --breakdown
 trace serve --port 8080    # live web dashboard
@@ -19,13 +24,17 @@ trace serve --port 8080    # live web dashboard
 
 ## Quickstart
 
-**1. Build and install:**
+**1. Install:**
 
 ```bash
+# npm (no Rust required — pre-built binaries for Linux x64/arm64, macOS x64/arm64, Windows x64)
+npm install -g @opentrace/trace
+
+# Homebrew / Cargo (build from source)
 git clone <repo> && cd trace
 cargo build --release
 
-# Optional: install globally
+# Install globally via Cargo
 cargo install --path .
 ```
 
@@ -191,6 +200,10 @@ The dashboard auto-refreshes every 2 seconds and shows:
 - Stat cards: total calls, total cost, avg latency, calls last hour
 - Live call log with model filter and errors-only checkbox
 - Fully offline — zero CDN dependencies
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `-p`, `--port` | `TRACE_UI_PORT` | `8080` | Dashboard port |
 
 The `serve.port` field in the config file sets the default port.
 
@@ -659,7 +672,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 Bug reports and pull requests are welcome.
 
 ```bash
-cargo test   # 500+ tests, no external dependencies required
+cargo test   # 514 tests, no external dependencies required
 ```
 
 ## License
