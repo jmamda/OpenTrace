@@ -252,15 +252,34 @@ pub fn redact_json_fields(body: &str, fields: &[String]) -> String {
 }
 
 /// Detect provider from upstream URL.
+///
+/// More-specific patterns (longer hostnames, branded keywords) are checked
+/// before shorter ones to avoid false matches (e.g. "azure-openai" before
+/// plain "openai").
 pub fn detect_provider(upstream: &str) -> String {
-    if upstream.contains("anthropic") {
-        "anthropic".to_string()
+    // Amazon Bedrock first — its URLs contain "amazonaws.com" which is
+    // unambiguous, and model path segments may include "anthropic" or "openai".
+    if upstream.contains("bedrock") && upstream.contains("amazonaws") {
+        "bedrock".to_string()
+    // Azure OpenAI before plain openai.
     } else if upstream.contains("openai.azure.com") || upstream.contains("azure.com/openai") {
         "azure-openai".to_string()
+    // Anthropic before openai — catches anthropic-openai bridges.
+    } else if upstream.contains("anthropic") {
+        "anthropic".to_string()
     } else if upstream.contains("openai") {
         "openai".to_string()
     } else if upstream.contains("openrouter") {
         "openrouter".to_string()
+    } else if upstream.contains("x.ai") {
+        "xai".to_string()
+    } else if upstream.contains("perplexity") {
+        "perplexity".to_string()
+    } else if upstream.contains("fireworks") {
+        "fireworks".to_string()
+    // NVIDIA NIM API: integrate.api.nvidia.com
+    } else if upstream.contains("nvidia") {
+        "nvidia".to_string()
     } else if upstream.contains("together") {
         "together".to_string()
     } else if upstream.contains("groq") {
@@ -304,55 +323,117 @@ pub fn estimate_cost(model: &str, input_tokens: i64, output_tokens: i64) -> f64 
 }
 
 pub fn model_prices(model: &str) -> (f64, f64) {
-    // Prices per 1M tokens (input, output) — USD
-    // More specific patterns must appear before less specific ones.
+    // Prices per 1M tokens (input, output) — USD.
+    // ORDERING RULE: more-specific patterns (longer substrings) MUST appear
+    // before less-specific ones, or the less-specific arm fires first.
+    // e.g. "gpt-4.1" before "gpt-4", "o1-mini" before "o1", etc.
     match model {
-        // Embeddings — output_tokens is always 0, only input price matters
-        m if m.contains("text-embedding-3-large") => (0.13, 0.0),
-        m if m.contains("text-embedding-3-small") => (0.02, 0.0),
-        m if m.contains("text-embedding-ada-002") => (0.10, 0.0),
-        // OpenAI
-        m if m.contains("gpt-4o-mini")       => (0.15,  0.60),
-        m if m.contains("gpt-4o")            => (2.50,  10.00),
-        m if m.contains("gpt-4-turbo")       => (10.00, 30.00),
-        m if m.contains("gpt-4")             => (30.00, 60.00),
-        m if m.contains("gpt-3.5")           => (0.50,  1.50),
-        // NOTE: o1-mini / o3-mini must appear before o1 / o3 — more-specific
-        // substrings first, otherwise "o1-mini" would match the "o1" arm.
-        m if m.contains("o1-mini")           => (1.10,  4.40),
-        m if m.contains("o1-preview")        => (15.00, 60.00),
-        m if m.contains("o1")               => (15.00, 60.00),
-        m if m.contains("o3-mini")           => (1.10,  4.40),
-        m if m.contains("o3")               => (10.00, 40.00),
-        // Anthropic Claude 4
-        m if m.contains("claude-sonnet-4")   => (3.00,  15.00),
-        m if m.contains("claude-opus-4")     => (15.00, 75.00),
-        m if m.contains("claude-haiku-4")    => (0.80,  4.00),
-        // Anthropic Claude 3.5
-        m if m.contains("claude-3-5-sonnet") => (3.00,  15.00),
-        m if m.contains("claude-3-5-haiku")  => (0.80,  4.00),
-        // Anthropic Claude 3
-        m if m.contains("claude-3-opus")     => (15.00, 75.00),
-        m if m.contains("claude-3-sonnet")   => (3.00,  15.00),
-        m if m.contains("claude-3-haiku")    => (0.25,  1.25),
-        // Google Gemini
-        m if m.contains("gemini-2.0-flash")  => (0.10,  0.40),
-        m if m.contains("gemini-2.0")        => (0.10,  0.40),
-        m if m.contains("gemini-1.5-pro")    => (1.25,  5.00),
-        m if m.contains("gemini-1.5-flash")  => (0.075, 0.30),
-        // Meta Llama
-        m if m.contains("llama-3.3-70b")     => (0.59,  0.79),
-        m if m.contains("llama-3.1-405b")    => (3.00,  3.00),
-        m if m.contains("llama-3.1-70b")     => (0.52,  0.75),
-        m if m.contains("llama-3.1-8b")      => (0.18,  0.18),
-        // Mistral / Mixtral
-        m if m.contains("mistral-large")     => (2.00,  6.00),
-        m if m.contains("mistral-small")     => (0.20,  0.60),
-        m if m.contains("mixtral")           => (0.24,  0.24),
-        // Others
-        m if m.contains("deepseek")          => (0.14,  0.28),
-        m if m.contains("gemma")             => (0.10,  0.10),
-        _ => (1.00, 3.00), // fallback — may be inaccurate for unlisted models
+        // ── Embeddings (output_tokens always 0; only input price matters) ──
+        m if m.contains("text-embedding-3-large")    => (0.13,   0.0),
+        m if m.contains("text-embedding-3-small")    => (0.02,   0.0),
+        m if m.contains("text-embedding-ada-002")    => (0.10,   0.0),
+
+        // ── OpenAI o-series reasoning (mini before base) ──────────────────
+        m if m.contains("o1-mini")                   => (1.10,   4.40),
+        m if m.contains("o1-preview")                => (15.00,  60.00),
+        m if m.contains("o1")                        => (15.00,  60.00),
+        m if m.contains("o3-mini")                   => (1.10,   4.40),
+        m if m.contains("o3")                        => (10.00,  40.00),
+
+        // ── OpenAI GPT-4.1 (before gpt-4o and gpt-4) ─────────────────────
+        // gpt-4.1 is a substring of gpt-4.1-mini / gpt-4.1-nano, so this
+        // single arm covers all GPT-4.1 variants at the same price tier
+        // until OpenAI publishes mini/nano pricing.
+        m if m.contains("gpt-4.1")                  => (2.00,   8.00),
+
+        // ── OpenAI GPT-4o (mini before base) ──────────────────────────────
+        m if m.contains("gpt-4o-mini")               => (0.15,   0.60),
+        m if m.contains("gpt-4o")                    => (2.50,   10.00),
+
+        // ── OpenAI GPT-4 legacy ────────────────────────────────────────────
+        m if m.contains("gpt-4-turbo")               => (10.00,  30.00),
+        m if m.contains("gpt-4")                     => (30.00,  60.00),
+        m if m.contains("gpt-3.5")                   => (0.50,   1.50),
+
+        // ── Anthropic Claude 4 (opus > sonnet > haiku) ────────────────────
+        m if m.contains("claude-opus-4")             => (15.00,  75.00),
+        m if m.contains("claude-sonnet-4")           => (3.00,   15.00),
+        m if m.contains("claude-haiku-4")            => (1.00,   5.00),
+
+        // ── Anthropic Claude 3.7 ──────────────────────────────────────────
+        m if m.contains("claude-3-7-sonnet")         => (3.00,   15.00),
+
+        // ── Anthropic Claude 3.5 ──────────────────────────────────────────
+        m if m.contains("claude-3-5-sonnet")         => (3.00,   15.00),
+        m if m.contains("claude-3-5-haiku")          => (0.80,   4.00),
+
+        // ── Anthropic Claude 3 ────────────────────────────────────────────
+        m if m.contains("claude-3-opus")             => (15.00,  75.00),
+        m if m.contains("claude-3-sonnet")           => (3.00,   15.00),
+        m if m.contains("claude-3-haiku")            => (0.25,   1.25),
+
+        // ── Google Gemini 2.5 ─────────────────────────────────────────────
+        m if m.contains("gemini-2.5-pro")            => (1.25,   10.00),
+        m if m.contains("gemini-2.5-flash")          => (0.075,  0.30),
+
+        // ── Google Gemini 2.0 (flash-lite before flash) ───────────────────
+        m if m.contains("gemini-2.0-flash-lite")     => (0.075,  0.30),
+        m if m.contains("gemini-2.0-flash")          => (0.10,   0.40),
+        m if m.contains("gemini-2.0")                => (0.10,   0.40),
+
+        // ── Google Gemini 1.5 (8b before flash before pro) ────────────────
+        m if m.contains("gemini-1.5-flash-8b")       => (0.0375, 0.15),
+        m if m.contains("gemini-1.5-pro")            => (1.25,   5.00),
+        m if m.contains("gemini-1.5-flash")          => (0.075,  0.30),
+
+        // ── xAI Grok (specific versions before generic) ───────────────────
+        m if m.contains("grok-3")                    => (3.00,   15.00),
+        m if m.contains("grok-2")                    => (2.00,   10.00),
+        m if m.contains("grok")                      => (5.00,   15.00),
+
+        // ── Meta Llama 4 ──────────────────────────────────────────────────
+        m if m.contains("llama-4-maverick")          => (0.24,   0.77),
+        m if m.contains("llama-4-scout")             => (0.20,   0.60),
+
+        // ── Meta Llama 3.3 ────────────────────────────────────────────────
+        m if m.contains("llama-3.3-70b")             => (0.59,   0.79),
+
+        // ── Meta Llama 3.2 (larger sizes first) ───────────────────────────
+        m if m.contains("llama-3.2-90b")             => (0.90,   0.90),
+        m if m.contains("llama-3.2-11b")             => (0.18,   0.18),
+        m if m.contains("llama-3.2-3b")              => (0.06,   0.06),
+        m if m.contains("llama-3.2-1b")              => (0.04,   0.04),
+
+        // ── Meta Llama 3.1 ────────────────────────────────────────────────
+        m if m.contains("llama-3.1-405b")            => (3.00,   3.00),
+        m if m.contains("llama-3.1-70b")             => (0.52,   0.75),
+        m if m.contains("llama-3.1-8b")              => (0.18,   0.18),
+
+        // ── Mistral / Mixtral / Codestral / Pixtral ───────────────────────
+        m if m.contains("mistral-large")             => (2.00,   6.00),
+        m if m.contains("mistral-medium")            => (2.75,   8.10),
+        m if m.contains("mistral-small")             => (0.20,   0.60),
+        m if m.contains("codestral")                 => (0.30,   0.90),
+        m if m.contains("pixtral")                   => (2.00,   6.00),
+        m if m.contains("mixtral")                   => (0.24,   0.24),
+
+        // ── DeepSeek (R1 reasoning before generic deepseek) ───────────────
+        m if m.contains("deepseek-r1")               => (0.55,   2.19),
+        m if m.contains("deepseek")                  => (0.14,   0.28),
+
+        // ── Cohere Command (plus before base) ─────────────────────────────
+        m if m.contains("command-r-plus")            => (2.50,   10.00),
+        m if m.contains("command-r")                 => (0.50,   1.50),
+
+        // ── Perplexity Sonar (pro before base) ────────────────────────────
+        m if m.contains("sonar-pro")                 => (3.00,   15.00),
+        m if m.contains("sonar")                     => (1.00,   5.00),
+
+        // ── Google Gemma ──────────────────────────────────────────────────
+        m if m.contains("gemma")                     => (0.10,   0.10),
+
+        // ── Fallback ──────────────────────────────────────────────────────
+        _ => (1.00, 3.00), // unknown model — cost estimate will be inaccurate
     }
 }
 
@@ -971,5 +1052,171 @@ mod tests {
     #[test]
     fn detect_provider_openrouter() {
         assert_eq!(detect_provider("https://openrouter.ai/api/v1"), "openrouter");
+    }
+
+    #[test]
+    fn detect_provider_xai() {
+        assert_eq!(detect_provider("https://api.x.ai/v1"), "xai");
+    }
+
+    #[test]
+    fn detect_provider_perplexity() {
+        assert_eq!(detect_provider("https://api.perplexity.ai"), "perplexity");
+        assert_eq!(detect_provider("https://api.perplexity.ai/chat/completions"), "perplexity");
+    }
+
+    #[test]
+    fn detect_provider_bedrock() {
+        assert_eq!(
+            detect_provider("https://bedrock-runtime.us-east-1.amazonaws.com"),
+            "bedrock"
+        );
+        assert_eq!(
+            detect_provider("https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3"),
+            "bedrock"
+        );
+    }
+
+    #[test]
+    fn detect_provider_fireworks() {
+        assert_eq!(detect_provider("https://api.fireworks.ai/inference/v1"), "fireworks");
+    }
+
+    #[test]
+    fn detect_provider_nvidia() {
+        assert_eq!(detect_provider("https://integrate.api.nvidia.com/v1"), "nvidia");
+        assert_eq!(detect_provider("https://api.nvidia.com/v1"), "nvidia");
+    }
+
+    // ── New model pricing tests ───────────────────────────────────────────────
+
+    #[test]
+    fn model_prices_gpt41_cheaper_than_gpt4_legacy() {
+        let (inp41, out41) = model_prices("gpt-4.1");
+        let (inp4, _) = model_prices("gpt-4");
+        assert!(inp41 < inp4, "gpt-4.1 should be cheaper input than legacy gpt-4");
+        assert_eq!((inp41, out41), (2.00, 8.00));
+    }
+
+    #[test]
+    fn model_prices_gpt41_mini_uses_gpt41_arm() {
+        // Until mini/nano get dedicated pricing, they match the gpt-4.1 arm.
+        let (inp, _) = model_prices("gpt-4.1-mini");
+        assert_eq!(inp, 2.00, "gpt-4.1-mini should fall through to gpt-4.1 pricing");
+    }
+
+    #[test]
+    fn model_prices_claude_37_sonnet() {
+        assert_eq!(model_prices("claude-3-7-sonnet-20250219"), (3.00, 15.00));
+    }
+
+    #[test]
+    fn model_prices_gemini_25_pro() {
+        assert_eq!(model_prices("gemini-2.5-pro"), (1.25, 10.00));
+    }
+
+    #[test]
+    fn model_prices_gemini_20_flash_lite() {
+        let (inp_lite, _) = model_prices("gemini-2.0-flash-lite");
+        let (inp_full, _) = model_prices("gemini-2.0-flash");
+        assert!(inp_lite <= inp_full, "flash-lite should be <= flash price");
+    }
+
+    #[test]
+    fn model_prices_gemini_15_flash_8b() {
+        let (inp_8b, _) = model_prices("gemini-1.5-flash-8b");
+        let (inp_flash, _) = model_prices("gemini-1.5-flash");
+        assert!(inp_8b < inp_flash, "flash-8b should be cheaper than flash");
+    }
+
+    #[test]
+    fn model_prices_llama_4_scout() {
+        assert_eq!(model_prices("llama-4-scout-17b-16e-instruct"), (0.20, 0.60));
+    }
+
+    #[test]
+    fn model_prices_llama_32_sizes() {
+        assert_eq!(model_prices("llama-3.2-90b-vision-instruct"), (0.90, 0.90));
+        assert_eq!(model_prices("llama-3.2-11b-vision-instruct"), (0.18, 0.18));
+        assert_eq!(model_prices("llama-3.2-3b-instruct"), (0.06, 0.06));
+        assert_eq!(model_prices("llama-3.2-1b-instruct"), (0.04, 0.04));
+    }
+
+    #[test]
+    fn model_prices_deepseek_r1_more_expensive_than_v3() {
+        let (inp_r1, out_r1) = model_prices("deepseek-r1");
+        let (inp_v3, out_v3) = model_prices("deepseek-v3");
+        assert!(inp_r1 > inp_v3, "DeepSeek R1 reasoning should cost more input than V3");
+        assert!(out_r1 > out_v3, "DeepSeek R1 reasoning should cost more output than V3");
+    }
+
+    #[test]
+    fn model_prices_deepseek_r1() {
+        assert_eq!(model_prices("deepseek-r1"), (0.55, 2.19));
+    }
+
+    #[test]
+    fn model_prices_grok_versions() {
+        assert_eq!(model_prices("grok-3"), (3.00, 15.00));
+        assert_eq!(model_prices("grok-2-1212"), (2.00, 10.00));
+    }
+
+    #[test]
+    fn model_prices_command_r_plus_more_expensive_than_command_r() {
+        let (inp_plus, _) = model_prices("command-r-plus");
+        let (inp_base, _) = model_prices("command-r");
+        assert!(inp_plus > inp_base, "command-r-plus should cost more than command-r");
+    }
+
+    #[test]
+    fn model_prices_sonar_pro_more_expensive_than_sonar() {
+        let (inp_pro, _) = model_prices("sonar-pro");
+        let (inp_base, _) = model_prices("sonar");
+        assert!(inp_pro > inp_base, "sonar-pro should cost more than sonar");
+    }
+
+    #[test]
+    fn model_prices_codestral_and_pixtral() {
+        let (inp_code, _) = model_prices("codestral-latest");
+        let (inp_pix, _) = model_prices("pixtral-large-2411");
+        assert_eq!(inp_code, 0.30);
+        assert_eq!(inp_pix, 2.00);
+    }
+
+    #[test]
+    fn model_prices_mistral_medium() {
+        assert_eq!(model_prices("mistral-medium-2312"), (2.75, 8.10));
+    }
+
+    #[test]
+    fn is_known_model_grok_is_known() {
+        assert!(is_known_model("grok-3"));
+        assert!(is_known_model("grok-2-1212"));
+    }
+
+    #[test]
+    fn is_known_model_deepseek_r1_is_known() {
+        assert!(is_known_model("deepseek-r1"));
+    }
+
+    #[test]
+    fn is_known_model_llama_4_scout_is_known() {
+        assert!(is_known_model("llama-4-scout-17b-16e-instruct"));
+    }
+
+    #[test]
+    fn is_known_model_command_r_plus_is_known() {
+        assert!(is_known_model("command-r-plus"));
+        assert!(is_known_model("command-r"));
+    }
+
+    #[test]
+    fn is_known_model_gemini_25_is_known() {
+        assert!(is_known_model("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn is_known_model_claude_37_is_known() {
+        assert!(is_known_model("claude-3-7-sonnet-20250219"));
     }
 }

@@ -561,6 +561,16 @@ impl Store {
 }
 
 pub fn db_path() -> Result<PathBuf> {
+    // On Linux, respect XDG Base Directory Specification when XDG_DATA_HOME is
+    // explicitly set.  We do NOT default to ~/.local/share to avoid breaking
+    // existing users who already have data at ~/.trace/trace.db.
+    #[cfg(target_os = "linux")]
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg).join("trace").join("trace.db"));
+        }
+    }
+    // Universal fallback: ~/.trace/trace.db (Windows, macOS, Linux without XDG).
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
