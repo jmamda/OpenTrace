@@ -546,6 +546,18 @@ impl Store {
             "SELECT COUNT(*) FROM calls", [], |r| r.get(0))?;
         Ok(count)
     }
+
+    /// Return the total estimated cost in USD for all calls recorded at or
+    /// after `since_iso`.  Returns 0.0 when no records match or cost_usd is
+    /// NULL on all rows.
+    pub fn cost_since(&self, since_iso: &str) -> Result<f64> {
+        let sum: f64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM calls WHERE timestamp >= ?1",
+            params![since_iso],
+            |r| r.get(0),
+        )?;
+        Ok(sum)
+    }
 }
 
 pub fn db_path() -> Result<PathBuf> {
@@ -1251,6 +1263,38 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let result = store.stats_by_model().unwrap();
         assert!(result.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // cost_since
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cost_since_returns_correct_sum() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Insert 3 records with known cost AFTER a baseline timestamp.
+        for i in 0..3u32 {
+            let mut r = make_record(&format!("id-{i}"), "gpt-4o", 200);
+            r.cost_usd = Some(1.0); // $1 each → $3 total
+            store.insert(&r).unwrap();
+        }
+
+        // An old record that must NOT be counted.
+        let mut old = make_record("old", "gpt-4o", 200);
+        old.timestamp = "2020-01-01T00:00:00.000Z".to_string();
+        old.cost_usd = Some(999.0);
+        store.insert(&old).unwrap();
+
+        let sum = store.cost_since("2024-01-01T00:00:00.000Z").unwrap();
+        assert!((sum - 3.0).abs() < 1e-9, "expected $3.00, got ${}", sum);
+    }
+
+    #[test]
+    fn cost_since_empty_returns_zero() {
+        let store = Store::open_in_memory().unwrap();
+        let sum = store.cost_since("2024-01-01T00:00:00.000Z").unwrap();
+        assert_eq!(sum, 0.0);
     }
 
     #[test]

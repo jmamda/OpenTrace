@@ -71,6 +71,7 @@ async fn start_proxy(upstream_url: String, db_path: &PathBuf) -> u16 {
         store_tx,
         verbose: false,
         no_request_bodies: false,
+        redact_fields: vec![],
     };
 
     let app = proxy::router(state);

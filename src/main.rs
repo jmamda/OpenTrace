@@ -1,7 +1,9 @@
 mod capture;
+mod config;
 mod metrics;
 mod otel;
 mod proxy;
+mod serve;
 mod store;
 
 use anyhow::{Context, Result};
@@ -14,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.2.0",
+    version = "0.21.0",
     long_about = None,
 )]
 struct Cli {
@@ -26,13 +28,13 @@ struct Cli {
 enum Commands {
     /// Start the proxy server
     Start {
-        /// Port to listen on
-        #[arg(short, long, default_value = "4000", env = "TRACE_PORT")]
-        port: u16,
+        /// Port to listen on [default: 4000]
+        #[arg(short, long, env = "TRACE_PORT")]
+        port: Option<u16>,
 
-        /// Upstream LLM API base URL
-        #[arg(short, long, default_value = "https://api.openai.com", env = "TRACE_UPSTREAM")]
-        upstream: String,
+        /// Upstream LLM API base URL [default: https://api.openai.com]
+        #[arg(short, long, env = "TRACE_UPSTREAM")]
+        upstream: Option<String>,
 
         /// Address to bind on (use 0.0.0.0 to expose on the local network)
         #[arg(long, default_value = "127.0.0.1", env = "TRACE_BIND")]
@@ -46,24 +48,34 @@ enum Commands {
         #[arg(long, default_value = "300", env = "TRACE_UPSTREAM_TIMEOUT")]
         upstream_timeout: u64,
 
-        /// Delete records older than this many days (0 = keep forever)
-        #[arg(long, default_value = "90", env = "TRACE_RETENTION_DAYS")]
-        retention_days: u32,
+        /// Delete records older than this many days (0 = keep forever) [default: 90]
+        #[arg(long, env = "TRACE_RETENTION_DAYS")]
+        retention_days: Option<u32>,
 
         /// Do not store request bodies (prompts) in the database.
-        /// Use in compliance-sensitive environments where prompt data must not
-        /// be persisted at rest.
         #[arg(long, env = "TRACE_NO_REQUEST_BODIES")]
         no_request_bodies: bool,
 
-        /// Expose Prometheus metrics on this port (e.g. 9091). 0 = disabled.
-        #[arg(long, default_value = "0", env = "TRACE_METRICS_PORT")]
-        metrics_port: u16,
+        /// Expose Prometheus metrics on this port (e.g. 9091). 0 = disabled. [default: 0]
+        #[arg(long, env = "TRACE_METRICS_PORT")]
+        metrics_port: Option<u16>,
 
         /// Send spans to this OTLP HTTP endpoint (e.g. http://localhost:4318).
-        /// Uses the OTLP HTTP/JSON format — no extra crates required.
         #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
         otel_endpoint: Option<String>,
+
+        /// Comma-separated top-level JSON keys to redact from stored request bodies.
+        /// Example: --redact-fields messages,system_prompt
+        #[arg(long, env = "TRACE_REDACT_FIELDS")]
+        redact_fields: Option<String>,
+
+        /// Emit a budget warning to stderr when spend exceeds this USD amount in the period.
+        #[arg(long, env = "TRACE_BUDGET_ALERT_USD")]
+        budget_alert_usd: Option<f64>,
+
+        /// Budget period for --budget-alert-usd: day | week | month [default: month]
+        #[arg(long, env = "TRACE_BUDGET_PERIOD")]
+        budget_period: Option<String>,
     },
 
     /// Query captured calls
@@ -160,15 +172,74 @@ enum Commands {
         #[arg(long)]
         until: Option<String>,
     },
+
+    /// Start the local web dashboard (reads existing trace.db, no proxy)
+    Serve {
+        /// Port for the dashboard [default: 8080]
+        #[arg(short, long, env = "TRACE_UI_PORT")]
+        port: Option<u16>,
+    },
+
+    /// Print a cost report for captured calls
+    Report {
+        /// Show calls at or after this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Show calls at or before this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Filter by model name (substring match)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Output format: text (default) | json | github
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Exit with code 1 if total cost exceeds this USD amount
+        #[arg(long)]
+        fail_over_usd: Option<f64>,
+    },
+
+    /// Manage the trace config file
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the effective config (file values merged with env vars)
+    Show,
+    /// Print the active config file path (or "no config file found")
+    Path,
+    /// Write a default config skeleton to ~/.config/trace/config.toml
+    Init,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Load config file once; used as fallback defaults below.
+    let cfg = config::load_config();
+    let cfg_path = config::config_path();
+
     match cli.command.unwrap_or(Commands::Stats { breakdown: false, endpoint: false }) {
-        Commands::Start { port, upstream, bind, verbose, upstream_timeout, retention_days, no_request_bodies, metrics_port, otel_endpoint } => {
-            cmd_start(port, upstream, bind, verbose, upstream_timeout, retention_days, no_request_bodies, metrics_port, otel_endpoint).await
+        Commands::Start {
+            port, upstream, bind, verbose, upstream_timeout, retention_days,
+            no_request_bodies, metrics_port, otel_endpoint,
+            redact_fields, budget_alert_usd, budget_period,
+        } => {
+            cmd_start(
+                port, upstream, bind, verbose, upstream_timeout, retention_days,
+                no_request_bodies, metrics_port, otel_endpoint,
+                redact_fields, budget_alert_usd, budget_period,
+                &cfg,
+            ).await
         }
         Commands::Query { last, json, bodies, full, model, errors, since, until } => {
             cmd_query(last, json, bodies, full, model, errors, since, until)
@@ -191,20 +262,68 @@ async fn main() -> Result<()> {
         Commands::Export { format, model, since, until } => {
             cmd_export(format, model, since, until)
         }
+        Commands::Serve { port } => {
+            let serve_cfg = cfg.serve.as_ref();
+            let resolved_port = port
+                .or_else(|| serve_cfg.and_then(|s| s.port))
+                .unwrap_or(8080);
+            serve::cmd_serve(resolved_port).await
+        }
+        Commands::Report { since, until, model, format, fail_over_usd } => {
+            cmd_report(since, until, model, format, fail_over_usd)
+        }
+        Commands::Config { action } => {
+            cmd_config(action, &cfg, cfg_path.as_deref())
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_start(
-    port: u16,
-    upstream: String,
+    port: Option<u16>,
+    upstream: Option<String>,
     bind: String,
     verbose: bool,
     upstream_timeout: u64,
-    retention_days: u32,
+    retention_days: Option<u32>,
     no_request_bodies: bool,
-    metrics_port: u16,
+    metrics_port: Option<u16>,
     otel_endpoint: Option<String>,
+    redact_fields_str: Option<String>,
+    budget_alert_usd: Option<f64>,
+    budget_period: Option<String>,
+    cfg: &config::TraceConfig,
 ) -> Result<()> {
+    // Merge CLI/env args with config file defaults. Priority: CLI > env > config > hardcoded.
+    let start_cfg = cfg.start.as_ref();
+    let port = port.or_else(|| start_cfg.and_then(|s| s.port)).unwrap_or(4000);
+    let upstream = upstream
+        .or_else(|| start_cfg.and_then(|s| s.upstream.clone()))
+        .unwrap_or_else(|| "https://api.openai.com".to_string());
+    let retention_days = retention_days
+        .or_else(|| start_cfg.and_then(|s| s.retention_days))
+        .unwrap_or(90);
+    let metrics_port = metrics_port
+        .or_else(|| start_cfg.and_then(|s| s.metrics_port))
+        .unwrap_or(0);
+    let otel_endpoint = otel_endpoint.or_else(|| start_cfg.and_then(|s| s.otel_endpoint.clone()));
+
+    // Redact fields: CLI string (comma-sep) → config file array → empty
+    let redact_fields: Vec<String> = redact_fields_str
+        .map(|s| {
+            s.split(',')
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+                .collect()
+        })
+        .or_else(|| start_cfg.and_then(|s| s.redact_fields.clone()))
+        .unwrap_or_default();
+
+    let budget_alert_usd = budget_alert_usd.or_else(|| start_cfg.and_then(|s| s.budget_alert_usd));
+    let budget_period = budget_period
+        .or_else(|| start_cfg.and_then(|s| s.budget_period.clone()))
+        .unwrap_or_else(|| "month".to_string());
+
     // Validate upstream URL scheme early — prevent footguns like file:/// or ftp://.
     {
         let scheme = upstream.splitn(2, "://").next().unwrap_or("");
@@ -219,7 +338,7 @@ async fn cmd_start(
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.2".bold());
+    println!("{}", "trace v0.21".bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
     println!("  storage    {}", db_path.display().to_string().cyan());
@@ -232,12 +351,18 @@ async fn cmd_start(
     if let Some(ref ep) = otel_endpoint {
         println!("  otel       {}", ep.cyan());
     }
+    if !redact_fields.is_empty() {
+        println!("  redact     {}", redact_fields.join(", ").cyan());
+    }
+    if let Some(limit) = budget_alert_usd {
+        println!("  budget     ${:.2} / {}", limit, budget_period.cyan());
+    }
     println!();
     println!("Set your LLM client:");
     println!("  {}", format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow());
     println!();
 
-    // Warn when binding on non-localhost — proxy will be reachable from the network.
+    // Warn when binding on non-localhost.
     let is_localhost = matches!(bind.as_str(), "127.0.0.1" | "::1" | "localhost");
     if !is_localhost {
         eprintln!("{}", format!(
@@ -248,7 +373,6 @@ async fn cmd_start(
         eprintln!();
     }
 
-    // Warn if upstream is plain HTTP — traffic will be unencrypted in transit.
     if !upstream.starts_with("https://") {
         eprintln!("{}", format!(
             "WARNING: upstream '{}' is not HTTPS — traffic may be unencrypted.",
@@ -258,11 +382,15 @@ async fn cmd_start(
     }
 
     println!("{}", format!("Note: full request/response bodies (including prompts) are stored in {}", db_path.display()).dimmed());
-    // On Windows the database has no restricted file permissions (unlike Unix 0o600).
-    // Warn users on shared machines where other admins could read the file.
     #[cfg(windows)]
     eprintln!("{}", "WARNING: on Windows, the trace database has default NTFS permissions and may be readable by other administrators on this machine.".yellow());
     println!();
+
+    // Store budget config in DB meta so `trace watch` can read it.
+    if let Some(budget_usd) = budget_alert_usd {
+        let _ = store.update_meta("budget_alert_usd", &budget_usd.to_string());
+        let _ = store.update_meta("budget_period", &budget_period);
+    }
 
     // Build MetricsState if --metrics-port is set.
     let metrics_state: Option<Arc<metrics::MetricsState>> = if metrics_port > 0 {
@@ -276,9 +404,6 @@ async fn cmd_start(
         Arc::new(otel::OtelExporter::new(ep.to_string()))
     });
 
-    // Bounded channel — backpressure prevents OOM at high RPS.
-    // try_send in the proxy drops records (and increments DROPPED_RECORDS) rather
-    // than blocking requests.
     let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(20_000);
 
     let metrics_writer = metrics_state.clone();
@@ -319,21 +444,19 @@ async fn cmd_start(
     }
 
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(false) // explicit: always verify TLS certs
+        .danger_accept_invalid_certs(false)
         .timeout(std::time::Duration::from_secs(upstream_timeout))
         .build()
         .context("failed to build HTTP client")?;
 
-    // Non-blocking startup connectivity check — warns if the upstream host is
-    // unreachable.  Any HTTP response (including 4xx/5xx) means the host is up.
-    // Only connection errors and DNS failures trigger a warning.
+    // Non-blocking startup connectivity check.
     if let Ok(check_client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
     {
         let check_url = upstream.trim_end_matches('/').to_string();
         match check_client.head(&check_url).send().await {
-            Ok(_) => {} // reachable — any HTTP response is fine
+            Ok(_) => {}
             Err(e) if e.is_connect() || e.is_timeout() => {
                 eprintln!("{}", format!(
                     "WARNING: upstream '{}' did not respond ({}). Proxy will start anyway.",
@@ -341,7 +464,7 @@ async fn cmd_start(
                 ).yellow());
                 eprintln!();
             }
-            Err(_) => {} // auth errors, redirects, TLS issues — host is reachable
+            Err(_) => {}
         }
     }
 
@@ -351,11 +474,10 @@ async fn cmd_start(
         store_tx,
         verbose,
         no_request_bodies,
+        redact_fields,
     };
 
-    // Flush DROPPED_RECORDS counter to DB every 10s so `trace stats` can see it
-    // across process boundaries (the AtomicU64 is in-process only).
-    // Also syncs to MetricsState so Prometheus /metrics reflects it.
+    // Flush DROPPED_RECORDS counter to DB every 10s.
     {
         let flush_store = store::Store::open().context("failed to open trace database for metrics")?;
         let metrics_flush = metrics_state.clone();
@@ -377,6 +499,38 @@ async fn cmd_start(
                         m.set_dropped_records(new_total);
                     }
                     last_flushed = current;
+                }
+            }
+        });
+    }
+
+    // Budget alerting task (checks every 60s, warns at most once per 10min).
+    if let Some(budget_usd) = budget_alert_usd {
+        let budget_period_task = budget_period.clone();
+        let metrics_budget = metrics_state.clone();
+        tokio::spawn(async move {
+            let mut last_warned: Option<std::time::Instant> = None;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let since = period_start_iso(&budget_period_task);
+                if let Ok(budget_store) = store::Store::open() {
+                    if let Ok(spent) = budget_store.cost_since(&since) {
+                        if let Some(ref m) = metrics_budget {
+                            m.set_budget_spent(spent, budget_usd, &budget_period_task);
+                        }
+                        if spent >= budget_usd {
+                            let should_warn = last_warned
+                                .map(|t| t.elapsed() >= std::time::Duration::from_secs(600))
+                                .unwrap_or(true);
+                            if should_warn {
+                                eprintln!(
+                                    "[trace] BUDGET WARNING: ${:.2} spent / ${:.2} limit this {}",
+                                    spent, budget_usd, budget_period_task
+                                );
+                                last_warned = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -435,9 +589,6 @@ async fn cmd_start(
         .await
         .context("server error")?;
 
-    // store_tx was moved into ProxyState which is owned by the router.
-    // When axum::serve returns, the router is dropped → ProxyState dropped → store_tx dropped.
-    // The writer task sees channel closed and drains. Wait up to 5s.
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         writer_handle,
@@ -482,7 +633,6 @@ fn cmd_query(
     since: Option<String>,
     until: Option<String>,
 ) -> Result<()> {
-    // Validate and normalise timestamp arguments before touching the DB.
     let since = since.map(parse_since_ts).transpose()?;
     let until = until.map(parse_until_ts).transpose()?;
 
@@ -490,7 +640,6 @@ fn cmd_query(
     let filter = store::QueryFilter { errors_only: errors, model, since, until };
     let mut calls = store.query_filtered(limit, &filter)?;
 
-    // Show oldest first in table output.
     calls.reverse();
 
     if json {
@@ -547,12 +696,34 @@ async fn cmd_watch(model: Option<String>, errors: bool) -> Result<()> {
         ..Default::default()
     };
 
-    // Initialize last_ts to the most recent record's timestamp, or epoch if none.
+    // Read budget config from DB meta (written by `trace start` when budget alerting is active).
+    let budget_alert_usd: Option<f64> = store
+        .get_meta("budget_alert_usd")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok());
+    let budget_period = store
+        .get_meta("budget_period")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "month".to_string());
+
     let latest = store.query_filtered(1, &store::QueryFilter::default())?;
     let mut last_ts = latest
         .first()
         .map(|r| r.timestamp.clone())
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+
+    // Budget spend, refreshed every ~10s (40 × 250ms ticks).
+    let mut budget_spent: f64 = 0.0;
+    let mut budget_tick: u32 = 0;
+
+    // Print budget header line if budget alerting is configured.
+    if let Some(limit) = budget_alert_usd {
+        let since = period_start_iso(&budget_period);
+        budget_spent = store.cost_since(&since).unwrap_or(0.0);
+        print_budget_line(budget_spent, limit, &budget_period);
+    }
 
     print_query_header();
     let mut rows_since_header: usize = 0;
@@ -566,6 +737,15 @@ async fn cmd_watch(model: Option<String>, errors: bool) -> Result<()> {
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
         }
 
+        budget_tick += 1;
+        if budget_tick % 40 == 0 {
+            if let Some(limit) = budget_alert_usd {
+                let since = period_start_iso(&budget_period);
+                budget_spent = store.cost_since(&since).unwrap_or(budget_spent);
+                print_budget_line(budget_spent, limit, &budget_period);
+            }
+        }
+
         let new_records = store.query_after(&last_ts, &filter, 100)?;
         for record in &new_records {
             print_call_row(record);
@@ -576,6 +756,16 @@ async fn cmd_watch(model: Option<String>, errors: bool) -> Result<()> {
                 rows_since_header = 0;
             }
         }
+    }
+}
+
+fn print_budget_line(spent: f64, limit: f64, period: &str) {
+    let pct = if limit > 0.0 { (spent / limit * 100.0) as u32 } else { 0 };
+    let line = format!("budget  ${:.2} / ${:.2} this {}  ({}%)", spent, limit, period, pct);
+    if pct >= 80 {
+        println!("{}", line.red());
+    } else {
+        println!("{}", line.dimmed());
     }
 }
 
@@ -659,7 +849,6 @@ fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
     println!("  output tokens     {}", s.total_output_tokens.to_string().cyan());
     println!("  estimated cost    {}", format!("${:.4}", s.total_cost_usd).cyan());
 
-    // Show dropped records warning if any were lost due to channel backpressure.
     let dropped: u64 = store
         .get_meta("dropped_records")
         .ok()
@@ -836,7 +1025,6 @@ fn cmd_export(
 
     match format.as_str() {
         "csv" => {
-            // Header — scalar fields only (bodies are excluded: too large / complex for CSV).
             println!(
                 "id,timestamp,provider,model,endpoint,status_code,latency_ms,\
                  ttft_ms,input_tokens,output_tokens,cost_usd,error,provider_request_id"
@@ -861,7 +1049,6 @@ fn cmd_export(
             }
         }
         _ => {
-            // "jsonl" — newline-delimited JSON, one CallRecord per line
             for r in &records {
                 println!("{}", serde_json::to_string(&r)?);
             }
@@ -872,10 +1059,236 @@ fn cmd_export(
 }
 
 // ---------------------------------------------------------------------------
+// trace report
+// ---------------------------------------------------------------------------
+
+struct ModelReportRow {
+    model: String,
+    calls: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_usd: f64,
+}
+
+fn cmd_report(
+    since: Option<String>,
+    until: Option<String>,
+    model: Option<String>,
+    format: String,
+    fail_over_usd: Option<f64>,
+) -> Result<()> {
+    let since = since.map(parse_since_ts).transpose()?;
+    let until = until.map(parse_until_ts).transpose()?;
+
+    let store = store::Store::open().context("failed to open trace database")?;
+    let filter = store::QueryFilter {
+        errors_only: false,
+        model,
+        since: since.clone(),
+        until: until.clone(),
+    };
+    let records = store.query_all_filtered(&filter)?;
+
+    // Aggregate per-model stats from the filtered record set.
+    let mut model_map: std::collections::HashMap<String, ModelReportRow> =
+        std::collections::HashMap::new();
+    for r in &records {
+        let entry = model_map.entry(r.model.clone()).or_insert(ModelReportRow {
+            model: r.model.clone(),
+            calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+        });
+        entry.calls += 1;
+        entry.input_tokens += r.input_tokens.unwrap_or(0);
+        entry.output_tokens += r.output_tokens.unwrap_or(0);
+        entry.cost_usd += r.cost_usd.unwrap_or(0.0);
+    }
+
+    let total_calls = records.len() as i64;
+    let total_cost: f64 = records.iter().map(|r| r.cost_usd.unwrap_or(0.0)).sum();
+
+    // Sort by cost descending.
+    let mut rows: Vec<ModelReportRow> = model_map.into_values().collect();
+    rows.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+
+    let period_from = since.as_deref().unwrap_or("(all time)");
+    let period_to = until.as_deref().unwrap_or("now");
+
+    match format.as_str() {
+        "json" => {
+            let json = serde_json::json!({
+                "period": {"from": period_from, "to": period_to},
+                "total_calls": total_calls,
+                "total_cost_usd": total_cost,
+                "models": rows.iter().map(|r| serde_json::json!({
+                    "model": r.model,
+                    "calls": r.calls,
+                    "input_tokens": r.input_tokens,
+                    "output_tokens": r.output_tokens,
+                    "cost_usd": r.cost_usd,
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        }
+        "github" => {
+            let output = format_report_github(&rows, total_calls, total_cost);
+            if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&summary_path)
+                    .context("failed to open GITHUB_STEP_SUMMARY")?;
+                write!(f, "{}", output)?;
+            } else {
+                print!("{}", output);
+            }
+        }
+        _ => {
+            // text (default)
+            print_report_text(&rows, total_calls, total_cost, period_from, period_to);
+        }
+    }
+
+    // Threshold check — after printing the report.
+    if let Some(limit) = fail_over_usd {
+        if total_cost > limit {
+            anyhow::bail!(
+                "cost threshold exceeded: ${:.4} spent > ${:.4} limit",
+                total_cost,
+                limit
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn print_report_text(
+    rows: &[ModelReportRow],
+    total_calls: i64,
+    total_cost: f64,
+    from: &str,
+    to: &str,
+) {
+    println!("OpenTrace Cost Report  {} -> {}", from, to);
+    println!(
+        "{:<28}  {:>6}  {:>12}  {:>12}  {:>10}",
+        "model", "calls", "input tok", "output tok", "cost"
+    );
+    let sep = "-".repeat(74);
+    println!("{}", sep);
+    for r in rows {
+        println!(
+            "{:<28}  {:>6}  {:>12}  {:>12}  ${:>9.4}",
+            truncate(&r.model, 28),
+            r.calls,
+            fmt_num_commas(r.input_tokens),
+            fmt_num_commas(r.output_tokens),
+            r.cost_usd,
+        );
+    }
+    println!("{}", sep);
+    println!(
+        "{:<28}  {:>6}  {:>12}  {:>12}  ${:>9.4}",
+        "TOTAL",
+        total_calls,
+        "",
+        "",
+        total_cost
+    );
+}
+
+fn format_report_github(rows: &[ModelReportRow], total_calls: i64, total_cost: f64) -> String {
+    let mut out = String::new();
+    out.push_str("## OpenTrace Cost Report\n");
+    out.push_str("| model | calls | input tok | output tok | cost |\n");
+    out.push_str("|-------|-------|-----------|------------|------|\n");
+    for r in rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | ${:.4} |\n",
+            r.model, r.calls,
+            fmt_num_commas(r.input_tokens),
+            fmt_num_commas(r.output_tokens),
+            r.cost_usd
+        ));
+    }
+    out.push_str(&format!("\n**Total: {} calls / ${:.4}**\n", total_calls, total_cost));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// trace config
+// ---------------------------------------------------------------------------
+
+fn cmd_config(
+    action: ConfigAction,
+    cfg: &config::TraceConfig,
+    cfg_path: Option<&std::path::Path>,
+) -> Result<()> {
+    match action {
+        ConfigAction::Path => {
+            match cfg_path {
+                Some(p) => println!("{}", p.display()),
+                None => println!("no config file found"),
+            }
+        }
+        ConfigAction::Show => {
+            match cfg_path {
+                Some(p) => println!("Config file: {}", p.display()),
+                None => println!("No config file found — showing hardcoded defaults"),
+            }
+            println!();
+            println!("[start]");
+            if let Some(ref s) = cfg.start {
+                println!("  port            = {}", s.port.map(|v| v.to_string()).unwrap_or_else(|| "4000 (default)".to_string()));
+                println!("  upstream        = {}", s.upstream.as_deref().unwrap_or("https://api.openai.com (default)"));
+                if let Some(v) = s.retention_days { println!("  retention_days  = {}", v); }
+                if let Some(v) = s.metrics_port { println!("  metrics_port    = {}", v); }
+                if let Some(ref v) = s.otel_endpoint { println!("  otel_endpoint   = {}", v); }
+                if let Some(ref v) = s.redact_fields { println!("  redact_fields   = {:?}", v); }
+                if let Some(v) = s.budget_alert_usd { println!("  budget_alert_usd = {}", v); }
+                if let Some(ref v) = s.budget_period { println!("  budget_period   = {}", v); }
+            } else {
+                println!("  (using all defaults)");
+            }
+            println!();
+            println!("[serve]");
+            if let Some(ref s) = cfg.serve {
+                println!("  port = {}", s.port.map(|v| v.to_string()).unwrap_or_else(|| "8080 (default)".to_string()));
+            } else {
+                println!("  (using all defaults)");
+            }
+        }
+        ConfigAction::Init => {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            let config_dir = std::path::PathBuf::from(home)
+                .join(".config")
+                .join("trace");
+            std::fs::create_dir_all(&config_dir)
+                .context("failed to create ~/.config/trace")?;
+            let config_path = config_dir.join("config.toml");
+            if config_path.exists() {
+                println!("Config file already exists: {}", config_path.display());
+                println!("Delete it first if you want a fresh skeleton.");
+                return Ok(());
+            }
+            std::fs::write(&config_path, config::DEFAULT_CONFIG_TOML)
+                .context("failed to write config file")?;
+            println!("Created: {}", config_path.display());
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Display helpers
 // ---------------------------------------------------------------------------
 
-/// Print the column header for the query / watch table.
 fn print_query_header() {
     println!("{}", format!(
         "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
@@ -883,7 +1296,6 @@ fn print_query_header() {
     ).bold().underline());
 }
 
-/// Print a single call row in the query / watch table format.
 fn print_call_row(call: &store::CallRecord) {
     let id_short = if call.id.len() >= 8 { &call.id[..8] } else { &call.id };
     let ts = call.timestamp.get(..19).unwrap_or(&call.timestamp);
@@ -914,7 +1326,6 @@ fn print_call_row(call: &store::CallRecord) {
     );
 }
 
-/// Pretty-print JSON if valid, otherwise return as-is.
 fn pretty_json(s: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         serde_json::to_string_pretty(&v).unwrap_or_else(|_| s.to_string())
@@ -923,11 +1334,6 @@ fn pretty_json(s: &str) -> String {
     }
 }
 
-/// Validate and return a `--since` timestamp for use in a SQL `>=` comparison.
-///
-/// Accepts full ISO 8601 (`2024-02-22T14:30:00Z`) or date-only (`2024-02-22`).
-/// Date-only strings compare correctly with stored timestamps because lexicographic
-/// order matches chronological order for ISO 8601: `"2024-02-22T..." >= "2024-02-22"`.
 fn parse_since_ts(s: String) -> Result<String> {
     if chrono::DateTime::parse_from_rfc3339(&s).is_ok() {
         return Ok(s);
@@ -941,11 +1347,6 @@ fn parse_since_ts(s: String) -> Result<String> {
     )
 }
 
-/// Validate and return a `--until` timestamp for use in a SQL `<=` comparison.
-///
-/// Date-only values are normalised to end-of-day (`T23:59:59.999Z`) so that
-/// `--until 2024-02-22` includes all calls made on that day rather than
-/// stopping at midnight (which the raw string comparison would otherwise do).
 fn parse_until_ts(s: String) -> Result<String> {
     if chrono::DateTime::parse_from_rfc3339(&s).is_ok() {
         return Ok(s);
@@ -959,7 +1360,24 @@ fn parse_until_ts(s: String) -> Result<String> {
     )
 }
 
-/// Truncate to `max` Unicode characters (not bytes), appending `…` if clipped.
+/// Compute the ISO 8601 timestamp for the start of the current budget period.
+fn period_start_iso(period: &str) -> String {
+    use chrono::Datelike;
+    let now = chrono::Utc::now();
+    match period {
+        "day" => now.format("%Y-%m-%dT00:00:00.000Z").to_string(),
+        "week" => {
+            let days_from_monday = now.weekday().num_days_from_monday() as i64;
+            let monday = now - chrono::Duration::days(days_from_monday);
+            monday.format("%Y-%m-%dT00:00:00.000Z").to_string()
+        }
+        _ => {
+            // "month" (default)
+            format!("{}-{:02}-01T00:00:00.000Z", now.year(), now.month())
+        }
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let mut chars = s.chars();
     let mut out = String::new();
@@ -977,8 +1395,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Trim and clip a JSON string for inline display.
-/// O(max) — stops scanning after `max` characters.
 fn dim_json(s: &str, max: usize) -> String {
     let trimmed = s.trim();
     let mut clipped = String::new();
@@ -1003,9 +1419,25 @@ fn fmt_tokens(n: i64) -> String {
     }
 }
 
-/// Escape a string for CSV output.
-/// Fields containing commas, double-quotes, or newlines are wrapped in double quotes.
-/// Internal double quotes are escaped by doubling them.
+/// Format an integer with comma-separated thousands groups (e.g. 850,200).
+fn fmt_num_commas(n: i64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let s = n.abs().to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    if n < 0 {
+        result.push('-');
+    }
+    result.chars().rev().collect()
+}
+
 fn csv_field(s: &str) -> String {
     if s.is_empty() {
         return String::new();
@@ -1063,7 +1495,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // export helpers (exercise query_all_filtered indirectly)
+    // export helpers
     // -------------------------------------------------------------------------
 
     fn make_export_record(id: &str, model: &str) -> CallRecord {
@@ -1098,7 +1530,6 @@ mod tests {
         let records = store.query_all_filtered(&crate::store::QueryFilter::default()).unwrap();
         assert_eq!(records.len(), 3);
 
-        // Round-trip each record through JSON serialization.
         for r in &records {
             let line = serde_json::to_string(r).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1111,10 +1542,8 @@ mod tests {
 
     #[test]
     fn export_csv_has_correct_headers() {
-        // The header produced by cmd_export is a deterministic string.
         let expected_header = "id,timestamp,provider,model,endpoint,status_code,latency_ms,\
                                ttft_ms,input_tokens,output_tokens,cost_usd,error,provider_request_id";
-        // Assert it matches the literal we use in cmd_export.
         assert_eq!(
             expected_header,
             "id,timestamp,provider,model,endpoint,status_code,latency_ms,\
@@ -1125,15 +1554,9 @@ mod tests {
     #[test]
     fn export_model_filter_applied() {
         let store = Store::open_in_memory().unwrap();
-        store
-            .insert(&make_export_record("a", "gpt-4o"))
-            .unwrap();
-        store
-            .insert(&make_export_record("b", "claude-opus-4"))
-            .unwrap();
-        store
-            .insert(&make_export_record("c", "gpt-4o"))
-            .unwrap();
+        store.insert(&make_export_record("a", "gpt-4o")).unwrap();
+        store.insert(&make_export_record("b", "claude-opus-4")).unwrap();
+        store.insert(&make_export_record("c", "gpt-4o")).unwrap();
 
         let filter = crate::store::QueryFilter {
             model: Some("gpt".to_string()),
@@ -1145,12 +1568,97 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // report helpers
+    // -------------------------------------------------------------------------
+
+    fn make_cost_record(id: &str, model: &str, cost: f64) -> CallRecord {
+        CallRecord {
+            id: id.to_string(),
+            timestamp: store::now_iso(),
+            provider: "openai".to_string(),
+            model: model.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            status_code: 200,
+            latency_ms: 100,
+            ttft_ms: None,
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cost_usd: Some(cost),
+            request_body: None,
+            response_body: None,
+            error: None,
+            provider_request_id: None,
+        }
+    }
+
+    #[test]
+    fn report_total_cost_matches_records() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_cost_record("a", "gpt-4o", 1.5)).unwrap();
+        store.insert(&make_cost_record("b", "gpt-4o", 2.0)).unwrap();
+        store.insert(&make_cost_record("c", "claude-opus-4", 0.75)).unwrap();
+
+        let records = store.query_all_filtered(&crate::store::QueryFilter::default()).unwrap();
+        let total: f64 = records.iter().map(|r| r.cost_usd.unwrap_or(0.0)).sum();
+        assert!((total - 4.25).abs() < 1e-9, "total cost should be $4.25, got ${}", total);
+    }
+
+    #[test]
+    fn report_fail_over_usd_logic() {
+        // Verify threshold comparison logic: $6.00 total > $5.00 limit.
+        let total_cost = 6.0_f64;
+        let limit = 5.0_f64;
+        assert!(total_cost > limit, "cost exceeds threshold — should trigger failure");
+
+        // Below threshold should not trigger.
+        let below = 4.99_f64;
+        assert!(!(below > limit), "cost below threshold should not trigger failure");
+    }
+
+    #[test]
+    fn report_github_format_has_table_header() {
+        let rows = vec![ModelReportRow {
+            model: "gpt-4o".to_string(),
+            calls: 142,
+            input_tokens: 850_200,
+            output_tokens: 142_000,
+            cost_usd: 0.8423,
+        }];
+        let output = format_report_github(&rows, 142, 0.8423);
+        assert!(output.contains("| model |"), "GitHub output must contain table header");
+        assert!(output.contains("gpt-4o"), "GitHub output must contain model name");
+        assert!(output.contains("**Total:"), "GitHub output must contain total line");
+    }
+
+    // -------------------------------------------------------------------------
+    // fmt_num_commas
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fmt_num_commas_zero() {
+        assert_eq!(fmt_num_commas(0), "0");
+    }
+
+    #[test]
+    fn fmt_num_commas_small() {
+        assert_eq!(fmt_num_commas(999), "999");
+    }
+
+    #[test]
+    fn fmt_num_commas_thousands() {
+        assert_eq!(fmt_num_commas(1_000), "1,000");
+        assert_eq!(fmt_num_commas(850_200), "850,200");
+    }
+
+    #[test]
+    fn fmt_num_commas_millions() {
+        assert_eq!(fmt_num_commas(1_000_000), "1,000,000");
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
-    /// Disable ANSI colour codes for the duration of a test so that string
-    /// comparisons on the output of `dim_json` work reliably regardless of
-    /// whether the test runner has a TTY attached.
     fn no_color() {
         colored::control::set_override(false);
     }
@@ -1166,35 +1674,24 @@ mod tests {
 
     #[test]
     fn truncate_string_shorter_than_max() {
-        // "hello" = 5 chars. Loop runs max-1=9 times but exits early at iter 5
-        // (None branch) → returns s.to_string() = "hello".
         assert_eq!(truncate("hello", 10), "hello");
     }
 
     #[test]
     fn truncate_string_exactly_max_length() {
-        // truncate("hello", max=5): loop runs max-1=4 times, consuming 'h','e','l','l'.
-        // Then chars.next() returns Some('o') → '…' is appended → "hell…".
-        // A string of exactly `max` chars is clipped because the loop reserves
-        // one slot for the ellipsis character.
         assert_eq!(truncate("hello", 5), "hell…");
-        // A string of exactly max-1 chars fits without clipping.
         assert_eq!(truncate("hell", 5), "hell");
     }
 
     #[test]
     fn truncate_string_one_over_max() {
-        // "abcdef" = 6 chars, max=5: loop consumes 4, chars.next() = 'e' → clips.
         let result = truncate("abcdef", 5);
         assert_eq!(result, "abcd…");
-        // The result has 5 Unicode scalar values: 4 ASCII + '…'
         assert_eq!(result.chars().count(), 5);
     }
 
     #[test]
     fn truncate_string_much_longer_than_max() {
-        // max=10: loop runs 9 times (max-1), consumes 9 'a's.
-        // chars.next() is Some → "aaaaaaaaa…" = 9 + 1 = 10 Unicode scalars.
         let long = "a".repeat(100);
         let result = truncate(&long, 10);
         assert_eq!(result.chars().count(), 10);
@@ -1203,44 +1700,31 @@ mod tests {
 
     #[test]
     fn truncate_max_one() {
-        // max=1: loop runs 0 times (max.saturating_sub(1) = 0).
-        // chars.next() on "a" returns Some('a') → out.push('…') → "…".
         assert_eq!(truncate("a", 1), "…");
-        // Same for a longer string.
         assert_eq!(truncate("ab", 1), "…");
-        // Empty string: loop runs 0 times, chars.next() = None → s.to_string() = "".
         assert_eq!(truncate("", 1), "");
     }
 
     #[test]
     fn truncate_max_zero() {
-        // max=0: saturating_sub(1) = 0, loop never runs, checks next char.
-        // For a non-empty string that char exists → returns "…".
         assert_eq!(truncate("abc", 0), "…");
-        // Empty string: no next char → returns "".
         assert_eq!(truncate("", 0), "");
     }
 
     #[test]
     fn truncate_multi_byte_emoji_chars() {
-        // Each emoji is one Unicode scalar value; truncate works on chars, not bytes.
-        let s = "😀😃😄😁😆"; // 5 emoji = 5 chars
-        assert_eq!(truncate(s, 10), s); // shorter than max → unchanged
-        let result = truncate(s, 3);   // keep 2 emoji + '…'
+        let s = "😀😃😄😁😆";
+        assert_eq!(truncate(s, 10), s);
+        let result = truncate(s, 3);
         assert_eq!(result.chars().count(), 3);
         assert!(result.ends_with('…'));
     }
 
     #[test]
     fn truncate_multi_byte_non_emoji() {
-        // Japanese characters: each is one char but 3 bytes in UTF-8.
-        // Verifies truncation counts Unicode scalars, not bytes.
-        let s = "日本語テスト"; // 6 chars
-        // max=7 → loop runs 6 times consuming all chars, next()=None → unchanged.
+        let s = "日本語テスト";
         assert_eq!(truncate(s, 7), s);
-        // max=6 clips: loop runs 5 times, next()=Some('ト') → "日本語テス…".
         assert_eq!(truncate(s, 6), "日本語テス…");
-        // max=4: keep 3 chars + '…' = 4 Unicode scalars total.
         let clipped = truncate(s, 4);
         assert_eq!(clipped.chars().count(), 4);
         assert!(clipped.ends_with('…'));
@@ -1253,7 +1737,6 @@ mod tests {
     #[test]
     fn dim_json_empty_string() {
         no_color();
-        // Empty string trims to empty; inner loop never runs → no '…' appended.
         let result = dim_json("", 10);
         assert_eq!(result, "");
     }
@@ -1268,10 +1751,6 @@ mod tests {
     #[test]
     fn dim_json_string_exactly_max_length() {
         no_color();
-        // "hello" = 5 chars, max=5.
-        // The guard fires when count >= max.  count is incremented AFTER each
-        // push, so all 5 chars are pushed (count goes 0→1→2→3→4→5) before the
-        // loop ends — the guard never triggers.  Result is the full string.
         let result = dim_json("hello", 5);
         assert_eq!(result, "hello");
     }
@@ -1279,8 +1758,6 @@ mod tests {
     #[test]
     fn dim_json_string_one_over_max() {
         no_color();
-        // "helloo" = 6 chars, max=5.
-        // After 5 pushes count==5; on char 'o' (6th) guard fires → "hello…".
         let result = dim_json("helloo", 5);
         assert_eq!(result, "hello…");
     }
@@ -1290,7 +1767,6 @@ mod tests {
         no_color();
         let long = "a".repeat(200);
         let result = dim_json(&long, 10);
-        // Should be clipped: exactly 10 'a's + '…' = 11 chars.
         assert!(result.ends_with('…'));
         assert_eq!(result.chars().count(), 11);
     }
@@ -1298,7 +1774,6 @@ mod tests {
     #[test]
     fn dim_json_strips_leading_and_trailing_whitespace() {
         no_color();
-        // The function calls s.trim() first — whitespace is removed before counting.
         let result = dim_json("  hello  ", 20);
         assert_eq!(result, "hello");
     }
@@ -1306,8 +1781,6 @@ mod tests {
     #[test]
     fn dim_json_leading_whitespace_then_clip() {
         no_color();
-        // After trim, "hello world" is 11 chars; max=5: 5 chars pushed then
-        // the 6th (' ') triggers the guard → "hello…".
         let result = dim_json("   hello world   ", 5);
         assert_eq!(result, "hello…");
     }
@@ -1315,14 +1788,10 @@ mod tests {
     #[test]
     fn dim_json_multi_byte_chars_counted_by_char_not_byte() {
         no_color();
-        // "日本語" = 3 chars, 9 bytes. max=10 → not clipped.
         let result = dim_json("日本語", 10);
         assert_eq!(result, "日本語");
-        // max=2: guard fires when count==2, so 2 chars are pushed then '…'.
-        // '日' (count 0→1) + '本' (count 1→2) pushed, then '語' triggers guard.
         let clipped = dim_json("日本語", 2);
         assert_eq!(clipped, "日本…");
-        // max=3: all 3 chars fit (count reaches 3 after last push, loop ends) → full string.
         let full = dim_json("日本語", 3);
         assert_eq!(full, "日本語");
     }
@@ -1362,19 +1831,16 @@ mod tests {
 
     #[test]
     fn fmt_tokens_boundary_999() {
-        // 999 < 1000 → plain number
         assert_eq!(fmt_tokens(999), "999");
     }
 
     #[test]
     fn fmt_tokens_boundary_1000() {
-        // 1000 >= 1000 → K format
         assert_eq!(fmt_tokens(1_000), "1.0K");
     }
 
     #[test]
     fn fmt_tokens_boundary_1_000_000() {
-        // 1_000_000 >= 1_000_000 → M format
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
     }
 }

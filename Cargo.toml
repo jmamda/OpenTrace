@@ -1,6 +1,6 @@
 [package]
 name = "trace"
-version = "0.2.0"
+version = "0.21.0"
 edition = "2021"
 description = "The strace of LLM calls — local-first observability proxy"
 
@@ -43,6 +43,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # Output formatting
 colored = "2"
 
+# Config file parsing (pure Rust, no build script — safe on Windows Application Control)
+toml = { version = "0.8", features = ["parse"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
 
 [profile.release]
 opt-level = 3

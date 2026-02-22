@@ -225,6 +225,32 @@ pub fn extract_response_text_from_chunks(chunks: &[Bytes]) -> String {
     String::new()
 }
 
+/// Replace the values of top-level JSON object keys listed in `fields` with
+/// `"[REDACTED]"`.  Only the **stored** copy is modified — forwarded traffic
+/// is never touched.
+///
+/// Returns the original body unchanged if:
+/// - `fields` is empty
+/// - the body is not valid JSON
+/// - the top-level value is not a JSON object
+pub fn redact_json_fields(body: &str, fields: &[String]) -> String {
+    if fields.is_empty() {
+        return body.to_string();
+    }
+    let mut value: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return body.to_string(),
+    };
+    if let Some(obj) = value.as_object_mut() {
+        for field in fields {
+            if obj.contains_key(field.as_str()) {
+                obj.insert(field.clone(), Value::String("[REDACTED]".to_string()));
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
+}
+
 /// Detect provider from upstream URL.
 pub fn detect_provider(upstream: &str) -> String {
     if upstream.contains("anthropic") {
@@ -808,6 +834,57 @@ mod tests {
     // -------------------------------------------------------------------------
     // detect_provider
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // redact_json_fields
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn redact_removes_target_key() {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
+        let fields = vec!["messages".to_string()];
+        let result = redact_json_fields(body, &fields);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["messages"].as_str(), Some("[REDACTED]"));
+        assert_eq!(v["model"].as_str(), Some("gpt-4o")); // other fields unchanged
+    }
+
+    #[test]
+    fn redact_ignores_unknown_key() {
+        let body = r#"{"model":"gpt-4o","messages":[]}"#;
+        let fields = vec!["system_prompt".to_string()];
+        let result = redact_json_fields(body, &fields);
+        // Body is returned but field absent — model and messages unchanged
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["model"].as_str(), Some("gpt-4o"));
+        assert!(v["messages"].is_array());
+    }
+
+    #[test]
+    fn redact_multiple_fields_all_removed() {
+        let body = r#"{"model":"gpt-4o","messages":[],"system_prompt":"You are a helpful assistant"}"#;
+        let fields = vec!["messages".to_string(), "system_prompt".to_string()];
+        let result = redact_json_fields(body, &fields);
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["messages"].as_str(), Some("[REDACTED]"));
+        assert_eq!(v["system_prompt"].as_str(), Some("[REDACTED]"));
+        assert_eq!(v["model"].as_str(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn redact_invalid_json_passthrough() {
+        let body = "this is not json at all";
+        let fields = vec!["messages".to_string()];
+        let result = redact_json_fields(body, &fields);
+        assert_eq!(result, body, "invalid JSON should be returned verbatim");
+    }
+
+    #[test]
+    fn redact_empty_fields_passthrough() {
+        let body = r#"{"model":"gpt-4o","messages":[]}"#;
+        let result = redact_json_fields(body, &[]);
+        assert_eq!(result, body);
+    }
 
     #[test]
     fn detect_provider_openai() {

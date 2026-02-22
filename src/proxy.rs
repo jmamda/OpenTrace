@@ -47,6 +47,9 @@ pub struct ProxyState {
     pub verbose: bool,
     /// When true, request bodies (prompts) are not stored in the database.
     pub no_request_bodies: bool,
+    /// Top-level JSON keys whose values are replaced with "[REDACTED]" before
+    /// storing.  Forwarded traffic is never modified.
+    pub redact_fields: Vec<String>,
 }
 
 pub fn router(state: ProxyState) -> Router {
@@ -85,6 +88,7 @@ async fn handle(
     let endpoint = uri.path().to_string();
     let verbose = state.verbose;
     let no_request_bodies = state.no_request_bodies;
+    let redact_fields = state.redact_fields.clone();
     let upstream = state.upstream.clone();
     let client = state.client.clone();
     let store_tx = state.store_tx.clone();
@@ -106,6 +110,14 @@ async fn handle(
 
     // Single parse extracts both model and streaming flag.
     let (model, streaming) = capture::extract_request_info(&req_str);
+
+    // Pre-compute the stored request body: apply field redaction (if configured)
+    // and respect the no_request_bodies flag.  Forwarded bytes are never modified.
+    let stored_req_body: Option<String> = if no_request_bodies {
+        None
+    } else {
+        Some(capture::redact_json_fields(&req_str, &redact_fields))
+    };
 
     // Warn on first use of unknown model so cost estimates are transparent.
     if verbose && !capture::is_known_model(&model) {
@@ -175,7 +187,7 @@ async fn handle(
                 input_tokens: None,
                 output_tokens: None,
                 cost_usd: None,
-                request_body: if no_request_bodies { None } else { Some(req_str) },
+                request_body: stored_req_body,
                 response_body: None,
                 error: Some(e.to_string()),
                 provider_request_id: None,
@@ -214,6 +226,10 @@ async fn handle(
 
     if upstream_streaming {
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1024);
+
+        // Clone stored_req_body for the spawned closure (error path already
+        // consumed the original via early return above).
+        let req_body_for_spawn = stored_req_body;
 
         tokio::spawn(async move {
             // Accumulate all chunks (cheap: Bytes::clone increments Arc refcount)
@@ -302,7 +318,7 @@ async fn handle(
                 input_tokens,
                 output_tokens,
                 cost_usd,
-                request_body: if no_request_bodies { None } else { Some(req_str) },
+                request_body: req_body_for_spawn,
                 response_body,
                 error: None,
                 provider_request_id,
@@ -373,7 +389,7 @@ async fn handle(
             input_tokens,
             output_tokens,
             cost_usd,
-            request_body: if no_request_bodies { None } else { Some(req_str) },
+            request_body: stored_req_body,
             response_body: resp_str,
             error: None,
             provider_request_id,

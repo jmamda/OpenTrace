@@ -36,6 +36,11 @@ struct MetricsInner {
     ttft_count: HashMap<String, u64>,
     /// Dropped records counter (synced from the DB meta table periodically).
     dropped_records: u64,
+    /// Budget alerting state (only populated when --budget-alert-usd is set).
+    budget_spent_usd: f64,
+    budget_limit_usd: f64,
+    budget_period: String,
+    budget_enabled: bool,
 }
 
 /// Shared Prometheus metrics state.
@@ -60,8 +65,21 @@ impl MetricsState {
                 ttft_sum: HashMap::new(),
                 ttft_count: HashMap::new(),
                 dropped_records: 0,
+                budget_spent_usd: 0.0,
+                budget_limit_usd: 0.0,
+                budget_period: String::new(),
+                budget_enabled: false,
             }),
         }
+    }
+
+    /// Update budget spend gauge (called from the budget-alerting task every 60 s).
+    pub fn set_budget_spent(&self, spent: f64, limit: f64, period: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.budget_spent_usd = spent;
+        inner.budget_limit_usd = limit;
+        inner.budget_period = period.to_string();
+        inner.budget_enabled = true;
     }
 
     /// Record a captured call.  Called from the DB-writer task on every insert.
@@ -257,6 +275,22 @@ impl MetricsState {
             inner.dropped_records
         ));
 
+        // --- opentrace_budget_* gauges (only when budget alerting is enabled) --
+        if inner.budget_enabled {
+            out.push_str("# HELP opentrace_budget_spent_usd Estimated spend since the start of the current budget period\n");
+            out.push_str("# TYPE opentrace_budget_spent_usd gauge\n");
+            out.push_str(&format!(
+                "opentrace_budget_spent_usd{{period=\"{}\"}} {:.8}\n",
+                inner.budget_period, inner.budget_spent_usd
+            ));
+            out.push_str("# HELP opentrace_budget_limit_usd Budget limit configured via --budget-alert-usd\n");
+            out.push_str("# TYPE opentrace_budget_limit_usd gauge\n");
+            out.push_str(&format!(
+                "opentrace_budget_limit_usd{{period=\"{}\"}} {:.8}\n",
+                inner.budget_period, inner.budget_limit_usd
+            ));
+        }
+
         out
     }
 }
@@ -366,6 +400,33 @@ mod tests {
             text.contains("opentrace_dropped_records_total 42"),
             "dropped records not reflected:\n{}",
             text
+        );
+    }
+
+    #[test]
+    fn budget_gauge_set_in_metrics() {
+        let m = MetricsState::new();
+        m.set_budget_spent(3.21, 50.0, "month");
+        let text = m.render_prometheus();
+        assert!(
+            text.contains("opentrace_budget_spent_usd{period=\"month\"}"),
+            "budget spent gauge not found:\n{}",
+            text
+        );
+        assert!(
+            text.contains("opentrace_budget_limit_usd{period=\"month\"}"),
+            "budget limit gauge not found:\n{}",
+            text
+        );
+    }
+
+    #[test]
+    fn budget_gauge_absent_when_not_enabled() {
+        let m = MetricsState::new();
+        let text = m.render_prometheus();
+        assert!(
+            !text.contains("opentrace_budget_spent_usd"),
+            "budget gauge should not appear when not enabled"
         );
     }
 
