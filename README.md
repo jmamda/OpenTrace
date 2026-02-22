@@ -6,6 +6,7 @@
 cargo build --release && ./target/release/trace start
 OPENAI_BASE_URL=http://localhost:4000/v1 python my_app.py
 trace stats --breakdown
+trace serve --port 8080    # live web dashboard
 ```
 
 **Why this exists:**
@@ -39,12 +40,18 @@ trace start --upstream https://api.anthropic.com
 
 # Groq, Together, Mistral, or any OpenAI-compatible endpoint
 trace start --upstream https://api.groq.com
+
+# With config file — no flags needed
+echo '[start]
+port = 4000
+upstream = "https://api.openai.com"' > .trace.toml
+trace start
 ```
 
 Output at startup:
 
 ```
-trace v0.1
+trace v0.21
   listening  http://127.0.0.1:4000
   upstream   https://api.openai.com
   storage    /home/user/.trace/trace.db
@@ -105,9 +112,111 @@ The proxy path adds no observable latency. DB writes happen on a bounded backgro
 | `-v`, `--verbose` | `TRACE_VERBOSE` | off | Print each request/response to stderr |
 | `--upstream-timeout` | `TRACE_UPSTREAM_TIMEOUT` | `300` | Upstream timeout in seconds |
 | `--retention-days` | `TRACE_RETENTION_DAYS` | `90` | Auto-delete records older than N days (0 = keep forever) |
+| `--no-request-bodies` | `TRACE_NO_REQUEST_BODIES` | off | Do not store request bodies (prompts) in the database |
+| `--redact-fields` | `TRACE_REDACT_FIELDS` | — | Comma-separated top-level JSON keys to replace with `[REDACTED]` before storing (e.g. `messages,system_prompt`) |
+| `--metrics-port` | `TRACE_METRICS_PORT` | off | Expose Prometheus metrics on this port (e.g. `9091`) |
+| `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Send OTLP HTTP/JSON spans to this endpoint (e.g. `http://localhost:4318`) |
+| `--budget-alert-usd` | `TRACE_BUDGET_ALERT_USD` | — | Emit a stderr warning when spend exceeds this USD amount in the period |
+| `--budget-period` | `TRACE_BUDGET_PERIOD` | `month` | Budget period: `day`, `week`, or `month` |
 
 ```bash
 trace start --upstream https://api.anthropic.com --port 4001 --verbose
+trace start --redact-fields messages,system_prompt
+trace start --budget-alert-usd 50.0 --budget-period month --metrics-port 9091
+```
+
+---
+
+### `trace serve` — local web dashboard
+
+Spin up a browser dashboard that reads from the existing `~/.trace/trace.db`. Does **not** run a proxy — use alongside `trace start` in another terminal.
+
+```bash
+trace serve              # http://localhost:8080
+trace serve --port 3000  # custom port
+```
+
+The dashboard auto-refreshes every 2 seconds and shows:
+- Stat cards: total calls, total cost, avg latency, calls last hour
+- Live call log with model filter and errors-only checkbox
+- Fully offline — zero CDN dependencies
+
+The `serve.port` field in the config file sets the default port.
+
+---
+
+### `trace report` — cost report for CI/CD
+
+Print a summary of costs for captured calls. Designed for CI pipelines.
+
+```bash
+trace report                              # text table, all time
+trace report --since 2026-02-01           # from a date
+trace report --model gpt-4o              # filter by model
+trace report --format json               # JSON output
+trace report --format github             # GitHub Actions job summary markdown
+trace report --fail-over-usd 5.00        # exit 1 if total cost > $5.00
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--since TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
+| `--until TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
+| `-m`, `--model SUBSTR` | — | Filter by model name (substring match) |
+| `--format text\|json\|github` | `text` | Output format |
+| `--fail-over-usd AMOUNT` | — | Exit with code 1 if total cost exceeds this value |
+
+Text output:
+
+```
+OpenTrace Cost Report  2026-02-01 -> now
+model                          calls    input tok   output tok         cost
+------------------------------------------------------------------------------
+gpt-4o                           142      850,200      142,000      $0.8423
+gpt-4o-mini                      891    3,201,100      982,000      $0.1204
+------------------------------------------------------------------------------
+TOTAL                          1,033                               $0.9627
+```
+
+`--format github` writes a Markdown table to `$GITHUB_STEP_SUMMARY` when that env var is set (GitHub Actions), otherwise prints to stdout.
+
+**CI usage:**
+```yaml
+- name: Check LLM spend
+  run: trace report --format github --fail-over-usd 10.00
+```
+
+---
+
+### `trace config` — manage config file
+
+```bash
+trace config path    # print which config file is active (or "no config file found")
+trace config show    # print the effective merged config
+trace config init    # write a default skeleton to ~/.config/trace/config.toml
+```
+
+Config files are searched in order:
+1. `.trace.toml` in the current working directory (project-local, takes priority)
+2. `~/.config/trace/config.toml` (user-global)
+
+Priority: **CLI flags > env vars > config file > hardcoded defaults**
+
+Example `.trace.toml`:
+
+```toml
+[start]
+port = 4000
+upstream = "https://api.openai.com"
+retention_days = 90
+# metrics_port = 9091
+# otel_endpoint = "http://localhost:4318"
+# redact_fields = ["messages"]
+# budget_alert_usd = 50.0
+# budget_period = "month"
+
+[serve]
+port = 8080
 ```
 
 ---
@@ -160,6 +269,14 @@ trace watch --model claude
 trace watch --errors
 ```
 
+When `--budget-alert-usd` was passed to `trace start`, the watch header shows a live budget line:
+
+```
+budget  $3.21 / $50.00 this month  (6%)
+```
+
+The line turns red when spend reaches 80% of the limit.
+
 | Flag | Description |
 |---|---|
 | `-m`, `--model SUBSTR` | Filter by model name |
@@ -211,15 +328,15 @@ response:
 ### `trace stats` — aggregate usage and cost
 
 ```bash
-trace stats                   # overall totals
+trace stats                   # overall totals + p50/p95/p99 latency
 trace stats --breakdown       # per-model breakdown
 trace stats --endpoint        # per-endpoint breakdown
 ```
 
 | Flag | Description |
 |---|---|
-| `-b`, `--breakdown` | Cost, tokens, and latency per model |
-| `--endpoint` | Cost, tokens, and latency per endpoint |
+| `-b`, `--breakdown` | Cost, tokens, and p99 latency per model |
+| `--endpoint` | Cost, tokens, and avg latency per endpoint |
 
 Example output:
 
@@ -230,17 +347,39 @@ trace stats
   calls last hour   23
   errors            2
   avg latency       614ms
+  latency p50       412ms
+  latency p95       1,203ms
+  latency p99       2,841ms
 
   input tokens      4.8M
   output tokens     983.4K
   estimated cost    $28.4712
 
 by model:
-  model                           calls       in       out       cost     avg ms
-  gpt-4o                            821     2.4M    512.0K   $18.1200      712ms
-  gpt-4o-mini                       614   891.2K    201.3K    $0.2546      198ms
-  claude-3-5-sonnet-20241022        412     1.5M    270.1K   $10.0953      934ms
+  model                           calls       in       out       cost     avg ms   p99 ms
+  gpt-4o                            821     2.4M    512.0K   $18.1200      712ms   2900ms
+  gpt-4o-mini                       614   891.2K    201.3K    $0.2546      198ms    430ms
+  claude-3-5-sonnet-20241022        412     1.5M    270.1K   $10.0953      934ms   3100ms
 ```
+
+---
+
+### `trace export` — export to file
+
+Export all captured calls to stdout. Pipe to a file.
+
+```bash
+trace export > calls.jsonl
+trace export --format csv > calls.csv
+trace export --since 2026-02-01 --model gpt-4o > filtered.jsonl
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--format jsonl\|csv` | `jsonl` | Output format |
+| `-m`, `--model SUBSTR` | — | Filter by model name |
+| `--since TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
+| `--until TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
 
 ---
 
@@ -265,6 +404,77 @@ trace clear --yes
 
 ---
 
+## Observability integrations
+
+### Prometheus
+
+```bash
+trace start --metrics-port 9091
+curl http://localhost:9091/metrics
+```
+
+Exposed metrics:
+
+| Metric | Type | Description |
+|---|---|---|
+| `opentrace_requests_total` | counter | Total requests proxied |
+| `opentrace_errors_total` | counter | Requests with status >= 400 or connection failure |
+| `opentrace_latency_ms_bucket` | histogram | Request latency in milliseconds |
+| `opentrace_input_tokens_total` | counter | Cumulative input tokens |
+| `opentrace_output_tokens_total` | counter | Cumulative output tokens |
+| `opentrace_cost_usd_total` | counter | Cumulative estimated cost |
+| `opentrace_dropped_records_total` | gauge | Records dropped due to DB backpressure |
+| `opentrace_budget_spent_usd` | gauge | Spend since start of current budget period (when `--budget-alert-usd` is set) |
+| `opentrace_budget_limit_usd` | gauge | Configured budget limit |
+
+### OpenTelemetry
+
+```bash
+trace start --otel-endpoint http://localhost:4318
+# or
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 trace start
+```
+
+Each call is exported as an OTLP HTTP/JSON span with attributes: `llm.model`, `llm.provider`, `llm.input_tokens`, `llm.output_tokens`, `llm.cost_usd`, `http.status_code`.
+
+---
+
+## Privacy and compliance
+
+### Field-level request body redaction
+
+Keep call metadata (tokens, cost, latency) without storing sensitive content:
+
+```bash
+trace start --redact-fields messages,system_prompt
+# or in .trace.toml:
+# redact_fields = ["messages", "system_prompt"]
+```
+
+Matching **top-level JSON keys** have their values replaced with `"[REDACTED]"` before storing. The body forwarded to the upstream API is **never modified**.
+
+### Suppress all request bodies
+
+```bash
+trace start --no-request-bodies
+```
+
+Records the call metadata but stores `NULL` in `request_body`.
+
+### Budget alerting
+
+```bash
+trace start --budget-alert-usd 50.0 --budget-period month
+```
+
+Checks every 60 seconds. Emits to stderr at most once per 10 minutes when spend meets or exceeds the limit:
+
+```
+[trace] BUDGET WARNING: $51.23 spent / $50.00 limit this month
+```
+
+---
+
 ## What gets captured
 
 Every call is one row in SQLite at `~/.trace/trace.db`.
@@ -282,7 +492,7 @@ Every call is one row in SQLite at `~/.trace/trace.db`.
 | `input_tokens` | `INTEGER` | Prompt tokens from upstream `usage` field |
 | `output_tokens` | `INTEGER` | Completion tokens from upstream `usage` field |
 | `cost_usd` | `REAL` | Estimated cost in USD, from built-in pricing table |
-| `request_body` | `TEXT` | Full JSON request body (up to 16MB) |
+| `request_body` | `TEXT` | Full JSON request body (up to 16MB); `NULL` when `--no-request-bodies` is set; sensitive fields replaced when `--redact-fields` is set |
 | `response_body` | `TEXT` | For non-streaming: full response JSON (up to 10MB). For streaming: extracted text content (up to 256KB). Tool calls are captured as a compact JSON summary. |
 | `provider_request_id` | `TEXT` | Value of `x-request-id` response header — useful for provider support tickets |
 | `error` | `TEXT` | Upstream connection error message, if any |
@@ -306,8 +516,11 @@ Every call is one row in SQLite at `~/.trace/trace.db`.
 | Together AI | `https://api.together.xyz` |
 | Cohere | `https://api.cohere.ai` |
 | DeepSeek | `https://api.deepseek.com` |
+| Azure OpenAI | `https://*.openai.azure.com` |
+| OpenRouter | `https://openrouter.ai` |
+| Ollama | `http://localhost:11434` |
 
-Any OpenAI-compatible endpoint works. The `provider` label in the database is detected from the upstream URL substring. For local models (Ollama, LM Studio, vLLM), provider will show as `unknown` — everything else still works.
+Any OpenAI-compatible endpoint works. The `provider` label in the database is detected from the upstream URL substring. For local models (LM Studio, vLLM), provider will show as `unknown` — everything else still works.
 
 The built-in pricing table covers OpenAI (GPT-4o, GPT-4o mini, o1, o3, embeddings), Anthropic (Claude 3, 3.5, 4 families), Google Gemini (1.5, 2.0), Meta Llama (3.1, 3.3), Mistral, DeepSeek, and Gemma. Unknown models fall back to $1.00/$3.00 per million tokens input/output and emit a warning in verbose mode.
 
@@ -323,6 +536,11 @@ The built-in pricing table covers OpenAI (GPT-4o, GPT-4o mini, o1, o3, embedding
 | Streaming body capture | **yes (256KB cap)** | partial | partial | partial |
 | TTFT metric | **yes** | no | no | no |
 | Cost tracking | yes | yes | yes | yes |
+| Field-level redaction | **yes** | no | no | partial |
+| Budget alerting | **yes** | paid | paid | paid |
+| Web dashboard | **yes (local)** | cloud | cloud | cloud |
+| CI cost gate | **yes** | no | no | no |
+| Prometheus / OTel | **yes** | no | partial | partial |
 | Setup time | **~30s** | ~5 min | ~5 min | ~30 min |
 
 Helicone, LangSmith, and Langfuse are mature products. The tradeoff is that your prompts, completions, and call metadata leave your infrastructure. For teams with data residency requirements, SOC 2 audits in progress, or simply a preference for not sharing LLM I/O with a third party, trace is the alternative.
@@ -338,7 +556,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 - Hop-by-hop headers (`connection`, `transfer-encoding`, `keep-alive`) and network topology headers (`x-forwarded-for`, `x-real-ip`) are stripped before forwarding.
 - `proxy-authorization` headers are stripped and never forwarded to the upstream LLM provider.
 - On Unix, `~/.trace/trace.db` is created with `0600` permissions (owner read/write only). On Windows, NTFS default permissions apply; avoid using trace on shared Windows machines.
-- Full request bodies — including your prompts and any PII they contain — are stored in plaintext SQLite. Keep this in mind before shipping trace to production.
+- Full request bodies — including your prompts and any PII they contain — are stored in plaintext SQLite. Use `--redact-fields` or `--no-request-bodies` for sensitive deployments.
 
 ---
 
@@ -347,7 +565,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 Bug reports and pull requests are welcome.
 
 ```bash
-cargo test   # 229 tests, no external dependencies required
+cargo test   # 330 tests, no external dependencies required
 ```
 
 ## License
