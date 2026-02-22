@@ -51,7 +51,7 @@ trace start
 Output at startup:
 
 ```
-trace v0.23
+trace v0.24.1
   listening  http://127.0.0.1:4000
   upstream   https://api.openai.com
   storage    /home/user/.trace/trace.db
@@ -506,38 +506,59 @@ Every call is one row in SQLite at `~/.trace/trace.db` (or `$XDG_DATA_HOME/trace
 
 ## Supported providers
 
-| Provider | Upstream URL |
+| Provider | Upstream URL | Label |
+|---|---|---|
+| OpenAI | `https://api.openai.com` (default) | `openai` |
+| Anthropic | `https://api.anthropic.com` | `anthropic` |
+| Azure OpenAI | `https://*.openai.azure.com` | `azure-openai` |
+| Google Gemini | `https://generativelanguage.googleapis.com` | `google` |
+| Amazon Bedrock | `https://bedrock-runtime.*.amazonaws.com` | `bedrock` |
+| OpenRouter | `https://openrouter.ai` | `openrouter` |
+| xAI (Grok) | `https://api.x.ai` | `xai` |
+| Perplexity | `https://api.perplexity.ai` | `perplexity` |
+| Alibaba Qwen | `https://dashscope.aliyuncs.com` | `qwen` |
+| Zhipu AI (GLM) | `https://api.z.ai` | `zhipu` |
+| Moonshot (Kimi) | `https://platform.moonshot.ai` | `moonshot` |
+| Mistral | `https://api.mistral.ai` | `mistral` |
+| Groq | `https://api.groq.com` | `groq` |
+| Together AI | `https://api.together.xyz` | `together` |
+| Cohere | `https://api.cohere.ai` | `cohere` |
+| DeepSeek | `https://api.deepseek.com` | `deepseek` |
+| Fireworks AI | `https://api.fireworks.ai` | `fireworks` |
+| NVIDIA NIM | `https://integrate.api.nvidia.com` | `nvidia` |
+| AI21 Labs | `https://api.ai21.com` | `ai21` |
+| Ollama / local | `http://localhost:11434` | `ollama` |
+
+Any OpenAI-compatible endpoint works. The `provider` label in the database is detected from the upstream URL. For local models (LM Studio, vLLM), provider shows as `unknown` — everything else still works.
+
+OpenRouter routes to 200+ models; trace detects the provider as `openrouter` and correctly prices the model from the request body (e.g. `qwen/qwen3-max`, `meta-llama/llama-3.1-70b-instruct`).
+
+Amazon Bedrock model IDs (`anthropic.claude-opus-4-6-v1:0`, `meta.llama3-1-70b-instruct-v1:0`, `amazon.nova-pro-v1:0`) are matched correctly — trace handles both standard and Bedrock naming formats.
+
+The built-in pricing table (80+ entries, updated Feb 2026) covers:
+
+| Family | Models |
 |---|---|
-| OpenAI | `https://api.openai.com` (default) |
-| Anthropic | `https://api.anthropic.com` |
-| Google Gemini | `https://generativelanguage.googleapis.com` |
-| Mistral | `https://api.mistral.ai` |
-| Groq | `https://api.groq.com` |
-| Together AI | `https://api.together.xyz` |
-| Cohere | `https://api.cohere.ai` |
-| DeepSeek | `https://api.deepseek.com` |
-| Azure OpenAI | `https://*.openai.azure.com` |
-| OpenRouter | `https://openrouter.ai` |
-| xAI (Grok) | `https://api.x.ai` |
-| Perplexity | `https://api.perplexity.ai` |
-| Amazon Bedrock | `https://bedrock-runtime.*.amazonaws.com` |
-| Fireworks AI | `https://api.fireworks.ai` |
-| NVIDIA NIM | `https://integrate.api.nvidia.com` |
-| Ollama | `http://localhost:11434` |
-
-Any OpenAI-compatible endpoint works. The `provider` label in the database is detected from the upstream URL. For local models (LM Studio, vLLM), provider will show as `unknown` — everything else still works.
-
-The built-in pricing table (50+ entries, updated Feb 2026) covers:
-- **OpenAI** — GPT-4.1, GPT-4o, GPT-4o mini, o1, o3, embeddings
-- **Anthropic** — Claude 4, Claude 3.7 Sonnet, Claude 3.5, Claude 3 families
-- **Google** — Gemini 2.5 Pro/Flash, Gemini 2.0 Flash/Flash Lite, Gemini 1.5 Pro/Flash/Flash-8B
-- **xAI** — Grok 3, Grok 2, Grok
-- **Meta** — Llama 4 Maverick/Scout, Llama 3.3 70B, Llama 3.2 (1B/3B/11B/90B), Llama 3.1 (8B/70B/405B)
-- **Mistral** — Mistral Large/Medium/Small, Codestral, Pixtral, Mixtral
-- **DeepSeek** — DeepSeek R1, DeepSeek V3
-- **Cohere** — Command R+, Command R
-- **Perplexity** — Sonar Pro, Sonar
-- **Google** — Gemma
+| **OpenAI GPT-5** | GPT-5.2, GPT-5.1, GPT-5.1-Codex, Codex Mini |
+| **OpenAI GPT-4** | GPT-4.1, GPT-4.1 Mini/Nano, GPT-4o, GPT-4o Mini, GPT-4 Turbo |
+| **OpenAI reasoning** | o1, o1-mini, o1-preview, o3, o3-mini |
+| **OpenAI embeddings** | text-embedding-3-large/small, ada-002 |
+| **Anthropic Claude 4** | Opus 4.6, Opus 4.5, Sonnet 4.6, Sonnet 4.5, Haiku 4 (incl. -thinking variants) |
+| **Anthropic Claude 3.x** | Claude 3.7 Sonnet, Claude 3.5 Sonnet/Haiku, Claude 3 Opus/Sonnet/Haiku |
+| **Google Gemini** | Gemini 3.1 Pro/Flash, Gemini 2.5 Pro/Flash, Gemini 2.0 Flash/Flash-Lite, Gemini 1.5 Pro/Flash/Flash-8B |
+| **xAI Grok** | Grok 3, Grok 2, Grok |
+| **Meta Llama 4** | Llama 4 Maverick, Llama 4 Scout |
+| **Meta Llama 3.x** | Llama 3.3 70B, Llama 3.2 (1B–90B), Llama 3.1 (8B/70B/405B) |
+| **Alibaba Qwen** | Qwen3-Max, Qwen3.5-Plus, Qwen3-Coder-Next/Plus, QwQ-32B, Qwen2.5 (7B/72B), Qwen-Max/Plus/Turbo |
+| **Zhipu AI GLM** | GLM-5, GLM-4.7 (X/Flash), GLM-4.5 (X/Flash) |
+| **Moonshot Kimi** | Kimi K2.5 |
+| **Mistral** | Mistral Large/Medium/Small, Codestral, Pixtral, Mixtral |
+| **DeepSeek** | DeepSeek R1, DeepSeek V3 |
+| **Amazon Nova** | Nova Premier, Nova Pro, Nova Lite, Nova Micro |
+| **AI21 Jamba** | Jamba Large 1.7, Jamba 1.5 Large/Mini |
+| **Cohere** | Command R+, Command R |
+| **Perplexity** | Sonar Pro, Sonar |
+| **Google** | Gemma |
 
 Unknown models fall back to $1.00/$3.00 per million tokens input/output.
 
@@ -582,7 +603,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 Bug reports and pull requests are welcome.
 
 ```bash
-cargo test   # 382 tests, no external dependencies required
+cargo test   # 488 tests, no external dependencies required
 ```
 
 ## License

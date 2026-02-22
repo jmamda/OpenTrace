@@ -275,6 +275,9 @@ pub fn detect_provider(upstream: &str) -> String {
         "xai".to_string()
     } else if upstream.contains("perplexity") {
         "perplexity".to_string()
+    // Zhipu AI — GLM models (api.z.ai / bigmodel.cn)
+    } else if upstream.contains("z.ai") || upstream.contains("bigmodel") || upstream.contains("zhipu") {
+        "zhipu".to_string()
     // Moonshot AI — Kimi models (platform.moonshot.ai / api.moonshot.cn)
     } else if upstream.contains("moonshot") {
         "moonshot".to_string()
@@ -291,6 +294,12 @@ pub fn detect_provider(upstream: &str) -> String {
         "mistral".to_string()
     } else if upstream.contains("cohere") {
         "cohere".to_string()
+    // Alibaba Cloud DashScope — Qwen models (dashscope.aliyuncs.com or api.dashscope.ai)
+    } else if upstream.contains("dashscope") || upstream.contains("aliyun") {
+        "qwen".to_string()
+    // AI21 Labs — Jamba models (api.ai21.com)
+    } else if upstream.contains("ai21") {
+        "ai21".to_string()
     } else if upstream.contains("google") || upstream.contains("generativelanguage") {
         "google".to_string()
     } else if upstream.contains("deepseek") {
@@ -367,12 +376,18 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         m if m.contains("gpt-3.5")                   => (0.50,   1.50),
 
         // ── Anthropic Claude 4 ────────────────────────────────────────────
-        // Opus 4.x (4.5, 4.6, 4.6-thinking) is $5/$25 — distinct from
-        // Claude 3 Opus which was $15/$75 and is matched further below.
-        // Thinking variants share the same token price as base models.
-        m if m.contains("claude-opus-4")             => (5.00,   25.00),
-        m if m.contains("claude-sonnet-4")           => (3.00,   15.00),
-        m if m.contains("claude-haiku-4")            => (1.00,   5.00),
+        // Opus 4.x is $5/$25 (NOT $15/$75 — that was Claude 3 Opus below).
+        // Thinking variants are billed at the same token rate as base.
+        // Named versions (4.6, 4.5) listed explicitly then caught by catch-all.
+        m if m.contains("claude-opus-4-6")           => (5.00,   25.00),  // opus 4.6 + -thinking
+        m if m.contains("claude-opus-4-5")           => (5.00,   25.00),
+        m if m.contains("claude-opus-4")             => (5.00,   25.00),  // future opus-4.x
+
+        m if m.contains("claude-sonnet-4-6")         => (3.00,   15.00),
+        m if m.contains("claude-sonnet-4-5")         => (3.00,   15.00),
+        m if m.contains("claude-sonnet-4")           => (3.00,   15.00),  // future sonnet-4.x
+
+        m if m.contains("claude-haiku-4")            => (1.00,    5.00),
 
         // ── Anthropic Claude 3.7 ──────────────────────────────────────────
         m if m.contains("claude-3-7-sonnet")         => (3.00,   15.00),
@@ -415,22 +430,26 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         m if m.contains("grok")                      => (5.00,   15.00),
 
         // ── Meta Llama 4 ──────────────────────────────────────────────────
-        m if m.contains("llama-4-maverick")          => (0.24,   0.77),
-        m if m.contains("llama-4-scout")             => (0.20,   0.60),
+        // Bedrock uses "llama4-maverick" (no hyphen between llama and 4).
+        m if m.contains("llama-4-maverick") || m.contains("llama4-maverick") => (0.24, 0.77),
+        m if m.contains("llama-4-scout")    || m.contains("llama4-scout")    => (0.20, 0.60),
 
         // ── Meta Llama 3.3 ────────────────────────────────────────────────
-        m if m.contains("llama-3.3-70b")             => (0.59,   0.79),
+        // Bedrock IDs: meta.llama3-3-70b-instruct-v1:0
+        m if m.contains("llama-3.3-70b") || m.contains("llama3-3-70b")      => (0.59, 0.79),
 
         // ── Meta Llama 3.2 (larger sizes first) ───────────────────────────
-        m if m.contains("llama-3.2-90b")             => (0.90,   0.90),
-        m if m.contains("llama-3.2-11b")             => (0.18,   0.18),
-        m if m.contains("llama-3.2-3b")              => (0.06,   0.06),
-        m if m.contains("llama-3.2-1b")              => (0.04,   0.04),
+        // Bedrock IDs: meta.llama3-2-{90b,11b,3b,1b}-instruct-v1:0
+        m if m.contains("llama-3.2-90b") || m.contains("llama3-2-90b")      => (0.90, 0.90),
+        m if m.contains("llama-3.2-11b") || m.contains("llama3-2-11b")      => (0.18, 0.18),
+        m if m.contains("llama-3.2-3b")  || m.contains("llama3-2-3b")       => (0.06, 0.06),
+        m if m.contains("llama-3.2-1b")  || m.contains("llama3-2-1b")       => (0.04, 0.04),
 
         // ── Meta Llama 3.1 ────────────────────────────────────────────────
-        m if m.contains("llama-3.1-405b")            => (3.00,   3.00),
-        m if m.contains("llama-3.1-70b")             => (0.52,   0.75),
-        m if m.contains("llama-3.1-8b")              => (0.18,   0.18),
+        // Bedrock IDs: meta.llama3-1-{405b,70b,8b}-instruct-v1:0
+        m if m.contains("llama-3.1-405b") || m.contains("llama3-1-405b")    => (3.00, 3.00),
+        m if m.contains("llama-3.1-70b")  || m.contains("llama3-1-70b")     => (0.52, 0.75),
+        m if m.contains("llama-3.1-8b")   || m.contains("llama3-1-8b")      => (0.18, 0.18),
 
         // ── Mistral / Mixtral / Codestral / Pixtral ───────────────────────
         m if m.contains("mistral-large")             => (2.00,   6.00),
@@ -452,9 +471,63 @@ pub fn model_prices(model: &str) -> (f64, f64) {
         m if m.contains("sonar-pro")                 => (3.00,   15.00),
         m if m.contains("sonar")                     => (1.00,   5.00),
 
+        // ── Amazon Nova (premier before pro, lite, micro) ─────────────────
+        // Bedrock model IDs: amazon.nova-{premier,pro,lite,micro}-v1:0
+        m if m.contains("nova-premier")              => (2.50,   12.50),
+        m if m.contains("nova-pro")                  => (0.80,    3.20),
+        m if m.contains("nova-lite")                 => (0.06,    0.24),
+        m if m.contains("nova-micro")                => (0.035,   0.14),
+
+        // ── AI21 Jamba (large before mini) ────────────────────────────────
+        // Model IDs use varied formats: "jamba-large-1.7", "jamba-1-5-large",
+        // "ai21.jamba-1-5-large-v1:0".  Use compound guards to match both.
+        m if m.contains("jamba") && (m.contains("-large") || m.contains("1.7")) => (2.00, 8.00),
+        m if m.contains("jamba") && m.contains("-mini")  => (0.20,    0.40),
+        m if m.contains("jamba")                          => (2.00,    8.00),  // generic
+
+        // ── Alibaba Qwen (Dashscope / OpenRouter: qwen/...) ───────────────
+        // QwQ reasoning models (32b-preview pricier than current qwq-plus)
+        m if m.contains("qwq-32b-preview")           => (1.60,    6.40),
+        m if m.contains("qwq")                       => (0.20,    0.60),  // qwq-plus, qwq-32b
+
+        // Qwen3 coder series (coder-next before coder; qwen3 is substring of both)
+        m if m.contains("qwen3-coder-next")          => (0.07,    0.30),
+        m if m.contains("qwen3-coder")               => (1.00,    5.00),  // coder-plus / coder
+
+        // Qwen3.5 before Qwen3 ("qwen3" is a substring of "qwen3.5")
+        m if m.contains("qwen3.5")                   => (0.90,    3.60),
+
+        // Qwen3 Max before generic Qwen3 ("qwen3" is a substring of "qwen3-max")
+        m if m.contains("qwen3-max")                 => (1.20,    6.00),
+        m if m.contains("qwen3")                     => (0.40,    1.20),  // qwen3-plus / turbo
+
+        // Qwen2.5 sized variants (specific sizes before generic)
+        m if m.contains("qwen2.5-72b")               => (0.15,    0.40),
+        m if m.contains("qwen2.5-7b")                => (0.10,    0.30),
+        m if m.contains("qwen2.5")                   => (0.35,    0.75),
+
+        // Legacy Qwen series (max > plus > turbo > generic)
+        m if m.contains("qwen-max")                  => (1.60,    6.40),
+        m if m.contains("qwen-plus")                 => (0.30,    1.20),
+        m if m.contains("qwen-turbo")                => (0.05,    0.20),
+        m if m.contains("qwen")                      => (0.40,    1.20),  // generic fallback
+
         // ── Kimi / Moonshot AI ────────────────────────────────────────────
         m if m.contains("kimi-k2.5")                 => (0.60,    3.00),
         m if m.contains("kimi")                      => (0.60,    3.00),  // generic kimi
+
+        // ── Zhipu AI GLM (api.z.ai) ───────────────────────────────────────
+        // Ordering: specific version+variant before version, before generic glm-4.
+        // "glm-4.5" is a substring of "glm-4.5-x" and "glm-4.5-flash".
+        // "glm-4" is a substring of "glm-4.5", "glm-4.7", etc.
+        m if m.contains("glm-5")                     => (1.00,    3.20),
+        m if m.contains("glm-4.7-x")                 => (4.50,    8.90),  // GLM-4.7-X premium
+        m if m.contains("glm-4.7-flash")             => (0.05,    0.10),
+        m if m.contains("glm-4.7")                   => (0.60,    2.20),
+        m if m.contains("glm-4.5-x")                 => (4.50,    8.90),  // GLM-4.5-X premium
+        m if m.contains("glm-4.5-flash")             => (0.05,    0.10),
+        m if m.contains("glm-4.5")                   => (0.55,    2.00),
+        m if m.contains("glm-4")                     => (0.55,    2.00),  // GLM-4 generic
 
         // ── Google Gemma ──────────────────────────────────────────────────
         m if m.contains("gemma")                     => (0.10,   0.10),
@@ -1381,5 +1454,242 @@ mod tests {
     fn model_prices_claude_3_opus_is_15_per_million() {
         // The $15/$75 price is for Claude 3 Opus (not Claude 4).
         assert_eq!(model_prices("claude-3-opus-20240229"), (15.00, 75.00));
+    }
+
+    // ── Explicit Claude 4.5 / 4.6 version arms ───────────────────────────
+
+    #[test]
+    fn model_prices_claude_opus_46_explicit() {
+        assert_eq!(model_prices("claude-opus-4-6"), (5.00, 25.00));
+        assert_eq!(model_prices("claude-opus-4-6-20260205"), (5.00, 25.00));
+        assert_eq!(model_prices("claude-opus-4-6-thinking-20260205"), (5.00, 25.00));
+    }
+
+    #[test]
+    fn model_prices_claude_opus_45_explicit() {
+        assert_eq!(model_prices("claude-opus-4-5"), (5.00, 25.00));
+        assert_eq!(model_prices("claude-opus-4-5-20251101"), (5.00, 25.00));
+    }
+
+    #[test]
+    fn model_prices_claude_sonnet_46_explicit() {
+        assert_eq!(model_prices("claude-sonnet-4-6"), (3.00, 15.00));
+        assert_eq!(model_prices("claude-sonnet-4-6-20260205"), (3.00, 15.00));
+    }
+
+    #[test]
+    fn model_prices_claude_sonnet_45_explicit() {
+        assert_eq!(model_prices("claude-sonnet-4-5"), (3.00, 15.00));
+        assert_eq!(model_prices("claude-sonnet-4-5-20250825"), (3.00, 15.00));
+    }
+
+    #[test]
+    fn is_known_model_claude_opus_46() {
+        assert!(is_known_model("claude-opus-4-6"));
+        assert!(is_known_model("claude-opus-4-6-thinking-20260205"));
+    }
+
+    #[test]
+    fn is_known_model_claude_sonnet_46() {
+        assert!(is_known_model("claude-sonnet-4-6"));
+    }
+
+    // ── Zhipu AI GLM / z.ai ──────────────────────────────────────────────
+
+    #[test]
+    fn detect_provider_zhipu() {
+        assert_eq!(detect_provider("https://api.z.ai/v1"), "zhipu");
+        assert_eq!(detect_provider("https://open.bigmodel.cn/api/paas/v4"), "zhipu");
+        assert_eq!(detect_provider("https://api.zhipu.ai/v1"), "zhipu");
+    }
+
+    #[test]
+    fn model_prices_glm5() {
+        assert_eq!(model_prices("glm-5"), (1.00, 3.20));
+    }
+
+    #[test]
+    fn model_prices_glm47_variants() {
+        assert_eq!(model_prices("glm-4.7"), (0.60, 2.20));
+        assert_eq!(model_prices("glm-4.7-flash"), (0.05, 0.10));
+        assert_eq!(model_prices("glm-4.7-x"), (4.50, 8.90));
+    }
+
+    #[test]
+    fn model_prices_glm45_variants() {
+        assert_eq!(model_prices("glm-4.5"), (0.55, 2.00));
+        assert_eq!(model_prices("glm-4.5-flash"), (0.05, 0.10));
+        assert_eq!(model_prices("glm-4.5-x"), (4.50, 8.90));
+    }
+
+    #[test]
+    fn model_prices_glm4_generic() {
+        // glm-4 generic catches anything not matched by version-specific arms
+        assert_eq!(model_prices("glm-4"), (0.55, 2.00));
+    }
+
+    #[test]
+    fn model_prices_glm47_not_matched_by_glm4_generic() {
+        // glm-4.7 must match its own arm, not the glm-4 catch-all
+        let (i47, o47) = model_prices("glm-4.7");
+        let (i4,  o4)  = model_prices("glm-4-v");  // some glm-4 generic model
+        // glm-4.7 has higher output price than base glm-4
+        assert!(o47 > o4, "glm-4.7 output price should differ from glm-4 generic");
+    }
+
+    #[test]
+    fn model_prices_glm5_more_expensive_than_glm45() {
+        let (i5, _) = model_prices("glm-5");
+        let (i45, _) = model_prices("glm-4.5");
+        assert!(i5 > i45, "glm-5 should cost more per input token than glm-4.5");
+    }
+
+    #[test]
+    fn is_known_model_glm5_is_known() {
+        assert!(is_known_model("glm-5"));
+    }
+
+    #[test]
+    fn is_known_model_glm47_is_known() {
+        assert!(is_known_model("glm-4.7"));
+    }
+
+    // ── Amazon Nova ───────────────────────────────────────────────────────
+
+    #[test]
+    fn model_prices_nova_tiers() {
+        assert_eq!(model_prices("amazon.nova-premier-v1:0"), (2.50, 12.50));
+        assert_eq!(model_prices("amazon.nova-pro-v1:0"),     (0.80,  3.20));
+        assert_eq!(model_prices("amazon.nova-lite-v1:0"),    (0.06,  0.24));
+        assert_eq!(model_prices("amazon.nova-micro-v1:0"),   (0.035, 0.14));
+    }
+
+    #[test]
+    fn model_prices_nova_ordered_cheapest_to_priciest() {
+        let (micro, _) = model_prices("nova-micro");
+        let (lite, _)  = model_prices("nova-lite");
+        let (pro, _)   = model_prices("nova-pro");
+        let (prem, _)  = model_prices("nova-premier");
+        assert!(micro < lite && lite < pro && pro < prem);
+    }
+
+    #[test]
+    fn is_known_model_nova_is_known() {
+        assert!(is_known_model("amazon.nova-pro-v1:0"));
+        assert!(is_known_model("nova-premier"));
+    }
+
+    // ── AI21 Jamba ────────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_provider_ai21() {
+        assert_eq!(detect_provider("https://api.ai21.com/studio/v1"), "ai21");
+    }
+
+    #[test]
+    fn model_prices_jamba_large_and_mini() {
+        assert_eq!(model_prices("jamba-large-1.7"),   (2.00, 8.00));
+        assert_eq!(model_prices("jamba-1-5-large"),   (2.00, 8.00));
+        assert_eq!(model_prices("jamba-1-5-mini"),    (0.20, 0.40));
+        // via Bedrock: ai21.jamba-1-5-large-v1:0
+        assert_eq!(model_prices("ai21.jamba-1-5-large-v1:0"), (2.00, 8.00));
+    }
+
+    #[test]
+    fn is_known_model_jamba_is_known() {
+        assert!(is_known_model("jamba-large-1.7"));
+        assert!(is_known_model("ai21.jamba-1-5-mini-v1:0"));
+    }
+
+    // ── Qwen / Alibaba ────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_provider_qwen_dashscope() {
+        assert_eq!(detect_provider("https://dashscope.aliyuncs.com/compatible-mode/v1"), "qwen");
+        assert_eq!(detect_provider("https://api.dashscope.ai/v1"), "qwen");
+    }
+
+    #[test]
+    fn model_prices_qwq_series() {
+        assert_eq!(model_prices("qwq-plus"),           (0.20, 0.60));
+        assert_eq!(model_prices("qwq-32b"),            (0.20, 0.60));
+        assert_eq!(model_prices("qwq-32b-preview"),    (1.60, 6.40));
+    }
+
+    #[test]
+    fn model_prices_qwq_preview_pricier_than_qwq_plus() {
+        let (i_preview, _) = model_prices("qwq-32b-preview");
+        let (i_plus, _)    = model_prices("qwq-plus");
+        assert!(i_preview > i_plus);
+    }
+
+    #[test]
+    fn model_prices_qwen3_coder_next_cheaper_than_coder() {
+        let (i_next, _) = model_prices("qwen3-coder-next");
+        let (i_plus, _) = model_prices("qwen3-coder-plus");
+        assert!(i_next < i_plus);
+    }
+
+    #[test]
+    fn model_prices_qwen3_max_correct() {
+        assert_eq!(model_prices("qwen3-max"),                    (1.20, 6.00));
+        assert_eq!(model_prices("qwen3-max-2025-09-23"),         (1.20, 6.00));
+        // OpenRouter format: qwen/qwen3-max
+        assert_eq!(model_prices("qwen/qwen3-max"),               (1.20, 6.00));
+    }
+
+    #[test]
+    fn model_prices_qwen35_plus() {
+        assert_eq!(model_prices("qwen3.5-plus"),                 (0.90, 3.60));
+        assert_eq!(model_prices("qwen3.5-plus-2026-02-15"),      (0.90, 3.60));
+    }
+
+    #[test]
+    fn model_prices_qwen25_72b() {
+        assert_eq!(model_prices("qwen2.5-72b-instruct"),         (0.15, 0.40));
+        assert_eq!(model_prices("qwen/qwen2.5-72b-instruct"),    (0.15, 0.40));
+    }
+
+    #[test]
+    fn model_prices_qwen_generic_ladder() {
+        let (i_max, _)    = model_prices("qwen-max");
+        let (i_plus, _)   = model_prices("qwen-plus");
+        let (i_turbo, _)  = model_prices("qwen-turbo");
+        assert!(i_max > i_plus && i_plus > i_turbo);
+    }
+
+    #[test]
+    fn is_known_model_qwen3_is_known() {
+        assert!(is_known_model("qwen3-max"));
+        assert!(is_known_model("qwq-32b"));
+        assert!(is_known_model("qwen3.5-plus-2026-02-15"));
+    }
+
+    // ── Bedrock Llama ID format (no-hyphen aliases) ───────────────────────
+
+    #[test]
+    fn model_prices_bedrock_llama4_ids() {
+        // Bedrock: us.meta.llama4-maverick-17b-instruct-v1:0
+        assert_eq!(model_prices("us.meta.llama4-maverick-17b-instruct-v1:0"), (0.24, 0.77));
+        assert_eq!(model_prices("us.meta.llama4-scout-17b-instruct-v1:0"),    (0.20, 0.60));
+    }
+
+    #[test]
+    fn model_prices_bedrock_llama31_ids() {
+        // Bedrock: meta.llama3-1-70b-instruct-v1:0
+        assert_eq!(model_prices("meta.llama3-1-70b-instruct-v1:0"),  (0.52, 0.75));
+        assert_eq!(model_prices("meta.llama3-1-8b-instruct-v1:0"),   (0.18, 0.18));
+        assert_eq!(model_prices("meta.llama3-1-405b-instruct-v1:0"), (3.00, 3.00));
+    }
+
+    #[test]
+    fn model_prices_bedrock_llama33_id() {
+        assert_eq!(model_prices("meta.llama3-3-70b-instruct-v1:0"), (0.59, 0.79));
+    }
+
+    #[test]
+    fn model_prices_bedrock_llama32_ids() {
+        assert_eq!(model_prices("meta.llama3-2-11b-instruct-v1:0"), (0.18, 0.18));
+        assert_eq!(model_prices("meta.llama3-2-1b-instruct-v1:0"),  (0.04, 0.04));
     }
 }
