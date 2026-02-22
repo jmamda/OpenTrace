@@ -51,7 +51,7 @@ trace start
 Output at startup:
 
 ```
-trace v0.21
+trace v0.23
   listening  http://127.0.0.1:4000
   upstream   https://api.openai.com
   storage    /home/user/.trace/trace.db
@@ -477,13 +477,13 @@ Checks every 60 seconds. Emits to stderr at most once per 10 minutes when spend 
 
 ## What gets captured
 
-Every call is one row in SQLite at `~/.trace/trace.db`.
+Every call is one row in SQLite at `~/.trace/trace.db` (or `$XDG_DATA_HOME/trace/trace.db` on Linux when `XDG_DATA_HOME` is explicitly set).
 
 | Field | Type | Description |
 |---|---|---|
 | `id` | `TEXT` | UUID v4, unique per call |
 | `timestamp` | `TEXT` | UTC, ISO 8601, e.g. `2026-02-22T14:01:03.441Z` |
-| `provider` | `TEXT` | Detected from upstream URL: `openai`, `anthropic`, `google`, `groq`, `mistral`, `cohere`, `together` |
+| `provider` | `TEXT` | Detected from upstream URL: `openai`, `anthropic`, `azure-openai`, `google`, `groq`, `mistral`, `cohere`, `together`, `xai`, `perplexity`, `bedrock`, `fireworks`, `nvidia`, `deepseek`, `openrouter`, `ollama`, … |
 | `model` | `TEXT` | Extracted from request body `"model"` field |
 | `endpoint` | `TEXT` | Request path only, e.g. `/v1/chat/completions` (query string stripped) |
 | `status_code` | `INTEGER` | HTTP status from upstream; `0` = connection failure before any response |
@@ -518,11 +518,28 @@ Every call is one row in SQLite at `~/.trace/trace.db`.
 | DeepSeek | `https://api.deepseek.com` |
 | Azure OpenAI | `https://*.openai.azure.com` |
 | OpenRouter | `https://openrouter.ai` |
+| xAI (Grok) | `https://api.x.ai` |
+| Perplexity | `https://api.perplexity.ai` |
+| Amazon Bedrock | `https://bedrock-runtime.*.amazonaws.com` |
+| Fireworks AI | `https://api.fireworks.ai` |
+| NVIDIA NIM | `https://integrate.api.nvidia.com` |
 | Ollama | `http://localhost:11434` |
 
-Any OpenAI-compatible endpoint works. The `provider` label in the database is detected from the upstream URL substring. For local models (LM Studio, vLLM), provider will show as `unknown` — everything else still works.
+Any OpenAI-compatible endpoint works. The `provider` label in the database is detected from the upstream URL. For local models (LM Studio, vLLM), provider will show as `unknown` — everything else still works.
 
-The built-in pricing table covers OpenAI (GPT-4o, GPT-4o mini, o1, o3, embeddings), Anthropic (Claude 3, 3.5, 4 families), Google Gemini (1.5, 2.0), Meta Llama (3.1, 3.3), Mistral, DeepSeek, and Gemma. Unknown models fall back to $1.00/$3.00 per million tokens input/output and emit a warning in verbose mode.
+The built-in pricing table (50+ entries, updated Feb 2026) covers:
+- **OpenAI** — GPT-4.1, GPT-4o, GPT-4o mini, o1, o3, embeddings
+- **Anthropic** — Claude 4, Claude 3.7 Sonnet, Claude 3.5, Claude 3 families
+- **Google** — Gemini 2.5 Pro/Flash, Gemini 2.0 Flash/Flash Lite, Gemini 1.5 Pro/Flash/Flash-8B
+- **xAI** — Grok 3, Grok 2, Grok
+- **Meta** — Llama 4 Maverick/Scout, Llama 3.3 70B, Llama 3.2 (1B/3B/11B/90B), Llama 3.1 (8B/70B/405B)
+- **Mistral** — Mistral Large/Medium/Small, Codestral, Pixtral, Mixtral
+- **DeepSeek** — DeepSeek R1, DeepSeek V3
+- **Cohere** — Command R+, Command R
+- **Perplexity** — Sonar Pro, Sonar
+- **Google** — Gemma
+
+Unknown models fall back to $1.00/$3.00 per million tokens input/output.
 
 ---
 
@@ -565,7 +582,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 Bug reports and pull requests are welcome.
 
 ```bash
-cargo test   # 330 tests, no external dependencies required
+cargo test   # 382 tests, no external dependencies required
 ```
 
 ## License
