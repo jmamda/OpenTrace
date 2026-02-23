@@ -179,6 +179,7 @@ async fn api_calls_handler(
         model: params.model,
         since: params.since,
         until: params.until,
+        ..Default::default()
     };
     let store = state.store.lock().unwrap();
     let records = store.query_filtered(limit, &filter).unwrap_or_default();

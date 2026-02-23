@@ -56,16 +56,40 @@ pub struct EndpointStats {
     pub error_count: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenPercentiles {
+    pub input_p50:  u64,
+    pub input_p95:  u64,
+    pub input_p99:  u64,
+    pub output_p50: u64,
+    pub output_p95: u64,
+    pub output_p99: u64,
+}
+
 #[derive(Default)]
 pub struct QueryFilter {
     pub errors_only: bool,
     pub model: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
+    pub status: Option<u16>,
+    pub status_range: Option<(u16, u16)>,
 }
 
 pub struct Store {
     conn: Connection,
+    path: PathBuf,
+}
+
+/// Build a SQL fragment for status_code filtering.
+/// Returns an empty string when no status filter is active.
+/// Values are u16 so there is no SQL-injection risk.
+fn build_status_clause(status: &Option<u16>, status_range: &Option<(u16, u16)>) -> String {
+    match (status, status_range) {
+        (Some(s), _) => format!("AND status_code = {}", s),
+        (_, Some((lo, hi))) => format!("AND status_code BETWEEN {} AND {}", lo, hi),
+        (None, None) => String::new(),
+    }
 }
 
 /// Column mapping helper — returns a CallRecord from a rusqlite Row.
@@ -110,7 +134,7 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
             .context("failed to open in-memory DB")?;
-        let store = Self { conn };
+        let store = Self { conn, path: PathBuf::from(":memory:") };
         store.init()?;
         Ok(store)
     }
@@ -124,7 +148,7 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open DB at {}", path.display()))?;
-        let store = Self { conn };
+        let store = Self { conn, path: path.to_path_buf() };
         store.init()?;
         Ok(store)
     }
@@ -146,7 +170,7 @@ impl Store {
             let _ = std::fs::set_permissions(&db_path, perms);
         }
 
-        let store = Self { conn };
+        let store = Self { conn, path: db_path };
         store.init()?;
         Ok(store)
     }
@@ -235,6 +259,7 @@ impl Store {
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
+        let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         // status_code = 0 means upstream connection failure — include in --errors.
         let sql = format!("
@@ -244,6 +269,7 @@ impl Store {
               AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
               AND (?3 IS NULL OR timestamp >= ?3)
               AND (?4 IS NULL OR timestamp <= ?4)
+              {status_clause}
             ORDER BY timestamp DESC
             LIMIT ?5");
 
@@ -268,6 +294,7 @@ impl Store {
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
+        let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         let sql = format!("
             SELECT {SELECT_COLS}
@@ -276,6 +303,7 @@ impl Store {
               AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
               AND (?3 IS NULL OR timestamp >= ?3)
               AND (?4 IS NULL OR timestamp <= ?4)
+              {status_clause}
             ORDER BY timestamp ASC");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -384,6 +412,7 @@ impl Store {
         let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
         let model_filter: Option<String> = filter.model.as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         let sql = format!("
             SELECT {SELECT_COLS}
@@ -391,6 +420,7 @@ impl Store {
             WHERE timestamp > ?1
               AND (?2 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
               AND (?3 IS NULL OR model LIKE '%' || ?3 || '%' ESCAPE '\\')
+              {status_clause}
             ORDER BY timestamp ASC
             LIMIT ?4");
 
@@ -557,6 +587,62 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(sum)
+    }
+
+    /// Compute p50 / p95 / p99 for input and output token counts.
+    /// Returns all zeros when no records with non-null input_tokens exist.
+    /// If `since_iso` is Some, only records at or after that timestamp are included.
+    pub fn token_percentiles(&self, since_iso: Option<&str>) -> Result<TokenPercentiles> {
+        let sql = "
+            SELECT input_tokens, COALESCE(output_tokens, 0)
+            FROM calls
+            WHERE input_tokens IS NOT NULL
+              AND (?1 IS NULL OR timestamp >= ?1)";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows: Vec<(u64, u64)> = stmt
+            .query_map(params![since_iso], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(TokenPercentiles {
+                input_p50: 0, input_p95: 0, input_p99: 0,
+                output_p50: 0, output_p95: 0, output_p99: 0,
+            });
+        }
+
+        let mut inputs: Vec<u64> = rows.iter().map(|(i, _)| *i).collect();
+        let mut outputs: Vec<u64> = rows.iter().map(|(_, o)| *o).collect();
+        inputs.sort_unstable();
+        outputs.sort_unstable();
+
+        let n = inputs.len();
+        let pct = |v: &[u64], p: usize| v[(n * p / 100).min(n - 1)];
+
+        Ok(TokenPercentiles {
+            input_p50:  pct(&inputs,  50),
+            input_p95:  pct(&inputs,  95),
+            input_p99:  pct(&inputs,  99),
+            output_p50: pct(&outputs, 50),
+            output_p95: pct(&outputs, 95),
+            output_p99: pct(&outputs, 99),
+        })
+    }
+
+    /// Flush the WAL to the main database file and defragment.
+    /// Returns `(bytes_before, bytes_after)` from the filesystem.
+    pub fn vacuum(&self) -> Result<(u64, u64)> {
+        let before = std::fs::metadata(&self.path)
+            .with_context(|| format!("cannot stat DB at {}", self.path.display()))?
+            .len();
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        let after = std::fs::metadata(&self.path)
+            .with_context(|| format!("cannot stat DB at {}", self.path.display()))?
+            .len();
+        Ok((before, after))
     }
 }
 
@@ -1316,5 +1402,183 @@ mod tests {
         let model_stats = store.stats_by_model().unwrap();
         assert_eq!(model_stats.len(), 1);
         assert_eq!(model_stats[0].error_count, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // status filter (Feature 1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn status_filter_exact_match() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
+        let mut r = make_record("rate-limited", "gpt-4o", 429);
+        r.error = Some("too many requests".to_string());
+        store.insert(&r).unwrap();
+
+        let filter = QueryFilter { status: Some(429), ..Default::default() };
+        let results = store.query_filtered(100, &filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "rate-limited");
+    }
+
+    #[test]
+    fn status_filter_range() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
+        store.insert(&make_record("not-found", "gpt-4o", 404)).unwrap();
+        store.insert(&make_record("server-err", "gpt-4o", 500)).unwrap();
+
+        let filter = QueryFilter { status_range: Some((400, 499)), ..Default::default() };
+        let results = store.query_filtered(100, &filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "not-found");
+    }
+
+    #[test]
+    fn status_filter_no_match_returns_empty() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
+
+        let filter = QueryFilter { status: Some(429), ..Default::default() };
+        let results = store.query_filtered(100, &filter).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn status_filter_query_all_filtered() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
+        store.insert(&make_record("not-found", "gpt-4o", 404)).unwrap();
+        store.insert(&make_record("server-err", "gpt-4o", 500)).unwrap();
+
+        let filter = QueryFilter { status_range: Some((400, 599)), ..Default::default() };
+        let results = store.query_all_filtered(&filter).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"not-found"));
+        assert!(ids.contains(&"server-err"));
+    }
+
+    #[test]
+    fn status_filter_query_after() {
+        let store = Store::open_in_memory().unwrap();
+        let mut old = make_record("old-ok", "gpt-4o", 200);
+        old.timestamp = "2020-01-01T00:00:00.000Z".to_string();
+        store.insert(&old).unwrap();
+
+        let mut new_err = make_record("new-500", "gpt-4o", 500);
+        new_err.timestamp = "2025-01-01T00:00:00.000Z".to_string();
+        store.insert(&new_err).unwrap();
+
+        let mut new_ok = make_record("new-200", "gpt-4o", 200);
+        new_ok.timestamp = "2025-01-02T00:00:00.000Z".to_string();
+        store.insert(&new_ok).unwrap();
+
+        let filter = QueryFilter { status: Some(500), ..Default::default() };
+        let results = store.query_after("2024-01-01T00:00:00.000Z", &filter, 100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "new-500");
+    }
+
+    // -------------------------------------------------------------------------
+    // token_percentiles (Feature 3)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn token_percentiles_basic() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("a", "gpt-4o", 200);
+        r1.input_tokens = Some(100);
+        r1.output_tokens = Some(50);
+        store.insert(&r1).unwrap();
+
+        let mut r2 = make_record("b", "gpt-4o", 200);
+        r2.input_tokens = Some(200);
+        r2.output_tokens = Some(100);
+        store.insert(&r2).unwrap();
+
+        let mut r3 = make_record("c", "gpt-4o", 200);
+        r3.input_tokens = Some(300);
+        r3.output_tokens = Some(150);
+        store.insert(&r3).unwrap();
+
+        let tp = store.token_percentiles(None).unwrap();
+        // 3 records: [100, 200, 300]; p50 index = 3*50/100 = 1 → inputs[1] = 200
+        assert_eq!(tp.input_p50, 200);
+    }
+
+    #[test]
+    fn token_percentiles_empty_returns_zeros() {
+        let store = Store::open_in_memory().unwrap();
+        let tp = store.token_percentiles(None).unwrap();
+        assert_eq!(tp.input_p50, 0);
+        assert_eq!(tp.input_p95, 0);
+        assert_eq!(tp.input_p99, 0);
+        assert_eq!(tp.output_p50, 0);
+        assert_eq!(tp.output_p95, 0);
+        assert_eq!(tp.output_p99, 0);
+    }
+
+    #[test]
+    fn token_percentiles_single_record_all_same() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("only", "gpt-4o", 200);
+        r.input_tokens = Some(1000);
+        r.output_tokens = Some(500);
+        store.insert(&r).unwrap();
+
+        let tp = store.token_percentiles(None).unwrap();
+        assert_eq!(tp.input_p50, 1000);
+        assert_eq!(tp.input_p95, 1000);
+        assert_eq!(tp.input_p99, 1000);
+        assert_eq!(tp.output_p50, 500);
+        assert_eq!(tp.output_p95, 500);
+        assert_eq!(tp.output_p99, 500);
+    }
+
+    // -------------------------------------------------------------------------
+    // vacuum (Feature 4)
+    // -------------------------------------------------------------------------
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("trace_{}_{}.db", name, ts))
+    }
+
+    #[test]
+    fn vacuum_reduces_or_maintains_size() {
+        let db_path = temp_db_path("vacuum_size");
+        let store = Store::open_at(&db_path).expect("open DB");
+
+        // Insert 100 records then flush the WAL into the main file
+        // via a first vacuum so that the pre-clear baseline is accurate.
+        for i in 0..100u32 {
+            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+        }
+        let _ = store.vacuum().expect("first vacuum to flush WAL");
+
+        // Delete all records and vacuum — main file must not grow.
+        store.clear().unwrap();
+        let (before, after) = store.vacuum().expect("second vacuum");
+        assert!(after <= before, "after vacuum DB should not grow (before={} after={})", before, after);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn vacuum_returns_byte_counts() {
+        let db_path = temp_db_path("vacuum_counts");
+        let store = Store::open_at(&db_path).expect("open DB");
+        store.insert(&make_record("id-1", "gpt-4o", 200)).unwrap();
+
+        let (before, after) = store.vacuum().expect("vacuum");
+        assert!(before > 0, "before size should be > 0");
+        assert!(after > 0, "after size should be > 0");
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

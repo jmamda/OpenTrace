@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use serde_json::Value;
 use std::collections::HashMap;
+use crate::store::CallRecord;
 
 /// Extract model name and streaming flag in a single JSON parse.
 pub fn extract_request_info(body: &str) -> (String, bool) {
@@ -315,6 +316,33 @@ pub fn detect_provider(upstream: &str) -> String {
     }
 }
 
+/// Classify the error type of a failed call for display purposes.
+///
+/// Returns a static label such as "rate_limit", "auth", "upstream_5xx",
+/// "timeout", or "connection".  Returns `None` for successful calls or
+/// failures that don't match any recognised pattern.
+///
+/// This is display-only — the classification is never stored in the database.
+pub fn classify_error(r: &CallRecord) -> Option<&'static str> {
+    match r.status_code {
+        401 | 403 => Some("auth"),
+        429       => Some("rate_limit"),
+        s if s >= 500 => Some("upstream_5xx"),
+        0 => {
+            if let Some(e) = &r.error {
+                if e.contains("timeout") || e.contains("timed out") {
+                    return Some("timeout");
+                }
+                if e.contains("connection") {
+                    return Some("connection");
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Returns true if the model is in the known pricing table.
 ///
 /// The only correct signal is whether `model_prices` returned the fallback
@@ -541,6 +569,73 @@ pub fn model_prices(model: &str) -> (f64, f64) {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::store::{CallRecord, now_iso};
+
+    fn make_test_record(status_code: u16, error: Option<&str>) -> CallRecord {
+        CallRecord {
+            id: "test-id".to_string(),
+            timestamp: now_iso(),
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            status_code,
+            latency_ms: 100,
+            ttft_ms: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cost_usd: Some(0.001),
+            request_body: None,
+            response_body: None,
+            error: error.map(String::from),
+            provider_request_id: None,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_error
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn classify_429_is_rate_limit() {
+        let r = make_test_record(429, Some("rate limit exceeded"));
+        assert_eq!(classify_error(&r), Some("rate_limit"));
+    }
+
+    #[test]
+    fn classify_401_is_auth() {
+        let r = make_test_record(401, None);
+        assert_eq!(classify_error(&r), Some("auth"));
+    }
+
+    #[test]
+    fn classify_403_is_auth() {
+        let r = make_test_record(403, None);
+        assert_eq!(classify_error(&r), Some("auth"));
+    }
+
+    #[test]
+    fn classify_503_is_upstream_5xx() {
+        let r = make_test_record(503, None);
+        assert_eq!(classify_error(&r), Some("upstream_5xx"));
+    }
+
+    #[test]
+    fn classify_timeout_error_string() {
+        let r = make_test_record(0, Some("request timed out after 30s"));
+        assert_eq!(classify_error(&r), Some("timeout"));
+    }
+
+    #[test]
+    fn classify_connection_error_string() {
+        let r = make_test_record(0, Some("connection refused"));
+        assert_eq!(classify_error(&r), Some("connection"));
+    }
+
+    #[test]
+    fn classify_none_for_200() {
+        let r = make_test_record(200, None);
+        assert_eq!(classify_error(&r), None);
+    }
 
     // -------------------------------------------------------------------------
     // extract_request_info

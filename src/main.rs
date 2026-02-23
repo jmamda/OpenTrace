@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.25.0",
+    version = "0.26.0",
     long_about = None,
 )]
 struct Cli {
@@ -117,6 +117,14 @@ enum Commands {
         /// Show calls at or before this timestamp (ISO 8601 or YYYY-MM-DD)
         #[arg(long)]
         until: Option<String>,
+
+        /// Filter by exact HTTP status code (e.g. 429)
+        #[arg(long)]
+        status: Option<u16>,
+
+        /// Filter by HTTP status code range (e.g. 400-499)
+        #[arg(long, value_parser = parse_status_range)]
+        status_range: Option<(u16, u16)>,
     },
 
     /// Watch for new calls in real time (polls every 250ms)
@@ -128,6 +136,14 @@ enum Commands {
         /// Show only failed calls
         #[arg(short, long)]
         errors: bool,
+
+        /// Filter by exact HTTP status code (e.g. 500)
+        #[arg(long)]
+        status: Option<u16>,
+
+        /// Filter by HTTP status code range (e.g. 400-499)
+        #[arg(long, value_parser = parse_status_range)]
+        status_range: Option<(u16, u16)>,
     },
 
     /// Show full detail for a single call by ID (prefix of 8+ chars is fine)
@@ -177,6 +193,14 @@ enum Commands {
         /// Export calls at or before this timestamp (ISO 8601 or YYYY-MM-DD)
         #[arg(long)]
         until: Option<String>,
+
+        /// Filter by exact HTTP status code (e.g. 429)
+        #[arg(long)]
+        status: Option<u16>,
+
+        /// Filter by HTTP status code range (e.g. 400-599)
+        #[arg(long, value_parser = parse_status_range)]
+        status_range: Option<(u16, u16)>,
     },
 
     /// Start the local web dashboard (reads existing trace.db, no proxy)
@@ -214,6 +238,13 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Flush WAL and defragment the database (shrinks disk usage)
+    Vacuum {
+        /// Path to the database file [default: ~/.trace/trace.db]
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -247,11 +278,11 @@ async fn main() -> Result<()> {
                 &cfg,
             ).await
         }
-        Commands::Query { last, json, bodies, full, model, errors, since, until } => {
-            cmd_query(last, json, bodies, full, model, errors, since, until)
+        Commands::Query { last, json, bodies, full, model, errors, since, until, status, status_range } => {
+            cmd_query(last, json, bodies, full, model, errors, since, until, status, status_range)
         }
-        Commands::Watch { model, errors } => {
-            cmd_watch(model, errors).await
+        Commands::Watch { model, errors, status, status_range } => {
+            cmd_watch(model, errors, status, status_range).await
         }
         Commands::Show { id, no_bodies } => {
             cmd_show(id, no_bodies)
@@ -265,8 +296,8 @@ async fn main() -> Result<()> {
         Commands::Clear { yes } => {
             cmd_clear(yes)
         }
-        Commands::Export { format, model, since, until } => {
-            cmd_export(format, model, since, until)
+        Commands::Export { format, model, since, until, status, status_range } => {
+            cmd_export(format, model, since, until, status, status_range)
         }
         Commands::Serve { port } => {
             let serve_cfg = cfg.serve.as_ref();
@@ -280,6 +311,9 @@ async fn main() -> Result<()> {
         }
         Commands::Config { action } => {
             cmd_config(action, &cfg, cfg_path.as_deref())
+        }
+        Commands::Vacuum { db } => {
+            cmd_vacuum(db)
         }
     }
 }
@@ -410,7 +444,7 @@ async fn cmd_start(
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.25.0".bold());
+    println!("{}", "trace v0.26.0".bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
     if !routes.is_empty() {
@@ -728,12 +762,14 @@ fn cmd_query(
     errors: bool,
     since: Option<String>,
     until: Option<String>,
+    status: Option<u16>,
+    status_range: Option<(u16, u16)>,
 ) -> Result<()> {
     let since = since.map(parse_since_ts).transpose()?;
     let until = until.map(parse_until_ts).transpose()?;
 
     let store = store::Store::open().context("failed to open trace database")?;
-    let filter = store::QueryFilter { errors_only: errors, model, since, until };
+    let filter = store::QueryFilter { errors_only: errors, model, since, until, status, status_range };
     let mut calls = store.query_filtered(limit, &filter)?;
 
     calls.reverse();
@@ -784,11 +820,18 @@ fn cmd_query(
     Ok(())
 }
 
-async fn cmd_watch(model: Option<String>, errors: bool) -> Result<()> {
+async fn cmd_watch(
+    model: Option<String>,
+    errors: bool,
+    status: Option<u16>,
+    status_range: Option<(u16, u16)>,
+) -> Result<()> {
     let store = store::Store::open().context("failed to open trace database")?;
     let filter = store::QueryFilter {
         errors_only: errors,
         model,
+        status,
+        status_range,
         ..Default::default()
     };
 
@@ -940,6 +983,18 @@ fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
         println!("  latency p95       {}ms", format!("{:.0}", p95).cyan());
         println!("  latency p99       {}ms", format!("{:.0}", p99).cyan());
     }
+    let tp = store.token_percentiles(None)?;
+    if tp.input_p50 > 0 || tp.output_p50 > 0 || tp.input_p99 > 0 {
+        println!();
+        println!("{}", "Token percentiles (input / output):".bold());
+        println!("  p50   {:>6} / {:>6}",
+            fmt_num_commas(tp.input_p50 as i64), fmt_num_commas(tp.output_p50 as i64));
+        println!("  p95   {:>6} / {:>6}",
+            fmt_num_commas(tp.input_p95 as i64), fmt_num_commas(tp.output_p95 as i64));
+        println!("  p99   {:>6} / {:>6}",
+            fmt_num_commas(tp.input_p99 as i64), fmt_num_commas(tp.output_p99 as i64));
+    }
+
     println!();
     println!("  input tokens      {}", s.total_input_tokens.to_string().cyan());
     println!("  output tokens     {}", s.total_output_tokens.to_string().cyan());
@@ -1106,6 +1161,8 @@ fn cmd_export(
     model: Option<String>,
     since: Option<String>,
     until: Option<String>,
+    status: Option<u16>,
+    status_range: Option<(u16, u16)>,
 ) -> Result<()> {
     let since = since.map(parse_since_ts).transpose()?;
     let until = until.map(parse_until_ts).transpose()?;
@@ -1116,6 +1173,8 @@ fn cmd_export(
         model,
         since,
         until,
+        status,
+        status_range,
     };
     let records = store.query_all_filtered(&filter)?;
 
@@ -1182,6 +1241,7 @@ fn cmd_report(
         model,
         since: since.clone(),
         until: until.clone(),
+        ..Default::default()
     };
     let records = store.query_all_filtered(&filter)?;
 
@@ -1401,7 +1461,15 @@ fn print_call_row(call: &store::CallRecord) {
     let id_short = if call.id.len() >= 8 { &call.id[..8] } else { &call.id };
     let ts = call.timestamp.get(..19).unwrap_or(&call.timestamp);
     let model_short = truncate(&call.model, 22);
-    let status_str = if call.status_code == 0 || call.status_code >= 400 || call.error.is_some() {
+    let is_error = call.status_code == 0 || call.status_code >= 400 || call.error.is_some();
+    let error_tag = if is_error {
+        capture::classify_error(call)
+            .map(|tag| format!(" [{}]", tag).red().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let status_str = if is_error {
         format!("{:>6}", call.status_code).red().to_string()
     } else {
         format!("{:>6}", call.status_code).green().to_string()
@@ -1421,9 +1489,9 @@ fn print_call_row(call: &store::CallRecord) {
         .unwrap_or_else(|| "         -".to_string());
 
     println!(
-        "{:<8}  {:<19}  {:<22}  {}  {}  {}  {}  {}  {}",
-        id_short, ts, model_short, status_str, latency_str, ttft_str,
-        in_str, out_str, cost_str
+        "{:<8}  {:<19}  {:<22}  {}{}  {}  {}  {}  {}  {}",
+        id_short, ts, model_short, status_str, error_tag,
+        latency_str, ttft_str, in_str, out_str, cost_str
     );
 }
 
@@ -1433,6 +1501,32 @@ fn pretty_json(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Parse a status code range like "400-499" into `(lo, hi)`.
+/// Returns an error if the format is wrong or lo > hi.
+fn parse_status_range(s: &str) -> std::result::Result<(u16, u16), String> {
+    let parts: Vec<&str> = s.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return Err(format!("expected format LO-HI (e.g. 400-499), got {:?}", s));
+    }
+    let lo: u16 = parts[0].parse().map_err(|_| format!("invalid status code {:?}", parts[0]))?;
+    let hi: u16 = parts[1].parse().map_err(|_| format!("invalid status code {:?}", parts[1]))?;
+    if lo > hi {
+        return Err(format!("range lo ({}) must be <= hi ({})", lo, hi));
+    }
+    Ok((lo, hi))
+}
+
+fn cmd_vacuum(db: Option<std::path::PathBuf>) -> Result<()> {
+    let db_path = match db {
+        Some(p) => p,
+        None => store::db_path()?,
+    };
+    let store = store::Store::open_at(&db_path)?;
+    let (before, after) = store.vacuum()?;
+    println!("Vacuumed: {:.1} MB → {:.1} MB", before as f64 / 1e6, after as f64 / 1e6);
+    Ok(())
 }
 
 fn parse_since_ts(s: String) -> Result<String> {
@@ -1895,6 +1989,28 @@ mod tests {
         assert_eq!(clipped, "日本…");
         let full = dim_json("日本語", 3);
         assert_eq!(full, "日本語");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_status_range (Feature 1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_status_range_valid() {
+        assert_eq!(parse_status_range("400-499"), Ok((400, 499)));
+        assert_eq!(parse_status_range("400-400"), Ok((400, 400)));
+        assert_eq!(parse_status_range("500-599"), Ok((500, 599)));
+    }
+
+    #[test]
+    fn parse_status_range_inverted_fails() {
+        assert!(parse_status_range("499-400").is_err(), "lo > hi should fail");
+    }
+
+    #[test]
+    fn parse_status_range_bad_format_fails() {
+        assert!(parse_status_range("400").is_err());
+        assert!(parse_status_range("abc-499").is_err());
     }
 
     // -------------------------------------------------------------------------
