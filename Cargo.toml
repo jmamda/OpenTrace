@@ -1,6 +1,6 @@
 [package]
 name = "trace"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 description = "The strace of LLM calls — local-first observability proxy"
 
@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 axum = "0.7"
 
 # HTTP client (upstream forwarding)
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 
 # Local storage (SQLite, bundled — zero external deps)
 rusqlite = { version = "0.31", features = ["bundled"] }
