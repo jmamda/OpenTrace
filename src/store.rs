@@ -113,6 +113,22 @@ pub struct QueryFilter {
     pub status_range: Option<(u16, u16)>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchResult {
+    pub record: CallRecord,
+    pub rank: f64,
+    pub snippet: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DailyStat {
+    pub date: String,
+    pub calls: i64,
+    pub cost_usd: f64,
+    pub error_count: i64,
+    pub avg_latency_ms: f64,
+}
+
 pub struct Store {
     conn: Connection,
     path: PathBuf,
@@ -167,6 +183,15 @@ const SELECT_COLS: &str = "
     input_tokens, output_tokens, cost_usd,
     request_body, response_body, error,
     provider_request_id, trace_id, parent_id, prompt_hash";
+
+/// Same columns as SELECT_COLS but table-qualified for use in JOINs
+/// where bare column names (e.g. `id`) would be ambiguous.
+const SELECT_COLS_CALLS: &str = "
+    calls.id, calls.timestamp, calls.provider, calls.model, calls.endpoint,
+    calls.status_code, calls.latency_ms, calls.ttft_ms,
+    calls.input_tokens, calls.output_tokens, calls.cost_usd,
+    calls.request_body, calls.response_body, calls.error,
+    calls.provider_request_id, calls.trace_id, calls.parent_id, calls.prompt_hash";
 
 impl Store {
     /// Open an in-memory SQLite database.
@@ -254,6 +279,43 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS calls_fts USING fts5(
+                id UNINDEXED,
+                model,
+                provider,
+                endpoint,
+                request_body,
+                response_body,
+                error,
+                content='calls',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS calls_fts_ai
+                AFTER INSERT ON calls BEGIN
+                    INSERT INTO calls_fts(rowid, id, model, provider, endpoint,
+                                          request_body, response_body, error)
+                    VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
+                            new.request_body, new.response_body, new.error);
+                END;
+            CREATE TRIGGER IF NOT EXISTS calls_fts_ad
+                AFTER DELETE ON calls BEGIN
+                    INSERT INTO calls_fts(calls_fts, rowid, id, model, provider, endpoint,
+                                          request_body, response_body, error)
+                    VALUES ('delete', old.rowid, old.id, old.model, old.provider, old.endpoint,
+                            old.request_body, old.response_body, old.error);
+                END;
+            CREATE TRIGGER IF NOT EXISTS calls_fts_au
+                AFTER UPDATE ON calls BEGIN
+                    INSERT INTO calls_fts(calls_fts, rowid, id, model, provider, endpoint,
+                                          request_body, response_body, error)
+                    VALUES ('delete', old.rowid, old.id, old.model, old.provider, old.endpoint,
+                            old.request_body, old.response_body, old.error);
+                    INSERT INTO calls_fts(rowid, id, model, provider, endpoint,
+                                          request_body, response_body, error)
+                    VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
+                            new.request_body, new.response_body, new.error);
+                END;
         ")?;
 
         // Migrate existing databases that predate ttft_ms / provider_request_id.
@@ -271,6 +333,21 @@ impl Store {
                 if !msg.contains("duplicate column name") {
                     return Err(anyhow::anyhow!("schema migration failed: {e}"));
                 }
+            }
+        }
+
+        // Backfill FTS5 index for any rows inserted before the virtual table existed.
+        if let Err(e) = self.conn.execute_batch(
+            "INSERT INTO calls_fts(rowid, id, model, provider, endpoint, \
+                                   request_body, response_body, error) \
+             SELECT rowid, id, model, provider, endpoint, \
+                    request_body, response_body, error FROM calls \
+             WHERE rowid NOT IN (SELECT rowid FROM calls_fts)",
+        ) {
+            // Only propagate if it's not a harmless \"already exists\" scenario.
+            let msg = e.to_string();
+            if !msg.contains("no such table") {
+                return Err(e.into());
             }
         }
 
@@ -330,6 +407,34 @@ impl Store {
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Full-text search across model, provider, endpoint, request_body,
+    /// response_body, and error. Returns up to `limit` results ranked by
+    /// BM25 relevance. Returns an error on invalid FTS5 query syntax.
+    pub fn search_calls(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let limit_i64 = limit.min(500) as i64;
+        let sql = format!(
+            "SELECT {SELECT_COLS_CALLS}, rank, \
+                    snippet(calls_fts, -1, '', '', '...', 12) \
+             FROM calls \
+             JOIN calls_fts ON calls.rowid = calls_fts.rowid \
+             WHERE calls_fts MATCH ?1 \
+             ORDER BY rank \
+             LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![query, limit_i64], |row| {
+            let record = row_to_record(row)?;
+            let rank: f64 = row.get(18)?;
+            let snippet: String = row.get(19).unwrap_or_default();
+            Ok(SearchResult { record, rank, snippet })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(anyhow::Error::from)?);
         }
         Ok(results)
     }
@@ -605,6 +710,40 @@ impl Store {
             })
         })?;
 
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Return per-day aggregates for the last `days` calendar days,
+    /// oldest-first. Days with zero calls are omitted.
+    pub fn daily_stats(&self, days: u32) -> Result<Vec<DailyStat>> {
+        let interval = format!("-{} days", days);
+        let mut stmt = self.conn.prepare(
+            "SELECT date(timestamp) as day, \
+                    COUNT(*) as calls, \
+                    COALESCE(SUM(cost_usd), 0.0) as cost_usd, \
+                    COUNT(CASE WHEN error IS NOT NULL \
+                                OR status_code >= 400 \
+                                OR status_code = 0 \
+                           THEN 1 END) as error_count, \
+                    COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms \
+             FROM calls \
+             WHERE timestamp >= datetime('now', ?1) \
+             GROUP BY day \
+             ORDER BY day ASC",
+        )?;
+        let rows = stmt.query_map(params![interval], |row| {
+            Ok(DailyStat {
+                date: row.get(0)?,
+                calls: row.get(1)?,
+                cost_usd: row.get(2)?,
+                error_count: row.get(3)?,
+                avg_latency_ms: row.get(4)?,
+            })
+        })?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -2044,5 +2183,60 @@ mod tests {
 
         let text = store.get_prompt_text("hash-test").unwrap();
         assert_eq!(text, Some("You are a test assistant".to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // search_calls (FTS5)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn search_calls_finds_by_model() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("a", "gpt-4o-search-unique", 200)).unwrap();
+        store.insert(&make_record("b", "claude-opus-4", 200)).unwrap();
+        let results = store.search_calls("gpt-4o-search-unique", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.id, "a");
+    }
+
+    #[test]
+    fn search_calls_returns_empty_for_no_match() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("a", "gpt-4o", 200)).unwrap();
+        let results = store.search_calls("nonexistent-model-xyz-99999", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_calls_finds_in_request_body() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = make_record("body-test", "gpt-4o", 200);
+        r.request_body = Some(r#"{"messages":[{"role":"user","content":"tell me about semaphores"}]}"#.to_string());
+        store.insert(&r).unwrap();
+        let results = store.search_calls("semaphores", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.id, "body-test");
+    }
+
+    // -------------------------------------------------------------------------
+    // daily_stats
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn daily_stats_returns_aggregated_rows() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("d1", "gpt-4o", 200)).unwrap();
+        store.insert(&make_record("d2", "gpt-4o", 200)).unwrap();
+        let stats = store.daily_stats(7).unwrap();
+        assert!(!stats.is_empty());
+        let today = stats.iter().find(|d| d.calls > 0).unwrap();
+        assert_eq!(today.calls, 2);
+    }
+
+    #[test]
+    fn daily_stats_empty_store_returns_empty() {
+        let store = Store::open_in_memory().unwrap();
+        let stats = store.daily_stats(90).unwrap();
+        assert!(stats.is_empty());
     }
 }

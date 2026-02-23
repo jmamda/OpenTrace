@@ -142,6 +142,18 @@ fn extract_trace_ids(headers: &HeaderMap) -> (Option<String>, Option<String>) {
     (trace_id, parent_id)
 }
 
+/// Add the three CORS headers required for browser fetch() calls from the
+/// playground page (http://localhost:8080) to the proxy (http://localhost:4000).
+fn add_cors_headers(builder: axum::http::response::Builder) -> axum::http::response::Builder {
+    builder
+        .header("Access-Control-Allow-Origin", "*")
+        .header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, x-api-key, anthropic-version",
+        )
+        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+}
+
 async fn handle(
     State(state): State<ProxyState>,
     method: Method,
@@ -149,6 +161,14 @@ async fn handle(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
+    // Handle CORS preflight immediately — no upstream contact needed.
+    if method == Method::OPTIONS {
+        let resp = add_cors_headers(Response::builder().status(200))
+            .body(Body::empty())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(resp);
+    }
+
     let id = Uuid::new_v4().to_string();
     let start = std::time::Instant::now();
     let timestamp = store::now_iso();
@@ -268,7 +288,12 @@ async fn handle(
                 prompt_hash: prompt_hash.clone(),
             };
             try_store(&store_tx, record, verbose);
-            return Err(StatusCode::BAD_GATEWAY);
+            // Return a 502 with CORS headers so the playground page receives a
+            // proper error response rather than an opaque network failure.
+            let resp = add_cors_headers(Response::builder().status(StatusCode::BAD_GATEWAY))
+                .body(Body::empty())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(resp);
         }
     };
 
@@ -298,6 +323,9 @@ async fn handle(
         }
         builder = builder.header(k, v);
     }
+    // CORS headers — required so the playground page at http://localhost:8080
+    // can make fetch() calls to the proxy at http://localhost:4000.
+    builder = add_cors_headers(builder);
 
     if upstream_streaming {
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1024);

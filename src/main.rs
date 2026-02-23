@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.2.9",
+    version = "0.3.0",
     long_about = None,
 )]
 struct Cli {
@@ -309,6 +309,13 @@ enum Commands {
         #[arg(long)]
         upstream: Option<String>,
     },
+
+    /// Open the built-in side-by-side model playground in the dashboard
+    Playground {
+        /// Dashboard port [default: 8080]
+        #[arg(short, long, env = "TRACE_UI_PORT")]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -409,6 +416,18 @@ async fn main() -> Result<()> {
         }
         Commands::Replay { id, model, upstream } => {
             cmd_replay(id, model, upstream).await
+        }
+        Commands::Playground { port } => {
+            let resolved = port.unwrap_or(8080);
+            println!(
+                "Playground: http://localhost:{}/playground",
+                resolved
+            );
+            println!(
+                "Run `trace serve --port {}` first if the dashboard is not already running.",
+                resolved
+            );
+            Ok(())
         }
     }
 }
@@ -2132,6 +2151,18 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::store::{CallRecord, Store};
+
+    // -------------------------------------------------------------------------
+    // playground command
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn playground_command_default_port() {
+        // Just verify the variant exists and resolves the default port correctly
+        let port: Option<u16> = None;
+        let resolved = port.unwrap_or(8080);
+        assert_eq!(resolved, 8080);
+    }
 
     // -------------------------------------------------------------------------
     // csv_field

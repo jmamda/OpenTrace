@@ -1,6 +1,6 @@
 {
   "name": "@opentrace/trace",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "description": "The strace of LLM calls — local-first LLM observability proxy",
   "license": "MIT",
   "repository": {
@@ -11,11 +11,11 @@
   "bin": { "trace": "./lib/main.js" },
   "files": ["lib"],
   "optionalDependencies": {
-    "@opentrace/trace-linux-x64":    "0.2.8",
-    "@opentrace/trace-linux-arm64":  "0.2.8",
-    "@opentrace/trace-darwin-x64":   "0.2.8",
-    "@opentrace/trace-darwin-arm64": "0.2.8",
-    "@opentrace/trace-win32-x64":    "0.2.8"
+    "@opentrace/trace-linux-x64":    "0.3.0",
+    "@opentrace/trace-linux-arm64":  "0.3.0",
+    "@opentrace/trace-darwin-x64":   "0.3.0",
+    "@opentrace/trace-darwin-arm64": "0.3.0",
+    "@opentrace/trace-win32-x64":    "0.3.0"
   },
   "publishConfig": { "access": "public" }
 }

@@ -210,6 +210,21 @@ jobs:
             chmod +x "${PKG_DIR}/bin/trace"
           fi
 
+      - name: Check NPM_TOKEN is configured
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "ERROR: NPM_TOKEN secret is not configured in this repository."
+            echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New secret"
+            echo "Name: NPM_TOKEN"
+            echo "Value: A granular npm access token with write access to @opentrace packages"
+            echo "Note: Classic npm tokens have been globally revoked — use a granular token."
+            exit 1
+          fi
+          echo "NPM_TOKEN is configured."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish platform package
         run: npm publish npm/platforms/${{ matrix.pkg }} --access public
         env:
@@ -242,6 +257,21 @@ jobs:
             }
             fs.writeFileSync('./npm/package.json', JSON.stringify(p, null, 2) + '\n');
           "
+
+      - name: Check NPM_TOKEN is configured
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "ERROR: NPM_TOKEN secret is not configured in this repository."
+            echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New secret"
+            echo "Name: NPM_TOKEN"
+            echo "Value: A granular npm access token with write access to @opentrace packages"
+            echo "Note: Classic npm tokens have been globally revoked — use a granular token."
+            exit 1
+          fi
+          echo "NPM_TOKEN is configured."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish root package
         run: npm publish npm --access public

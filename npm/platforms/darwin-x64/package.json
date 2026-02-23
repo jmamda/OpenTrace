@@ -1,6 +1,6 @@
 {
   "name": "@opentrace/trace-darwin-x64",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "description": "macOS x64 binary for @opentrace/trace",
   "license": "MIT",
   "repository": {
