@@ -1673,8 +1673,8 @@ mod tests {
     #[test]
     fn model_prices_glm47_not_matched_by_glm4_generic() {
         // glm-4.7 must match its own arm, not the glm-4 catch-all
-        let (i47, o47) = model_prices("glm-4.7");
-        let (i4,  o4)  = model_prices("glm-4-v");  // some glm-4 generic model
+        let (_i47, o47) = model_prices("glm-4.7");
+        let (_i4,  o4)  = model_prices("glm-4-v");  // some glm-4 generic model
         // glm-4.7 has higher output price than base glm-4
         assert!(o47 > o4, "glm-4.7 output price should differ from glm-4 generic");
     }

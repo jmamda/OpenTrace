@@ -196,6 +196,7 @@ const SELECT_COLS_CALLS: &str = "
 impl Store {
     /// Open an in-memory SQLite database.
     /// This avoids touching the filesystem and keeps every test isolated.
+    #[allow(dead_code)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
             .context("failed to open in-memory DB")?;

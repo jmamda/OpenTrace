@@ -139,13 +139,12 @@ jobs:
           mkdir -p "${OUTDIR}"
 
           for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            declare -A TARGET=(
-              [linux-x64]="x86_64-unknown-linux-gnu"
-              [linux-arm64]="aarch64-unknown-linux-gnu"
-              [darwin-x64]="x86_64-apple-darwin"
-              [darwin-arm64]="aarch64-apple-darwin"
-            )
-            triple="${TARGET[$pkg]}"
+            case "$pkg" in
+              linux-x64)    triple="x86_64-unknown-linux-gnu" ;;
+              linux-arm64)  triple="aarch64-unknown-linux-gnu" ;;
+              darwin-x64)   triple="x86_64-apple-darwin" ;;
+              darwin-arm64) triple="aarch64-apple-darwin" ;;
+            esac
             src="/tmp/artifacts/binary-${pkg}/trace"
             dst="${OUTDIR}/trace-${VERSION}-${triple}"
             cp "${src}" "${dst}"
@@ -274,6 +273,6 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish root package
-        run: npm publish npm --access public
+        run: npm publish ./npm --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

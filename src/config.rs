@@ -17,6 +17,7 @@ pub struct RouteEntry {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
 pub struct StartConfig {
     pub port: Option<u16>,
     pub upstream: Option<String>,
