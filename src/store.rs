@@ -193,6 +193,24 @@ const SELECT_COLS_CALLS: &str = "
     calls.request_body, calls.response_body, calls.error,
     calls.provider_request_id, calls.trace_id, calls.parent_id, calls.prompt_hash";
 
+/// Escape a raw user query into a valid FTS5 MATCH expression.
+///
+/// Each whitespace-separated token is wrapped in FTS5 double-quotes so that
+/// hyphens, asterisks, and other FTS5 syntax characters are treated as
+/// literals rather than operators.  For example:
+///
+///   `gpt-4o`  →  `"gpt-4o"`
+///   `foo bar` →  `"foo" "bar"`
+///
+/// Embedded double-quote characters are escaped by doubling them (`"` → `""`).
+fn fts5_escape(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Store {
     /// Open an in-memory SQLite database.
     /// This avoids touching the filesystem and keeps every test isolated.
@@ -414,8 +432,17 @@ impl Store {
 
     /// Full-text search across model, provider, endpoint, request_body,
     /// response_body, and error. Returns up to `limit` results ranked by
-    /// BM25 relevance. Returns an error on invalid FTS5 query syntax.
+    /// BM25 relevance.
+    ///
+    /// User input is escaped before being handed to FTS5: each whitespace-
+    /// separated token is double-quoted so that hyphens and other FTS5
+    /// syntax characters (e.g. `gpt-4o`) are treated as literals rather
+    /// than operators.
     pub fn search_calls(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let escaped = fts5_escape(query);
+        if escaped.is_empty() {
+            return Ok(Vec::new());
+        }
         let limit_i64 = limit.min(500) as i64;
         let sql = format!(
             "SELECT {SELECT_COLS_CALLS}, rank, \
@@ -427,7 +454,7 @@ impl Store {
              LIMIT ?2"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![query, limit_i64], |row| {
+        let rows = stmt.query_map(params![escaped, limit_i64], |row| {
             let record = row_to_record(row)?;
             let rank: f64 = row.get(18)?;
             let snippet: String = row.get(19).unwrap_or_default();
