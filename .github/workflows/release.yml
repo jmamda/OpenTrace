@@ -2,15 +2,62 @@ name: Release
 
 on:
   push:
-    tags: ['v[0-9]*']
+    tags: ['v[0-9]+\.[0-9]+\.[0-9]+']
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
 
+  # ── 1. Gate: tag must match Cargo.toml version ──────────────────────────────
+  verify-version:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          CARGO_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          TAG_VERSION="${TAG#v}"
+
+          echo "Git tag    : ${TAG}"
+          echo "Cargo.toml : ${CARGO_VERSION}"
+
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo ""
+            echo "ERROR: tag '${TAG}' does not match Cargo.toml version '${CARGO_VERSION}'."
+            echo "Bump the version field in Cargo.toml (and commit) before pushing this tag."
+            exit 1
+          fi
+          echo "OK: versions match (${CARGO_VERSION})"
+
+  # ── 2. Test: run full suite on Linux before touching any builds ──────────────
+  test:
+    name: Test suite
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Run tests
+        run: cargo test --locked
+
+  # ── 3. Build: cross-platform matrix ─────────────────────────────────────────
   build:
     name: Build ${{ matrix.target }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,6 +92,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install cross (Linux ARM64)
         if: matrix.use_cross == true
         uses: taiki-e/install-action@cross
@@ -53,9 +104,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --locked --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }}
           fi
 
       - name: Upload binary
@@ -65,6 +116,56 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.bin }}
           if-no-files-found: error
 
+  # ── 4a. GitHub Release: attach all 5 binaries ───────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: /tmp/artifacts
+          merge-multiple: false
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          OUTDIR="/tmp/release-assets"
+          mkdir -p "${OUTDIR}"
+
+          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            declare -A TARGET=(
+              [linux-x64]="x86_64-unknown-linux-gnu"
+              [linux-arm64]="aarch64-unknown-linux-gnu"
+              [darwin-x64]="x86_64-apple-darwin"
+              [darwin-arm64]="aarch64-apple-darwin"
+            )
+            triple="${TARGET[$pkg]}"
+            src="/tmp/artifacts/binary-${pkg}/trace"
+            dst="${OUTDIR}/trace-${VERSION}-${triple}"
+            cp "${src}" "${dst}"
+            chmod +x "${dst}"
+          done
+
+          src="/tmp/artifacts/binary-win32-x64/trace.exe"
+          dst="${OUTDIR}/trace-${VERSION}-x86_64-pc-windows-msvc.exe"
+          cp "${src}" "${dst}"
+
+          echo "Release assets:"
+          ls -lh "${OUTDIR}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: /tmp/release-assets/*
+
+  # ── 4b. npm platform packages (parallel to release job) ─────────────────────
   publish-platforms:
     name: Publish @opentrace/trace-${{ matrix.pkg }}
     needs: build
@@ -94,7 +195,6 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           PKG_DIR="npm/platforms/${{ matrix.pkg }}"
 
-          # Update version in platform package.json to match the git tag
           node -e "
             const fs = require('fs');
             const p = JSON.parse(fs.readFileSync('./${PKG_DIR}/package.json', 'utf8'));
@@ -102,7 +202,6 @@ jobs:
             fs.writeFileSync('./${PKG_DIR}/package.json', JSON.stringify(p, null, 2) + '\n');
           "
 
-          # Place binary in the right location
           if [[ "${{ matrix.pkg }}" == win32* ]]; then
             cp /tmp/binary/trace.exe "${PKG_DIR}/trace.exe"
           else
@@ -116,6 +215,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # ── 5. npm root package ──────────────────────────────────────────────────────
   publish-root:
     name: Publish @opentrace/trace (root)
     needs: publish-platforms

@@ -1,6 +1,6 @@
 {
   "name": "@opentrace/trace-win32-x64",
-  "version": "0.25.0",
+  "version": "0.2.8",
   "description": "Windows x64 binary for @opentrace/trace",
   "license": "MIT",
   "repository": {
