@@ -107,6 +107,41 @@ fn resolve_upstream<'a>(
     default
 }
 
+/// Extract distributed trace identifiers from incoming request headers.
+///
+/// Priority order:
+/// 1. W3C `traceparent` header: `00-{32hex}-{16hex}-{2hex}`
+///    → trace_id = field[1] (the 32-char trace identifier)
+///    → parent_id = field[2] (the 16-char parent span identifier)
+/// 2. `x-trace-id` or `x-b3-traceid` (Zipkin/B3) → trace_id only
+/// 3. `x-parent-span-id` → parent_id only
+///
+/// Returns (trace_id, parent_id), both Option<String>.
+fn extract_trace_ids(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    // Try W3C traceparent first: "00-{trace_id}-{parent_id}-{flags}"
+    if let Some(val) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+        let parts: Vec<&str> = val.splitn(4, '-').collect();
+        if parts.len() == 4 {
+            return (Some(parts[1].to_string()), Some(parts[2].to_string()));
+        }
+    }
+
+    // Fallback: individual headers
+    let trace_id = headers
+        .get("x-trace-id")
+        .or_else(|| headers.get("x-b3-traceid"))
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let parent_id = headers
+        .get("x-parent-span-id")
+        .or_else(|| headers.get("x-b3-parentspanid"))
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    (trace_id, parent_id)
+}
+
 async fn handle(
     State(state): State<ProxyState>,
     method: Method,
@@ -126,6 +161,7 @@ async fn handle(
     let client = state.client.clone();
     let store_tx = state.store_tx.clone();
     let provider = capture::detect_provider(&upstream);
+    let (trace_id, parent_id) = extract_trace_ids(&headers);
 
     // Read and buffer request body.
     let req_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
@@ -224,6 +260,8 @@ async fn handle(
                 response_body: None,
                 error: Some(e.to_string()),
                 provider_request_id: None,
+                trace_id: trace_id.clone(),
+                parent_id: parent_id.clone(),
             };
             try_store(&store_tx, record, verbose);
             return Err(StatusCode::BAD_GATEWAY);
@@ -263,6 +301,8 @@ async fn handle(
         // Clone stored_req_body for the spawned closure (error path already
         // consumed the original via early return above).
         let req_body_for_spawn = stored_req_body;
+        let trace_id_for_spawn = trace_id.clone();
+        let parent_id_for_spawn = parent_id.clone();
 
         tokio::spawn(async move {
             // Accumulate all chunks (cheap: Bytes::clone increments Arc refcount)
@@ -355,6 +395,8 @@ async fn handle(
                 response_body,
                 error: None,
                 provider_request_id,
+                trace_id: trace_id_for_spawn,
+                parent_id: parent_id_for_spawn,
             };
             try_store(&store_tx, record, verbose);
         });
@@ -426,6 +468,8 @@ async fn handle(
             response_body: resp_str,
             error: None,
             provider_request_id,
+            trace_id,
+            parent_id,
         };
         try_store(&store_tx, record, verbose);
 
@@ -519,6 +563,47 @@ mod tests {
             resolve_upstream(&default, &routes, "/v1-legacy").as_str(),
             "https://default.example.com"
         );
+    }
+
+    #[test]
+    fn extract_trace_ids_w3c_traceparent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        let (trace_id, parent_id) = extract_trace_ids(&headers);
+        assert_eq!(trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(parent_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
+    #[test]
+    fn extract_trace_ids_x_trace_id_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-trace-id", "my-trace-123".parse().unwrap());
+        let (trace_id, parent_id) = extract_trace_ids(&headers);
+        assert_eq!(trace_id.as_deref(), Some("my-trace-123"));
+        assert!(parent_id.is_none());
+    }
+
+    #[test]
+    fn extract_trace_ids_empty_headers() {
+        let headers = HeaderMap::new();
+        let (trace_id, parent_id) = extract_trace_ids(&headers);
+        assert!(trace_id.is_none());
+        assert!(parent_id.is_none());
+    }
+
+    #[test]
+    fn extract_trace_ids_b3_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-b3-traceid", "abc123".parse().unwrap());
+        headers.insert("x-b3-parentspanid", "def456".parse().unwrap());
+        let (trace_id, parent_id) = extract_trace_ids(&headers);
+        assert_eq!(trace_id.as_deref(), Some("abc123"));
+        assert_eq!(parent_id.as_deref(), Some("def456"));
     }
 
     #[test]

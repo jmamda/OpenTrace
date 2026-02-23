@@ -21,6 +21,17 @@ pub struct CallRecord {
     pub response_body: Option<String>,
     pub error: Option<String>,
     pub provider_request_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EvalStats {
+    pub total_calls: i64,
+    pub error_count: i64,
+    pub error_rate: f64,       // error_count / total_calls, or 0.0 if no calls
+    pub latency_p99: u64,      // milliseconds
+    pub avg_cost_usd: f64,     // average cost per call, 0.0 if no cost data
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,7 +111,7 @@ fn build_status_clause(status: &Option<u16>, status_range: &Option<(u16, u16)>) 
 ///   5=status_code  6=latency_ms  7=ttft_ms
 ///   8=input_tokens  9=output_tokens  10=cost_usd
 ///   11=request_body  12=response_body  13=error
-///   14=provider_request_id
+///   14=provider_request_id  15=trace_id  16=parent_id
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     Ok(CallRecord {
         id: row.get(0)?,
@@ -118,6 +129,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
         response_body: row.get(12)?,
         error: row.get(13)?,
         provider_request_id: row.get(14)?,
+        trace_id: row.get(15)?,
+        parent_id: row.get(16)?,
     })
 }
 
@@ -126,7 +139,7 @@ const SELECT_COLS: &str = "
     status_code, latency_ms, ttft_ms,
     input_tokens, output_tokens, cost_usd,
     request_body, response_body, error,
-    provider_request_id";
+    provider_request_id, trace_id, parent_id";
 
 impl Store {
     /// Open an in-memory SQLite database.
@@ -199,11 +212,14 @@ impl Store {
                 request_body        TEXT,
                 response_body       TEXT,
                 error               TEXT,
-                provider_request_id TEXT
+                provider_request_id TEXT,
+                trace_id            TEXT,
+                parent_id           TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
             CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(model);
+            CREATE INDEX IF NOT EXISTS idx_calls_trace_id ON calls(trace_id);
 
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
@@ -217,6 +233,8 @@ impl Store {
         for sql in &[
             "ALTER TABLE calls ADD COLUMN ttft_ms INTEGER",
             "ALTER TABLE calls ADD COLUMN provider_request_id TEXT",
+            "ALTER TABLE calls ADD COLUMN trace_id TEXT",
+            "ALTER TABLE calls ADD COLUMN parent_id TEXT",
         ] {
             if let Err(e) = self.conn.execute_batch(sql) {
                 let msg = e.to_string().to_lowercase();
@@ -236,14 +254,14 @@ impl Store {
                 status_code, latency_ms, ttft_ms,
                 input_tokens, output_tokens,
                 cost_usd, request_body, response_body, error,
-                provider_request_id
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                provider_request_id, trace_id, parent_id
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 r.id, r.timestamp, r.provider, r.model, r.endpoint,
                 r.status_code, r.latency_ms, r.ttft_ms.map(|v| v as i64),
                 r.input_tokens, r.output_tokens,
                 r.cost_usd, r.request_body, r.response_body, r.error,
-                r.provider_request_id,
+                r.provider_request_id, r.trace_id, r.parent_id,
             ],
         )?;
         Ok(())
@@ -632,6 +650,81 @@ impl Store {
         })
     }
 
+    /// Return all calls that share the same trace_id, ordered by timestamp.
+    /// Used by `trace show --tree` to render the full call chain.
+    pub fn query_trace_tree(&self, trace_id: &str) -> Result<Vec<CallRecord>> {
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM calls WHERE trace_id = ?1 ORDER BY timestamp ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let records = stmt
+            .query_map(params![trace_id], row_to_record)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(records)
+    }
+
+    /// Compute aggregate stats for eval rule checking.
+    /// Uses the same QueryFilter as other query methods (model, since, until, status filters).
+    pub fn eval_stats(&self, filter: &QueryFilter) -> Result<EvalStats> {
+        let mut clauses = vec!["1=1".to_string()];
+        if filter.errors_only {
+            clauses.push("(error IS NOT NULL OR status_code >= 400)".to_string());
+        }
+        if let Some(ref m) = filter.model {
+            clauses.push(format!("model = '{}'", m.replace('\'', "''")));
+        }
+        if let Some(ref s) = filter.since {
+            clauses.push(format!("timestamp >= '{}'", s));
+        }
+        if let Some(ref u) = filter.until {
+            clauses.push(format!("timestamp <= '{}'", u));
+        }
+        let status_clause = build_status_clause(&filter.status, &filter.status_range);
+        let where_sql = clauses.join(" AND ");
+
+        // Aggregate query for counts and avg cost
+        let agg_sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN error IS NOT NULL OR status_code >= 400 THEN 1 ELSE 0 END), 0), COALESCE(AVG(cost_usd), 0.0) FROM calls WHERE {where_sql} {status_clause}"
+        );
+        let (total_calls, error_count, avg_cost_usd): (i64, i64, f64) =
+            self.conn.query_row(&agg_sql, [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+
+        let error_rate = if total_calls > 0 {
+            error_count as f64 / total_calls as f64
+        } else {
+            0.0
+        };
+
+        // Compute latency p99 via sorted vec (same pattern as latency_percentiles)
+        let lat_sql = format!(
+            "SELECT latency_ms FROM calls WHERE {where_sql} {status_clause}"
+        );
+        let mut stmt = self.conn.prepare(&lat_sql)?;
+        let mut latencies: Vec<u64> = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|v| v as u64)
+            .collect();
+        latencies.sort_unstable();
+        let latency_p99 = if latencies.is_empty() {
+            0
+        } else {
+            let n = latencies.len();
+            latencies[(n * 99 / 100).min(n - 1)]
+        };
+
+        Ok(EvalStats {
+            total_calls,
+            error_count,
+            error_rate,
+            latency_p99,
+            avg_cost_usd,
+        })
+    }
+
     /// Flush the WAL to the main database file and defragment.
     /// Returns `(bytes_before, bytes_after)` from the filesystem.
     pub fn vacuum(&self) -> Result<(u64, u64)> {
@@ -693,6 +786,8 @@ mod tests {
             response_body: Some(r#"{"choices":[]}"#.to_string()),
             error: None,
             provider_request_id: None,
+            trace_id: None,
+            parent_id: None,
         }
     }
 
@@ -730,9 +825,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // idx_calls_timestamp + idx_calls_model = 2
+        // idx_calls_timestamp + idx_calls_model + idx_calls_trace_id = 3
         // (Excludes SQLite auto-generated indexes such as the PRIMARY KEY index.)
-        assert_eq!(idx_count, 2, "both indexes should exist after init");
+        assert_eq!(idx_count, 3, "all three indexes should exist after init");
     }
 
     // -------------------------------------------------------------------------
@@ -1580,5 +1675,71 @@ mod tests {
         assert!(after > 0, "after size should be > 0");
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // -------------------------------------------------------------------------
+    // query_trace_tree (Feature: agent trace tree)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn trace_tree_returns_calls_by_trace_id() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("t1", "gpt-4o", 200);
+        r1.trace_id = Some("trace-abc".to_string());
+        r1.parent_id = None;
+        let mut r2 = make_record("t2", "gpt-4o", 200);
+        r2.trace_id = Some("trace-abc".to_string());
+        r2.parent_id = Some("t1".to_string());
+        let mut r3 = make_record("t3", "gpt-4o", 200);
+        r3.trace_id = Some("trace-other".to_string());
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+        store.insert(&r3).unwrap();
+
+        let tree = store.query_trace_tree("trace-abc").unwrap();
+        assert_eq!(tree.len(), 2);
+        assert!(tree.iter().all(|r| r.trace_id.as_deref() == Some("trace-abc")));
+    }
+
+    #[test]
+    fn trace_tree_empty_for_unknown_trace_id() {
+        let store = Store::open_in_memory().unwrap();
+        let tree = store.query_trace_tree("no-such-trace").unwrap();
+        assert!(tree.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // eval_stats (Feature: EvalStats)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn eval_stats_basic() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("e1", "gpt-4o", 200)).unwrap();
+        store.insert(&make_record("e2", "gpt-4o", 200)).unwrap();
+        store.insert(&make_error_record("e3", "gpt-4o", 500, "server error")).unwrap();
+        let stats = store.eval_stats(&QueryFilter::default()).unwrap();
+        assert_eq!(stats.total_calls, 3);
+        assert_eq!(stats.error_count, 1);
+        assert!((stats.error_rate - 1.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn eval_stats_empty_store() {
+        let store = Store::open_in_memory().unwrap();
+        let stats = store.eval_stats(&QueryFilter::default()).unwrap();
+        assert_eq!(stats.total_calls, 0);
+        assert_eq!(stats.error_rate, 0.0);
+        assert_eq!(stats.latency_p99, 0);
+    }
+
+    #[test]
+    fn eval_stats_model_filter() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("m1", "gpt-4o", 200)).unwrap();
+        store.insert(&make_record("m2", "claude-3-opus", 200)).unwrap();
+        let filter = QueryFilter { model: Some("gpt-4o".to_string()), ..Default::default() };
+        let stats = store.eval_stats(&filter).unwrap();
+        assert_eq!(stats.total_calls, 1);
     }
 }

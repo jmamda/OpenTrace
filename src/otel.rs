@@ -230,6 +230,8 @@ mod tests {
             response_body: None,
             error: error.map(String::from),
             provider_request_id: Some("req-abc".to_string()),
+            trace_id: None,
+            parent_id: None,
         }
     }
 

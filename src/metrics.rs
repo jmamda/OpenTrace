@@ -317,6 +317,8 @@ mod tests {
             response_body: None,
             error: None,
             provider_request_id: None,
+            trace_id: None,
+            parent_id: None,
         }
     }
 

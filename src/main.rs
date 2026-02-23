@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.26.0",
+    version = "0.27.0",
     long_about = None,
 )]
 struct Cli {
@@ -153,6 +153,9 @@ enum Commands {
         /// Hide request and response bodies (for sensitive/shared environments)
         #[arg(long)]
         no_bodies: bool,
+        /// Show all calls in the same distributed trace as a tree
+        #[arg(long)]
+        tree: bool,
     },
 
     /// Show aggregate stats
@@ -245,6 +248,28 @@ enum Commands {
         #[arg(long)]
         db: Option<std::path::PathBuf>,
     },
+
+    /// Check call history against performance rules (exits 1 if any rule fails)
+    Eval {
+        /// Rule to check. Format: METRIC OP VALUE.
+        /// Metrics: latency_p99, error_rate, error_count, avg_cost_usd, total_calls.
+        /// Operators: <, <=, >, >=, =, ==.
+        /// Example: --rule "latency_p99 < 2000" --rule "error_rate < 0.05"
+        #[arg(long = "rule", value_name = "METRIC OP VALUE")]
+        rules: Vec<String>,
+
+        /// Only evaluate calls at or after this timestamp
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Only evaluate calls at or before this timestamp
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Only evaluate calls for this model (substring match)
+        #[arg(short, long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -284,8 +309,8 @@ async fn main() -> Result<()> {
         Commands::Watch { model, errors, status, status_range } => {
             cmd_watch(model, errors, status, status_range).await
         }
-        Commands::Show { id, no_bodies } => {
-            cmd_show(id, no_bodies)
+        Commands::Show { id, no_bodies, tree } => {
+            cmd_show(id, no_bodies, tree)
         }
         Commands::Stats { breakdown, endpoint } => {
             cmd_stats(breakdown, endpoint)
@@ -314,6 +339,9 @@ async fn main() -> Result<()> {
         }
         Commands::Vacuum { db } => {
             cmd_vacuum(db)
+        }
+        Commands::Eval { rules, since, until, model } => {
+            cmd_eval(rules, since, until, model)
         }
     }
 }
@@ -444,7 +472,7 @@ async fn cmd_start(
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.26.0".bold());
+    println!("{}", "trace v0.27.0".bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
     if !routes.is_empty() {
@@ -908,7 +936,7 @@ fn print_budget_line(spent: f64, limit: f64, period: &str) {
     }
 }
 
-fn cmd_show(id: String, no_bodies: bool) -> Result<()> {
+fn cmd_show(id: String, no_bodies: bool, tree: bool) -> Result<()> {
     let store = store::Store::open().context("failed to open trace database")?;
     match store.get_by_id(&id)? {
         None => {
@@ -956,6 +984,45 @@ fn cmd_show(id: String, no_bodies: bool) -> Result<()> {
                     println!();
                     println!("{}", "response:".bold());
                     println!("{}", pretty_json(resp));
+                }
+            }
+
+            // Tree view — show sibling/child calls sharing the same trace_id
+            if tree {
+                if let Some(ref tid) = r.trace_id {
+                    let store2 = store::Store::open().context("failed to open trace database")?;
+                    let siblings = store2.query_trace_tree(tid)?;
+                    if siblings.len() > 1 {
+                        println!();
+                        println!("{}", "trace tree:".bold());
+                        for s in &siblings {
+                            let is_root = s.parent_id.is_none();
+                            let is_self = s.id == r.id;
+                            let prefix = if is_root { "  ●" } else { "  └" };
+                            let id_str = s.id[..8.min(s.id.len())].to_string();
+                            let marker = if is_self { " ◀ this call" } else { "" };
+                            let status_str = if s.status_code == 0 || s.status_code >= 400 || s.error.is_some() {
+                                s.status_code.to_string().red().to_string()
+                            } else {
+                                s.status_code.to_string().green().to_string()
+                            };
+                            println!("{} {} {} {} {}ms {}{}",
+                                prefix,
+                                id_str.cyan(),
+                                s.model.as_str(),
+                                status_str,
+                                s.latency_ms,
+                                s.timestamp[..19.min(s.timestamp.len())].to_string().dimmed(),
+                                marker.dimmed(),
+                            );
+                        }
+                    } else {
+                        println!();
+                        println!("{}", "(no other calls share this trace_id)".dimmed());
+                    }
+                } else {
+                    println!();
+                    println!("{}", "(no trace_id on this call — was it proxied via OpenTrace with a traceparent header?)".dimmed());
                 }
             }
         }
@@ -1529,6 +1596,87 @@ fn cmd_vacuum(db: Option<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_eval(rules: Vec<String>, since: Option<String>, until: Option<String>, model: Option<String>) -> Result<()> {
+    if rules.is_empty() {
+        println!("{}", "No rules specified. Use --rule \"latency_p99 < 2000\".".yellow());
+        return Ok(());
+    }
+
+    let store = store::Store::open().context("failed to open trace database")?;
+    let filter = store::QueryFilter {
+        since,
+        until,
+        model,
+        ..Default::default()
+    };
+    let stats = store.eval_stats(&filter)?;
+
+    println!("{}", "trace eval".bold());
+    println!();
+    println!("  total_calls    {}", stats.total_calls.to_string().cyan());
+    println!("  error_count    {}", stats.error_count.to_string().cyan());
+    println!("  error_rate     {:.4}", stats.error_rate);
+    println!("  latency_p99    {}ms", stats.latency_p99.to_string().cyan());
+    println!("  avg_cost_usd   ${:.6}", stats.avg_cost_usd);
+    println!();
+
+    let mut any_failed = false;
+
+    for rule in &rules {
+        match eval_check_rule(rule, &stats) {
+            Ok(true) => {
+                println!("  {} {}", "PASS".green().bold(), rule);
+            }
+            Ok(false) => {
+                println!("  {} {}", "FAIL".red().bold(), rule);
+                any_failed = true;
+            }
+            Err(e) => {
+                println!("  {} {} — {}", "ERR ".yellow().bold(), rule, e);
+                any_failed = true;
+            }
+        }
+    }
+
+    println!();
+    if any_failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Parse and evaluate a single eval rule string against EvalStats.
+/// Format: "METRIC OPERATOR VALUE"
+/// Returns Ok(true) = pass, Ok(false) = fail, Err = bad rule format.
+fn eval_check_rule(rule: &str, stats: &store::EvalStats) -> std::result::Result<bool, String> {
+    let parts: Vec<&str> = rule.trim().splitn(3, ' ').collect();
+    if parts.len() != 3 {
+        return Err(format!("expected \"METRIC OP VALUE\", got {:?}", rule));
+    }
+    let metric = parts[0];
+    let op = parts[1];
+    let rhs: f64 = parts[2].parse().map_err(|_| format!("invalid number: {}", parts[2]))?;
+
+    let lhs: f64 = match metric {
+        "latency_p99"   => stats.latency_p99 as f64,
+        "error_rate"    => stats.error_rate,
+        "error_count"   => stats.error_count as f64,
+        "avg_cost_usd"  => stats.avg_cost_usd,
+        "total_calls"   => stats.total_calls as f64,
+        other           => return Err(format!("unknown metric: {}", other)),
+    };
+
+    let result = match op {
+        "<"  => lhs <  rhs,
+        "<=" => lhs <= rhs,
+        ">"  => lhs >  rhs,
+        ">=" => lhs >= rhs,
+        "=" | "==" => (lhs - rhs).abs() < f64::EPSILON,
+        other => return Err(format!("unknown operator: {}", other)),
+    };
+    Ok(result)
+}
+
 fn parse_since_ts(s: String) -> Result<String> {
     if chrono::DateTime::parse_from_rfc3339(&s).is_ok() {
         return Ok(s);
@@ -1710,6 +1858,8 @@ mod tests {
             response_body: Some(r#"{"choices":[]}"#.to_string()),
             error: None,
             provider_request_id: Some("req-123".to_string()),
+            trace_id: None,
+            parent_id: None,
         }
     }
 
@@ -1783,6 +1933,8 @@ mod tests {
             response_body: None,
             error: None,
             provider_request_id: None,
+            trace_id: None,
+            parent_id: None,
         }
     }
 
@@ -2059,5 +2211,48 @@ mod tests {
     #[test]
     fn fmt_tokens_boundary_1_000_000() {
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
+    }
+
+    #[test]
+    fn eval_check_rule_latency_pass() {
+        let stats = store::EvalStats {
+            total_calls: 10, error_count: 1, error_rate: 0.1,
+            latency_p99: 1500, avg_cost_usd: 0.001,
+        };
+        assert_eq!(eval_check_rule("latency_p99 < 2000", &stats), Ok(true));
+        assert_eq!(eval_check_rule("latency_p99 < 1000", &stats), Ok(false));
+    }
+
+    #[test]
+    fn eval_check_rule_error_rate_pass() {
+        let stats = store::EvalStats {
+            total_calls: 100, error_count: 3, error_rate: 0.03,
+            latency_p99: 500, avg_cost_usd: 0.0005,
+        };
+        assert_eq!(eval_check_rule("error_rate < 0.05", &stats), Ok(true));
+        assert_eq!(eval_check_rule("error_rate < 0.01", &stats), Ok(false));
+    }
+
+    #[test]
+    fn eval_check_rule_bad_metric() {
+        let stats = store::EvalStats {
+            total_calls: 1, error_count: 0, error_rate: 0.0,
+            latency_p99: 100, avg_cost_usd: 0.0,
+        };
+        assert!(eval_check_rule("unknown_metric < 100", &stats).is_err());
+    }
+
+    #[test]
+    fn eval_check_rule_bad_format() {
+        let stats = store::EvalStats {
+            total_calls: 1, error_count: 0, error_rate: 0.0,
+            latency_p99: 100, avg_cost_usd: 0.0,
+        };
+        assert!(eval_check_rule("malformed", &stats).is_err());
+    }
+
+    #[test]
+    fn parse_status_range_valid_still_works() {
+        assert_eq!(parse_status_range("400-499"), Ok((400u16, 499u16)));
     }
 }
