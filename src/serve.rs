@@ -252,6 +252,7 @@ mod tests {
             provider_request_id: None,
             trace_id: None,
             parent_id: None,
+            prompt_hash: None,
         }
     }
 

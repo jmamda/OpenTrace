@@ -316,6 +316,50 @@ pub fn detect_provider(upstream: &str) -> String {
     }
 }
 
+/// FNV-1a 64-bit hash — zero new dependencies.
+fn fnv1a_64(s: &str) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
+}
+
+/// Extract system prompt from OpenAI (messages[*].role=="system") or
+/// Anthropic ("system" field) request body, return its FNV-64 hex fingerprint.
+///
+/// Returns `None` when no system prompt is present or the body is not valid JSON.
+pub fn extract_prompt_hash(req_body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(req_body).ok()?;
+    let text = v
+        .get("system")
+        .and_then(|s| s.as_str())
+        .or_else(|| {
+            v.get("messages")?
+                .as_array()?
+                .iter()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
+                .get("content")?
+                .as_str()
+        })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{:016x}", fnv1a_64(trimmed)))
+}
+
+/// Default upstream URL for a stored provider name.
+/// Used by `trace replay` when no --upstream flag is given.
+pub fn default_upstream_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "https://api.anthropic.com",
+        "google"    => "https://generativelanguage.googleapis.com",
+        _           => "https://api.openai.com",
+    }
+}
+
 /// Classify the error type of a failed call for display purposes.
 ///
 /// Returns a static label such as "rate_limit", "auth", "upstream_5xx",
@@ -590,6 +634,7 @@ mod tests {
             provider_request_id: None,
             trace_id: None,
             parent_id: None,
+            prompt_hash: None,
         }
     }
 
@@ -1788,5 +1833,61 @@ mod tests {
     fn model_prices_bedrock_llama32_ids() {
         assert_eq!(model_prices("meta.llama3-2-11b-instruct-v1:0"), (0.18, 0.18));
         assert_eq!(model_prices("meta.llama3-2-1b-instruct-v1:0"),  (0.04, 0.04));
+    }
+
+    // -------------------------------------------------------------------------
+    // extract_prompt_hash
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn prompt_hash_extracted_from_openai_messages() {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a helpful assistant"},{"role":"user","content":"Hello"}]}"#;
+        let hash = extract_prompt_hash(body);
+        assert!(hash.is_some(), "should extract hash from OpenAI messages");
+        assert_eq!(hash.as_deref().unwrap().len(), 16, "FNV-64 hex is 16 chars");
+        // Idempotent: same prompt always produces same hash.
+        assert_eq!(extract_prompt_hash(body), hash);
+    }
+
+    #[test]
+    fn prompt_hash_extracted_from_anthropic_system() {
+        let body = r#"{"model":"claude-3-5-sonnet-20241022","system":"You are a senior software engineer","messages":[]}"#;
+        let hash = extract_prompt_hash(body);
+        assert!(hash.is_some(), "should extract hash from Anthropic system field");
+        assert_eq!(hash.as_deref().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn prompt_hash_none_for_no_system_prompt() {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
+        assert_eq!(extract_prompt_hash(body), None, "no system prompt → no hash");
+    }
+
+    #[test]
+    fn prompt_hash_different_prompts_produce_different_hashes() {
+        let a = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"Prompt A"}]}"#;
+        let b = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"Prompt B"}]}"#;
+        assert_ne!(extract_prompt_hash(a), extract_prompt_hash(b));
+    }
+
+    // -------------------------------------------------------------------------
+    // default_upstream_for_provider
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn default_upstream_anthropic() {
+        assert_eq!(default_upstream_for_provider("anthropic"), "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn default_upstream_google() {
+        assert_eq!(default_upstream_for_provider("google"), "https://generativelanguage.googleapis.com");
+    }
+
+    #[test]
+    fn default_upstream_unknown_falls_back_to_openai() {
+        assert_eq!(default_upstream_for_provider("openai"), "https://api.openai.com");
+        assert_eq!(default_upstream_for_provider("groq"), "https://api.openai.com");
+        assert_eq!(default_upstream_for_provider("unknown"), "https://api.openai.com");
     }
 }

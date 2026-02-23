@@ -232,6 +232,7 @@ mod tests {
             provider_request_id: Some("req-abc".to_string()),
             trace_id: None,
             parent_id: None,
+            prompt_hash: None,
         }
     }
 

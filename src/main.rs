@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.27.0",
+    version = "0.2.8",
     long_about = None,
 )]
 struct Cli {
@@ -270,6 +270,45 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
     },
+
+    /// Compare two models on cost, latency, and error rate
+    Compare {
+        /// First model name (exact match, e.g. gpt-4o)
+        #[arg(long = "model-a", value_name = "MODEL")]
+        model_a: String,
+
+        /// Second model name (exact match, e.g. claude-3-5-sonnet)
+        #[arg(long = "model-b", value_name = "MODEL")]
+        model_b: String,
+
+        /// Compare calls at or after this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Compare calls at or before this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+    },
+
+    /// Inspect prompt version fingerprints captured from system prompts
+    Prompts {
+        #[command(subcommand)]
+        action: PromptsAction,
+    },
+
+    /// Replay a captured call against a different model or upstream
+    Replay {
+        /// Call ID or unambiguous prefix (8+ chars)
+        id: String,
+
+        /// Override the model field before replaying (e.g. gpt-4o-mini)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Override the upstream URL (e.g. https://api.openai.com)
+        #[arg(long)]
+        upstream: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +319,25 @@ enum ConfigAction {
     Path,
     /// Write a default config skeleton to ~/.config/trace/config.toml
     Init,
+}
+
+#[derive(Subcommand)]
+enum PromptsAction {
+    /// List all observed prompt fingerprints with stats
+    List {
+        /// Only show prompts seen at or after this timestamp
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter by model name (substring match)
+        #[arg(short, long)]
+        model: Option<String>,
+    },
+    /// Show the full prompt text for a given hash
+    Show {
+        /// The 16-char hex hash from `trace prompts list`
+        hash: String,
+    },
 }
 
 #[tokio::main]
@@ -342,6 +400,15 @@ async fn main() -> Result<()> {
         }
         Commands::Eval { rules, since, until, model } => {
             cmd_eval(rules, since, until, model)
+        }
+        Commands::Compare { model_a, model_b, since, until } => {
+            cmd_compare(model_a, model_b, since, until)
+        }
+        Commands::Prompts { action } => {
+            cmd_prompts(action)
+        }
+        Commands::Replay { id, model, upstream } => {
+            cmd_replay(id, model, upstream).await
         }
     }
 }
@@ -472,7 +539,7 @@ async fn cmd_start(
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.27.0".bold());
+    println!("{}", "trace v0.28.0".bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
     if !routes.is_empty() {
@@ -1677,6 +1744,265 @@ fn eval_check_rule(rule: &str, stats: &store::EvalStats) -> std::result::Result<
     Ok(result)
 }
 
+fn cmd_compare(
+    model_a: String,
+    model_b: String,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<()> {
+    let since = since.map(parse_since_ts).transpose()?;
+    let until = until.map(parse_until_ts).transpose()?;
+    let store = store::Store::open().context("failed to open trace database")?;
+    let (a, b) = store.compare_models(&model_a, &model_b, since.as_deref(), until.as_deref())?;
+
+    println!("{}", "trace compare".bold());
+    println!("{}: {}  vs  {}", "models".dimmed(), model_a.cyan(), model_b.cyan());
+    println!("{}", "─".repeat(62));
+
+    fn delta_pct(a: f64, b: f64) -> String {
+        if a == 0.0 { return "  n/a".to_string(); }
+        let d = (b - a) / a * 100.0;
+        if d.abs() < 0.5 { "   ~".to_string() } else { format!("{:+.0}%", d) }
+    }
+    fn indicator(a: f64, b: f64, lower_is_better: bool) -> &'static str {
+        if (b - a).abs() < 0.001 * a.abs().max(1.0) { return ""; }
+        let b_better = if lower_is_better { b < a } else { b > a };
+        if b_better { "  ✓" } else { "  ✗" }
+    }
+
+    println!("{:<22}  {:>16}  {:>22}  {}", "", model_a.as_str(), model_b.as_str(), "delta");
+    println!("{:<22}  {:>16}  {:>22}  {}", "calls", fmt_num_commas(a.calls), fmt_num_commas(b.calls), delta_pct(a.calls as f64, b.calls as f64));
+    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        "avg cost/call",
+        format!("${:.6}", a.avg_cost_usd),
+        format!("${:.6}", b.avg_cost_usd),
+        delta_pct(a.avg_cost_usd, b.avg_cost_usd),
+        indicator(a.avg_cost_usd, b.avg_cost_usd, true));
+    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        "total cost",
+        format!("${:.4}", a.total_cost_usd),
+        format!("${:.4}", b.total_cost_usd),
+        delta_pct(a.total_cost_usd, b.total_cost_usd),
+        indicator(a.total_cost_usd, b.total_cost_usd, true));
+    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        "avg latency",
+        format!("{:.0}ms", a.avg_latency_ms),
+        format!("{:.0}ms", b.avg_latency_ms),
+        delta_pct(a.avg_latency_ms, b.avg_latency_ms),
+        indicator(a.avg_latency_ms, b.avg_latency_ms, true));
+    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        "p99 latency",
+        format!("{}ms", a.latency_p99),
+        format!("{}ms", b.latency_p99),
+        delta_pct(a.latency_p99 as f64, b.latency_p99 as f64),
+        indicator(a.latency_p99 as f64, b.latency_p99 as f64, true));
+    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        "error rate",
+        format!("{:.1}%", a.error_rate * 100.0),
+        format!("{:.1}%", b.error_rate * 100.0),
+        delta_pct(a.error_rate, b.error_rate),
+        indicator(a.error_rate, b.error_rate, true));
+    println!("{:<22}  {:>16}  {:>22}  {}",
+        "avg input tokens",
+        format!("{:.0}", a.avg_input_tokens),
+        format!("{:.0}", b.avg_input_tokens),
+        delta_pct(a.avg_input_tokens, b.avg_input_tokens));
+    println!("{:<22}  {:>16}  {:>22}  {}",
+        "avg output tokens",
+        format!("{:.0}", a.avg_output_tokens),
+        format!("{:.0}", b.avg_output_tokens),
+        delta_pct(a.avg_output_tokens, b.avg_output_tokens));
+    Ok(())
+}
+fn cmd_prompts(action: PromptsAction) -> Result<()> {
+    let store = store::Store::open().context("failed to open trace database")?;
+    match action {
+        PromptsAction::List { since, model } => {
+            let since = since.map(parse_since_ts).transpose()?;
+            let prompts = store.list_prompts(since.as_deref(), model.as_deref())?;
+            if prompts.is_empty() {
+                println!("{}", "No prompt fingerprints found. Are system prompts being captured?".dimmed());
+                return Ok(());
+            }
+            println!("{}", format!(
+                "{:<16}  {:>6}  {:>9}  {:>8}  {:<12}  {}",
+                "hash", "calls", "avg_cost", "avg_lat", "first_seen", "preview"
+            ).bold().underline());
+            for p in &prompts {
+                let first = p.first_seen.get(..10).unwrap_or(&p.first_seen);
+                println!(
+                    "{:<16}  {:>6}  ${:>8.4}  {:>6.0}ms  {:<12}  {}",
+                    p.hash,
+                    p.call_count,
+                    p.avg_cost_usd,
+                    p.avg_latency_ms,
+                    first,
+                    truncate(&p.preview, 50),
+                );
+            }
+        }
+        PromptsAction::Show { hash } => {
+            match store.get_prompt_text(&hash)? {
+                None => {
+                    println!("{}", format!("No prompt found for hash: {}", hash).red());
+                }
+                Some(text) => {
+                    println!("{}", "prompt text:".bold());
+                    println!("{}", text);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+/// Resolve the Authorization or API-key header for a replay request.
+/// Priority: ANTHROPIC_API_KEY (if provider==anthropic) → OPENAI_API_KEY → TRACE_REPLAY_API_KEY.
+/// Returns `(header_name, header_value)` or an error describing which env var to set.
+fn resolve_replay_auth_header(provider: &str) -> Result<(String, String)> {
+    // Provider-specific env vars first.
+    if provider == "anthropic" {
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            return Ok(("x-api-key".to_string(), key));
+        }
+    }
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        return Ok(("Authorization".to_string(), format!("Bearer {}", key)));
+    }
+    if let Ok(key) = std::env::var("TRACE_REPLAY_API_KEY") {
+        return Ok(("Authorization".to_string(), format!("Bearer {}", key)));
+    }
+    let hint = if provider == "anthropic" {
+        "ANTHROPIC_API_KEY or OPENAI_API_KEY"
+    } else {
+        "OPENAI_API_KEY or TRACE_REPLAY_API_KEY"
+    };
+    anyhow::bail!("no API key found for replay — set {}", hint)
+}
+async fn cmd_replay(
+    id: String,
+    model_override: Option<String>,
+    upstream_override: Option<String>,
+) -> Result<()> {
+    let store = store::Store::open().context("failed to open trace database")?;
+    let record = store
+        .get_by_id(&id)?
+        .ok_or_else(|| anyhow::anyhow!("no call found with id prefix: {}", id))?;
+
+    let req_body_str = record.request_body.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("call {} has no stored request body (was it captured with --no-request-bodies?)", &id)
+    })?;
+
+    // Optionally patch the model field.
+    let patched_body: String = if let Some(ref new_model) = model_override {
+        let mut v: serde_json::Value = serde_json::from_str(req_body_str)
+            .context("stored request body is not valid JSON")?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(new_model.clone()));
+        }
+        serde_json::to_string(&v)?
+    } else {
+        req_body_str.to_string()
+    };
+
+    // Resolve upstream URL.
+    let upstream = upstream_override
+        .or_else(|| std::env::var("TRACE_UPSTREAM").ok())
+        .unwrap_or_else(|| {
+            capture::default_upstream_for_provider(&record.provider).to_string()
+        });
+
+    let replay_model = model_override.as_deref().unwrap_or(&record.model);
+
+    let (auth_header, auth_value) = resolve_replay_auth_header(&record.provider)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+
+    let replay_url = format!("{}{}", upstream.trim_end_matches("/"), record.endpoint);
+    let replay_start = std::time::Instant::now();
+
+    let resp = client
+        .post(&replay_url)
+        .header(&auth_header, &auth_value)
+        .header("content-type", "application/json")
+        .body(patched_body)
+        .send()
+        .await
+        .context("replay request failed")?;
+
+    let replay_latency_ms = replay_start.elapsed().as_millis() as u64;
+    let replay_status = resp.status().as_u16();
+    let replay_body = resp.text().await.unwrap_or_default();
+
+    // Parse tokens and cost from replay response.
+    let (replay_in, replay_out) = capture::extract_usage(&replay_body)
+        .map(|(i, o)| (Some(i), Some(o)))
+        .unwrap_or((None, None));
+    let replay_cost = match (replay_in, replay_out) {
+        (Some(i), Some(o)) => Some(capture::estimate_cost(replay_model, i, o)),
+        _ => None,
+    };
+
+    // Print comparison.
+    println!("{}", "trace replay".bold());
+    println!("  id: {}", record.id[..8.min(record.id.len())].cyan());
+    println!();
+
+    let orig_cost_str = record.cost_usd
+        .map(|c| format!("${:.6}", c))
+        .unwrap_or_else(|| "-".to_string());
+    let replay_cost_str = replay_cost
+        .map(|c| format!("${:.6}", c))
+        .unwrap_or_else(|| "-".to_string());
+
+    println!("{}", "Original ─────────────────────────────────────────".dimmed());
+    println!("  model        {}", record.model.cyan());
+    println!("  status       {}", record.status_code.to_string().green());
+    println!("  latency      {}ms", record.latency_ms.to_string().cyan());
+    println!("  in/out       {} / {}",
+        record.input_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
+        record.output_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+    println!("  cost         {}", orig_cost_str.cyan());
+    println!();
+    println!("{}", "Replay ────────────────────────────────────────────".dimmed());
+    println!("  model        {}", replay_model.cyan());
+
+    let status_str = if replay_status >= 400 {
+        replay_status.to_string().red().to_string()
+    } else {
+        replay_status.to_string().green().to_string()
+    };
+    println!("  status       {}", status_str);
+
+    // Latency delta
+    let lat_delta = if record.latency_ms > 0 {
+        let d = replay_latency_ms as f64 / record.latency_ms as f64 - 1.0;
+        let sign = if d < 0.0 { "  ✓" } else { "  ✗" };
+        format!("  ({:+.0}%){}", d * 100.0, sign)
+    } else {
+        String::new()
+    };
+    println!("  latency      {}ms{}", replay_latency_ms.to_string().cyan(), lat_delta);
+
+    println!("  in/out       {} / {}",
+        replay_in.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
+        replay_out.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+
+    // Cost delta
+    let cost_delta = match (record.cost_usd, replay_cost) {
+        (Some(orig), Some(rep)) if orig > 0.0 => {
+            let d = rep / orig - 1.0;
+            let sign = if d < 0.0 { "  ✓" } else { "  ✗" };
+            format!("  ({:+.0}%){}", d * 100.0, sign)
+        }
+        _ => String::new(),
+    };
+    println!("  cost         {}{}", replay_cost_str.cyan(), cost_delta);
+
+    Ok(())
+}
+
 fn parse_since_ts(s: String) -> Result<String> {
     if chrono::DateTime::parse_from_rfc3339(&s).is_ok() {
         return Ok(s);
@@ -1860,6 +2186,7 @@ mod tests {
             provider_request_id: Some("req-123".to_string()),
             trace_id: None,
             parent_id: None,
+            prompt_hash: None,
         }
     }
 
@@ -1935,6 +2262,7 @@ mod tests {
             provider_request_id: None,
             trace_id: None,
             parent_id: None,
+            prompt_hash: None,
         }
     }
 
@@ -2254,5 +2582,51 @@ mod tests {
     #[test]
     fn parse_status_range_valid_still_works() {
         assert_eq!(parse_status_range("400-499"), Ok((400u16, 499u16)));
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve_replay_auth_header
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn replay_auth_openai_key_returns_bearer() {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("TRACE_REPLAY_API_KEY");
+        std::env::set_var("OPENAI_API_KEY", "sk-test-123");
+        let (name, value) = resolve_replay_auth_header("openai").unwrap();
+        assert_eq!(name, "Authorization");
+        assert!(value.starts_with("Bearer "));
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn replay_auth_anthropic_key_used_when_provider_is_anthropic() {
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TRACE_REPLAY_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "ant-key-456");
+        let (name, value) = resolve_replay_auth_header("anthropic").unwrap();
+        assert_eq!(name, "x-api-key");
+        assert_eq!(value, "ant-key-456");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn replay_auth_fallback_to_trace_replay_key() {
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var("TRACE_REPLAY_API_KEY", "fallback-key");
+        let (name, value) = resolve_replay_auth_header("openai").unwrap();
+        assert_eq!(name, "Authorization");
+        assert!(value.contains("fallback-key"));
+        std::env::remove_var("TRACE_REPLAY_API_KEY");
+    }
+
+    #[test]
+    fn replay_auth_no_key_returns_error() {
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("TRACE_REPLAY_API_KEY");
+        let result = resolve_replay_auth_header("openai");
+        assert!(result.is_err());
     }
 }

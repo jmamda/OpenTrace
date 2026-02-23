@@ -3,6 +3,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use serde_json;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CallRecord {
@@ -23,6 +24,7 @@ pub struct CallRecord {
     pub provider_request_id: Option<String>,
     pub trace_id: Option<String>,
     pub parent_id: Option<String>,
+    pub prompt_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +34,30 @@ pub struct EvalStats {
     pub error_rate: f64,       // error_count / total_calls, or 0.0 if no calls
     pub latency_p99: u64,      // milliseconds
     pub avg_cost_usd: f64,     // average cost per call, 0.0 if no cost data
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelComparison {
+    pub model: String,
+    pub calls: i64,
+    pub avg_cost_usd: f64,
+    pub total_cost_usd: f64,
+    pub avg_latency_ms: f64,
+    pub latency_p99: u64,
+    pub error_rate: f64,
+    pub avg_input_tokens: f64,
+    pub avg_output_tokens: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PromptStats {
+    pub hash: String,
+    pub call_count: i64,
+    pub avg_cost_usd: f64,
+    pub avg_latency_ms: f64,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub preview: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,6 +157,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
         provider_request_id: row.get(14)?,
         trace_id: row.get(15)?,
         parent_id: row.get(16)?,
+        prompt_hash: row.get(17)?,
     })
 }
 
@@ -139,7 +166,7 @@ const SELECT_COLS: &str = "
     status_code, latency_ms, ttft_ms,
     input_tokens, output_tokens, cost_usd,
     request_body, response_body, error,
-    provider_request_id, trace_id, parent_id";
+    provider_request_id, trace_id, parent_id, prompt_hash";
 
 impl Store {
     /// Open an in-memory SQLite database.
@@ -214,12 +241,14 @@ impl Store {
                 error               TEXT,
                 provider_request_id TEXT,
                 trace_id            TEXT,
-                parent_id           TEXT
+                parent_id           TEXT,
+                prompt_hash         TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
             CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(model);
             CREATE INDEX IF NOT EXISTS idx_calls_trace_id ON calls(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_calls_prompt_hash ON calls(prompt_hash);
 
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
@@ -235,6 +264,7 @@ impl Store {
             "ALTER TABLE calls ADD COLUMN provider_request_id TEXT",
             "ALTER TABLE calls ADD COLUMN trace_id TEXT",
             "ALTER TABLE calls ADD COLUMN parent_id TEXT",
+            "ALTER TABLE calls ADD COLUMN prompt_hash TEXT",
         ] {
             if let Err(e) = self.conn.execute_batch(sql) {
                 let msg = e.to_string().to_lowercase();
@@ -254,14 +284,14 @@ impl Store {
                 status_code, latency_ms, ttft_ms,
                 input_tokens, output_tokens,
                 cost_usd, request_body, response_body, error,
-                provider_request_id, trace_id, parent_id
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                provider_request_id, trace_id, parent_id, prompt_hash
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 r.id, r.timestamp, r.provider, r.model, r.endpoint,
                 r.status_code, r.latency_ms, r.ttft_ms.map(|v| v as i64),
                 r.input_tokens, r.output_tokens,
                 r.cost_usd, r.request_body, r.response_body, r.error,
-                r.provider_request_id, r.trace_id, r.parent_id,
+                r.provider_request_id, r.trace_id, r.parent_id, r.prompt_hash,
             ],
         )?;
         Ok(())
@@ -667,28 +697,32 @@ impl Store {
     /// Compute aggregate stats for eval rule checking.
     /// Uses the same QueryFilter as other query methods (model, since, until, status filters).
     pub fn eval_stats(&self, filter: &QueryFilter) -> Result<EvalStats> {
-        let mut clauses = vec!["1=1".to_string()];
-        if filter.errors_only {
-            clauses.push("(error IS NOT NULL OR status_code >= 400)".to_string());
-        }
-        if let Some(ref m) = filter.model {
-            clauses.push(format!("model = '{}'", m.replace('\'', "''")));
-        }
-        if let Some(ref s) = filter.since {
-            clauses.push(format!("timestamp >= '{}'", s));
-        }
-        if let Some(ref u) = filter.until {
-            clauses.push(format!("timestamp <= '{}'", u));
-        }
-        let status_clause = build_status_clause(&filter.status, &filter.status_range);
-        let where_sql = clauses.join(" AND ");
+        // Escape SQL LIKE wildcards in the model filter, matching the pattern
+        // used by query_filtered and query_all_filtered.
+        let model_filter: Option<String> = filter.model.as_deref()
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let since: Option<String> = filter.since.clone();
+        let until: Option<String> = filter.until.clone();
 
-        // Aggregate query for counts and avg cost
+        // build_status_clause produces only u16 integer literals — no injection risk.
+        let status_clause = build_status_clause(&filter.status, &filter.status_range);
+
+        // Aggregate query for counts and avg cost.
+        // ?1 = model filter (NULL = all models, LIKE match)
+        // ?2 = since timestamp (NULL = no lower bound)
+        // ?3 = until timestamp (NULL = no upper bound)
         let agg_sql = format!(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN error IS NOT NULL OR status_code >= 400 THEN 1 ELSE 0 END), 0), COALESCE(AVG(cost_usd), 0.0) FROM calls WHERE {where_sql} {status_clause}"
+            "SELECT COUNT(*), \
+                    COALESCE(SUM(CASE WHEN error IS NOT NULL OR status_code >= 400 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(AVG(cost_usd), 0.0) \
+             FROM calls \
+             WHERE (?1 IS NULL OR model LIKE '%' || ?1 || '%' ESCAPE '\\') \
+               AND (?2 IS NULL OR timestamp >= ?2) \
+               AND (?3 IS NULL OR timestamp <= ?3) \
+               {status_clause}"
         );
         let (total_calls, error_count, avg_cost_usd): (i64, i64, f64) =
-            self.conn.query_row(&agg_sql, [], |row| {
+            self.conn.query_row(&agg_sql, params![model_filter, since, until], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?;
 
@@ -698,13 +732,17 @@ impl Store {
             0.0
         };
 
-        // Compute latency p99 via sorted vec (same pattern as latency_percentiles)
+        // Compute latency p99 via sorted vec (same pattern as latency_percentiles).
         let lat_sql = format!(
-            "SELECT latency_ms FROM calls WHERE {where_sql} {status_clause}"
+            "SELECT latency_ms FROM calls \
+             WHERE (?1 IS NULL OR model LIKE '%' || ?1 || '%' ESCAPE '\\') \
+               AND (?2 IS NULL OR timestamp >= ?2) \
+               AND (?3 IS NULL OR timestamp <= ?3) \
+               {status_clause}"
         );
         let mut stmt = self.conn.prepare(&lat_sql)?;
         let mut latencies: Vec<u64> = stmt
-            .query_map([], |row| row.get::<_, i64>(0))?
+            .query_map(params![model_filter, since, until], |row| row.get::<_, i64>(0))?
             .filter_map(|r| r.ok())
             .map(|v| v as u64)
             .collect();
@@ -725,7 +763,177 @@ impl Store {
         })
     }
 
-    /// Flush the WAL to the main database file and defragment.
+    /// Compare aggregate stats for two models side by side.
+    pub fn compare_models(
+        &self,
+        model_a: &str,
+        model_b: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<(ModelComparison, ModelComparison)> {
+        let models = [model_a, model_b];
+        let mut out: Vec<ModelComparison> = Vec::with_capacity(2);
+        for model in &models {
+            let (calls, avg_cost_usd, total_cost_usd, avg_latency_ms, avg_input_tokens, avg_output_tokens, error_count): (i64, f64, f64, f64, f64, f64, i64) =
+                self.conn.query_row(
+                    "SELECT COUNT(*),
+                            COALESCE(AVG(cost_usd), 0.0),
+                            COALESCE(SUM(cost_usd), 0.0),
+                            COALESCE(AVG(latency_ms), 0.0),
+                            COALESCE(AVG(input_tokens), 0.0),
+                            COALESCE(AVG(output_tokens), 0.0),
+                            COUNT(CASE WHEN error IS NOT NULL OR status_code >= 400 THEN 1 END)
+                     FROM calls
+                     WHERE model = ?1
+                       AND (?2 IS NULL OR timestamp >= ?2)
+                       AND (?3 IS NULL OR timestamp <= ?3)",
+                    params![model, since, until],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                )?;
+
+            let error_rate = if calls > 0 { error_count as f64 / calls as f64 } else { 0.0 };
+
+            // Compute p99 from sorted latency vec (same pattern as latency_percentiles).
+            let mut stmt = self.conn.prepare(
+                "SELECT latency_ms FROM calls
+                 WHERE model = ?1
+                   AND (?2 IS NULL OR timestamp >= ?2)
+                   AND (?3 IS NULL OR timestamp <= ?3)
+                 ORDER BY latency_ms ASC",
+            )?;
+            let mut latencies: Vec<u64> = stmt
+                .query_map(params![model, since, until], |row| row.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .map(|v| v as u64)
+                .collect();
+            latencies.sort_unstable();
+            let latency_p99 = if latencies.is_empty() {
+                0
+            } else {
+                let n = latencies.len();
+                latencies[(n * 99 / 100).min(n - 1)]
+            };
+
+            out.push(ModelComparison {
+                model: model.to_string(),
+                calls,
+                avg_cost_usd,
+                total_cost_usd,
+                avg_latency_ms,
+                latency_p99,
+                error_rate,
+                avg_input_tokens,
+                avg_output_tokens,
+            });
+        }
+        let b = out.remove(1);
+        let a = out.remove(0);
+        Ok((a, b))
+    }
+    /// List prompt fingerprints grouped by hash, with per-group stats.
+    pub fn list_prompts(&self, since: Option<&str>, model: Option<&str>) -> Result<Vec<PromptStats>> {
+        let model_filter: Option<String> = model
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+
+        let sql = "
+            SELECT c.prompt_hash,
+                   COUNT(*) as call_count,
+                   COALESCE(AVG(c.cost_usd), 0.0),
+                   COALESCE(AVG(c.latency_ms), 0.0),
+                   MIN(c.timestamp) as first_seen,
+                   MAX(c.timestamp) as last_seen,
+                   (SELECT c2.request_body FROM calls c2
+                    WHERE c2.prompt_hash = c.prompt_hash
+                      AND c2.request_body IS NOT NULL
+                    LIMIT 1) as sample_body
+            FROM calls c
+            WHERE c.prompt_hash IS NOT NULL
+              AND (?1 IS NULL OR c.timestamp >= ?1)
+              AND (?2 IS NULL OR c.model LIKE '%' || ?2 || '%' ESCAPE '\\')
+            GROUP BY c.prompt_hash
+            ORDER BY call_count DESC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![since, model_filter], |row| {
+            let hash: String = row.get(0)?;
+            let call_count: i64 = row.get(1)?;
+            let avg_cost_usd: f64 = row.get(2)?;
+            let avg_latency_ms: f64 = row.get(3)?;
+            let first_seen: String = row.get(4)?;
+            let last_seen: String = row.get(5)?;
+            let sample_body: Option<String> = row.get(6)?;
+            Ok((hash, call_count, avg_cost_usd, avg_latency_ms, first_seen, last_seen, sample_body))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (hash, call_count, avg_cost_usd, avg_latency_ms, first_seen, last_seen, sample_body) = row?;
+            let preview = sample_body
+                .as_deref()
+                .and_then(|body| {
+                    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+                    let text = v.get("system")
+                        .and_then(|s| s.as_str())
+                        .or_else(|| {
+                            v.get("messages")?
+                                .as_array()?
+                                .iter()
+                                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
+                                .get("content")?
+                                .as_str()
+                        })?;
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    Some(trimmed.chars().take(80).collect::<String>())
+                })
+                .unwrap_or_default();
+            results.push(PromptStats {
+                hash,
+                call_count,
+                avg_cost_usd,
+                avg_latency_ms,
+                first_seen,
+                last_seen,
+                preview,
+            });
+        }
+        Ok(results)
+    }
+    /// Fetch the full system prompt text for a given hash.
+    /// Returns `None` when no call with that hash has a stored request body.
+    pub fn get_prompt_text(&self, hash: &str) -> Result<Option<String>> {
+        let body: Option<String> = match self.conn.query_row(
+            "SELECT request_body FROM calls WHERE prompt_hash = ?1 AND request_body IS NOT NULL LIMIT 1",
+            params![hash],
+            |row| row.get(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(body) = body else { return Ok(None); };
+        let v: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let text = v
+            .get("system")
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                v.get("messages")?
+                    .as_array()?
+                    .iter()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
+                    .get("content")?
+                    .as_str()
+            })
+            .map(|s| s.trim().to_string());
+        Ok(text)
+    }
+
+        /// Flush the WAL to the main database file and defragment.
     /// Returns `(bytes_before, bytes_after)` from the filesystem.
     pub fn vacuum(&self) -> Result<(u64, u64)> {
         let before = std::fs::metadata(&self.path)
@@ -788,6 +996,7 @@ mod tests {
             provider_request_id: None,
             trace_id: None,
             parent_id: None,
+            prompt_hash: None,
         }
     }
 
@@ -825,9 +1034,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // idx_calls_timestamp + idx_calls_model + idx_calls_trace_id = 3
+        // idx_calls_timestamp + idx_calls_model + idx_calls_trace_id + idx_calls_prompt_hash = 4
         // (Excludes SQLite auto-generated indexes such as the PRIMARY KEY index.)
-        assert_eq!(idx_count, 3, "all three indexes should exist after init");
+        assert_eq!(idx_count, 4, "all four indexes should exist after init");
     }
 
     // -------------------------------------------------------------------------
@@ -1741,5 +1950,99 @@ mod tests {
         let filter = QueryFilter { model: Some("gpt-4o".to_string()), ..Default::default() };
         let stats = store.eval_stats(&filter).unwrap();
         assert_eq!(stats.total_calls, 1);
+    }
+    // -------------------------------------------------------------------------
+    // compare_models
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn compare_models_returns_correct_aggregates() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Insert 2 calls for gpt-4o
+        let mut r1 = make_record("cmp-a1", "gpt-4o", 200);
+        r1.latency_ms = 1000;
+        r1.cost_usd = Some(0.004);
+        r1.input_tokens = Some(1200);
+        r1.output_tokens = Some(300);
+        store.insert(&r1).unwrap();
+
+        let mut r2 = make_record("cmp-a2", "gpt-4o", 200);
+        r2.latency_ms = 2000;
+        r2.cost_usd = Some(0.002);
+        r2.input_tokens = Some(1300);
+        r2.output_tokens = Some(320);
+        store.insert(&r2).unwrap();
+
+        // Insert 1 call for claude-3-5-sonnet
+        let mut r3 = make_record("cmp-b1", "claude-3-5-sonnet", 200);
+        r3.latency_ms = 2200;
+        r3.cost_usd = Some(0.003);
+        r3.input_tokens = Some(1100);
+        r3.output_tokens = Some(280);
+        store.insert(&r3).unwrap();
+
+        let (a, b) = store.compare_models("gpt-4o", "claude-3-5-sonnet", None, None).unwrap();
+        assert_eq!(a.model, "gpt-4o");
+        assert_eq!(a.calls, 2);
+        assert!((a.total_cost_usd - 0.006).abs() < 1e-9);
+        assert_eq!(b.model, "claude-3-5-sonnet");
+        assert_eq!(b.calls, 1);
+        assert!((b.total_cost_usd - 0.003).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compare_models_empty_side_returns_zeros() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_record("only-a", "gpt-4o", 200)).unwrap();
+
+        let (a, b) = store.compare_models("gpt-4o", "nonexistent-model", None, None).unwrap();
+        assert_eq!(a.calls, 1);
+        assert_eq!(b.calls, 0);
+        assert_eq!(b.latency_p99, 0);
+        assert_eq!(b.error_rate, 0.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // list_prompts / get_prompt_text
+    // -------------------------------------------------------------------------
+
+    fn make_record_with_hash(id: &str, model: &str, hash: &str, req_body: &str) -> CallRecord {
+        let mut r = make_record(id, model, 200);
+        r.prompt_hash = Some(hash.to_string());
+        r.request_body = Some(req_body.to_string());
+        r
+    }
+
+    #[test]
+    fn list_prompts_groups_by_hash() {
+        let store = Store::open_in_memory().unwrap();
+        let body_a = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a helpful assistant"}]}"#;
+        let body_b = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a senior engineer"}]}"#;
+
+        store.insert(&make_record_with_hash("p1", "gpt-4o", "hash-aaa", body_a)).unwrap();
+        store.insert(&make_record_with_hash("p2", "gpt-4o", "hash-aaa", body_a)).unwrap();
+        store.insert(&make_record_with_hash("p3", "gpt-4o", "hash-bbb", body_b)).unwrap();
+        // One record without a hash - should not appear
+        store.insert(&make_record("p4", "gpt-4o", 200)).unwrap();
+
+        let prompts = store.list_prompts(None, None).unwrap();
+        assert_eq!(prompts.len(), 2, "should have 2 distinct hashes");
+        let top = prompts.iter().find(|p| p.hash == "hash-aaa").unwrap();
+        assert_eq!(top.call_count, 2);
+        assert!(!top.preview.is_empty(), "preview should be extracted from request body");
+    }
+
+    #[test]
+    fn get_prompt_text_returns_text() {
+        let store = Store::open_in_memory().unwrap();
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a test assistant"},{"role":"user","content":"Hello"}]}"#;
+        let mut r = make_record("pt1", "gpt-4o", 200);
+        r.prompt_hash = Some("hash-test".to_string());
+        r.request_body = Some(body.to_string());
+        store.insert(&r).unwrap();
+
+        let text = store.get_prompt_text("hash-test").unwrap();
+        assert_eq!(text, Some("You are a test assistant".to_string()));
     }
 }

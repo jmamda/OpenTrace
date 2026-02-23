@@ -188,6 +188,9 @@ async fn handle(
         Some(capture::redact_json_fields(&req_str, &redact_fields))
     };
 
+    // Compute prompt hash from the stored request body (after redaction).
+    let prompt_hash = stored_req_body.as_deref().and_then(capture::extract_prompt_hash);
+
     // Warn on first use of unknown model so cost estimates are transparent.
     if verbose && !capture::is_known_model(&model) {
         eprintln!("[trace] warning: unknown model '{}', cost estimated at $1/$3 per MTok", model);
@@ -262,6 +265,7 @@ async fn handle(
                 provider_request_id: None,
                 trace_id: trace_id.clone(),
                 parent_id: parent_id.clone(),
+                prompt_hash: prompt_hash.clone(),
             };
             try_store(&store_tx, record, verbose);
             return Err(StatusCode::BAD_GATEWAY);
@@ -303,6 +307,7 @@ async fn handle(
         let req_body_for_spawn = stored_req_body;
         let trace_id_for_spawn = trace_id.clone();
         let parent_id_for_spawn = parent_id.clone();
+        let prompt_hash_for_spawn = prompt_hash.clone();
 
         tokio::spawn(async move {
             // Accumulate all chunks (cheap: Bytes::clone increments Arc refcount)
@@ -397,6 +402,7 @@ async fn handle(
                 provider_request_id,
                 trace_id: trace_id_for_spawn,
                 parent_id: parent_id_for_spawn,
+                prompt_hash: prompt_hash_for_spawn,
             };
             try_store(&store_tx, record, verbose);
         });
@@ -470,6 +476,7 @@ async fn handle(
             provider_request_id,
             trace_id,
             parent_id,
+            prompt_hash,
         };
         try_store(&store_tx, record, verbose);
 
