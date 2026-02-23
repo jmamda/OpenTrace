@@ -6,18 +6,18 @@ const path = require('path');
 const os = require('os');
 
 const PLATFORM_PACKAGES = {
-  'linux-x64':    '@opentrace/trace-linux-x64',
-  'linux-arm64':  '@opentrace/trace-linux-arm64',
-  'darwin-x64':   '@opentrace/trace-darwin-x64',
-  'darwin-arm64': '@opentrace/trace-darwin-arm64',
-  'win32-x64':    '@opentrace/trace-win32-x64',
+  'linux-x64':    '@opentraceai/trace-linux-x64',
+  'linux-arm64':  '@opentraceai/trace-linux-arm64',
+  'darwin-x64':   '@opentraceai/trace-darwin-x64',
+  'darwin-arm64': '@opentraceai/trace-darwin-arm64',
+  'win32-x64':    '@opentraceai/trace-win32-x64',
 };
 
 function getBinaryPath() {
   const key = `${process.platform}-${os.arch()}`;
   const pkg = PLATFORM_PACKAGES[key];
   if (!pkg) {
-    console.error(`@opentrace/trace: unsupported platform ${key}`);
+    console.error(`@opentraceai/trace: unsupported platform ${key}`);
     console.error(`Supported: ${Object.keys(PLATFORM_PACKAGES).join(', ')}`);
     process.exit(1);
   }
@@ -31,7 +31,7 @@ function getBinaryPath() {
       : path.join(pkgDir, 'bin', 'trace');
     return bin;
   } catch {
-    console.error(`@opentrace/trace: platform package '${pkg}' not installed.`);
+    console.error(`@opentraceai/trace: platform package '${pkg}' not installed.`);
     console.error(`Run: npm install ${pkg}`);
     process.exit(1);
   }

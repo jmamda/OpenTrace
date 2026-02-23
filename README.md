@@ -4,7 +4,7 @@
 
 ```bash
 # Install (npm — no Rust required)
-npm install -g @opentrace/trace
+npm install -g @opentraceai/trace
 
 # Or build from source
 cargo build --release && ./target/release/trace start
@@ -28,7 +28,7 @@ trace serve --port 8080    # live web dashboard
 
 ```bash
 # npm (no Rust required — pre-built binaries for Linux x64/arm64, macOS x64/arm64, Windows x64)
-npm install -g @opentrace/trace
+npm install -g @opentraceai/trace
 
 # Homebrew / Cargo (build from source)
 git clone <repo> && cd trace

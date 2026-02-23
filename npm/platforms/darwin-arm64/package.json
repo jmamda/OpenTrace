@@ -1,7 +1,7 @@
 {
-  "name": "@opentrace/trace-darwin-arm64",
+  "name": "@opentraceai/trace-darwin-arm64",
   "version": "0.3.0",
-  "description": "macOS ARM64 (Apple Silicon) binary for @opentrace/trace",
+  "description": "macOS ARM64 (Apple Silicon) binary for @opentraceai/trace",
   "license": "MIT",
   "repository": {
     "type": "git",

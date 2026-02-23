@@ -1,7 +1,7 @@
 {
-  "name": "@opentrace/trace-win32-x64",
+  "name": "@opentraceai/trace-win32-x64",
   "version": "0.3.0",
-  "description": "Windows x64 binary for @opentrace/trace",
+  "description": "Windows x64 binary for @opentraceai/trace",
   "license": "MIT",
   "repository": {
     "type": "git",

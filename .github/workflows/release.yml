@@ -166,7 +166,7 @@ jobs:
 
   # ── 4b. npm platform packages (parallel to release job) ─────────────────────
   publish-platforms:
-    name: Publish @opentrace/trace-${{ matrix.pkg }}
+    name: Publish @opentraceai/trace-${{ matrix.pkg }}
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -216,7 +216,7 @@ jobs:
             echo "ERROR: NPM_TOKEN secret is not configured in this repository."
             echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New secret"
             echo "Name: NPM_TOKEN"
-            echo "Value: A granular npm access token with write access to @opentrace packages"
+            echo "Value: A granular npm access token with write access to @opentraceai packages"
             echo "Note: Classic npm tokens have been globally revoked — use a granular token."
             exit 1
           fi
@@ -231,7 +231,7 @@ jobs:
 
   # ── 5. npm root package ──────────────────────────────────────────────────────
   publish-root:
-    name: Publish @opentrace/trace (root)
+    name: Publish @opentraceai/trace (root)
     needs: publish-platforms
     runs-on: ubuntu-latest
 
@@ -264,7 +264,7 @@ jobs:
             echo "ERROR: NPM_TOKEN secret is not configured in this repository."
             echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New secret"
             echo "Name: NPM_TOKEN"
-            echo "Value: A granular npm access token with write access to @opentrace packages"
+            echo "Value: A granular npm access token with write access to @opentraceai packages"
             echo "Note: Classic npm tokens have been globally revoked — use a granular token."
             exit 1
           fi
