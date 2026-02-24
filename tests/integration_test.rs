@@ -11,7 +11,7 @@
 //! No test-only dependencies are added — everything comes from the existing
 //! Cargo.toml (axum, reqwest, tokio, serde_json, tokio::sync::mpsc).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use trace::{proxy, store};
 
@@ -44,7 +44,7 @@ fn temp_db_path() -> PathBuf {
 ///
 /// The test opens its *own* `Store::open_at(&db_path)` to query results,
 /// avoiding the `!Sync` constraint on `rusqlite::Connection`.
-async fn start_proxy(upstream_url: String, db_path: &PathBuf) -> u16 {
+async fn start_proxy(upstream_url: String, db_path: &Path) -> u16 {
     // Writer task owns its own Store (Connection is Send, so it can be moved
     // into a spawn, but not shared across tasks via Arc which requires Sync).
     let writer_store = store::Store::open_at(db_path).expect("open writer store");
@@ -90,7 +90,7 @@ async fn start_proxy(upstream_url: String, db_path: &PathBuf) -> u16 {
 
 /// Poll the database at `db_path` until at least one record appears or we
 /// time out (5 seconds).  Opens a new connection each poll — cheap for tests.
-async fn wait_for_record(db_path: &PathBuf) -> store::CallRecord {
+async fn wait_for_record(db_path: &Path) -> store::CallRecord {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         // Re-open is cheap and avoids the Sync constraint entirely.
@@ -567,7 +567,7 @@ async fn provider_request_id_stored() {
 async fn start_proxy_with_routes(
     default_upstream: String,
     routes: Vec<proxy::UpstreamRoute>,
-    db_path: &PathBuf,
+    db_path: &Path,
 ) -> u16 {
     let writer_store = store::Store::open_at(db_path).expect("open writer store");
     let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(1024);
