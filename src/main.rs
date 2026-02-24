@@ -2851,6 +2851,10 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialise all tests that mutate environment variables so they cannot
+    /// race each other on platforms that run tests in parallel (macOS, Linux).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::store::{CallRecord, Store};
 
     // -------------------------------------------------------------------------
@@ -3363,6 +3367,7 @@ mod tests {
 
     #[test]
     fn replay_auth_openai_key_returns_bearer() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("TRACE_REPLAY_API_KEY");
         std::env::set_var("OPENAI_API_KEY", "sk-test-123");
@@ -3374,6 +3379,7 @@ mod tests {
 
     #[test]
     fn replay_auth_anthropic_key_used_when_provider_is_anthropic() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("TRACE_REPLAY_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "ant-key-456");
@@ -3385,6 +3391,7 @@ mod tests {
 
     #[test]
     fn replay_auth_fallback_to_trace_replay_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::set_var("TRACE_REPLAY_API_KEY", "fallback-key");
@@ -3396,6 +3403,7 @@ mod tests {
 
     #[test]
     fn replay_auth_no_key_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("TRACE_REPLAY_API_KEY");
