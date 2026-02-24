@@ -140,6 +140,9 @@ fn make_record(id: &str) -> CallRecord {
         ),
         error: None,
         provider_request_id: Some("req-9XwqKLmNpRtVuHjBsAeDfCgYiZoP".to_string()),
+        trace_id: None,
+        parent_id: None,
+        prompt_hash: None,
     }
 }
 
@@ -253,6 +256,9 @@ fn bench_store_query_filtered(c: &mut Criterion) {
         model: Some("gpt-4o".to_string()), // substring match — hits ~667 rows
         since: None,
         until: None,
+        provider: None,
+        status: None,
+        status_range: None,
     };
 
     // Parameterised by result-set limit so we can compare different sizes.

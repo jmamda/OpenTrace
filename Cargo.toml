@@ -48,6 +48,11 @@ toml = { version = "0.8", features = ["parse"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "proxy_throughput"
+harness = false
 
 [profile.release]
 opt-level = 3

@@ -3,7 +3,6 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use serde_json;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CallRecord {
