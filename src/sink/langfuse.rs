@@ -52,7 +52,11 @@ impl LangfuseSink {
         let req_body = parse_body(record.request_body.as_deref());
         let resp_body = parse_body(record.response_body.as_deref());
 
-        let level = if record.error.is_some() { "ERROR" } else { "DEFAULT" };
+        let level = if record.error.is_some() {
+            "ERROR"
+        } else {
+            "DEFAULT"
+        };
 
         let payload = json!({
             "batch": [{
@@ -135,13 +139,20 @@ fn truncate_10k(s: &str) -> &str {
 /// Standard Base64 encoder (RFC 4648, no line breaks).
 /// Copied inline — no import from `otel` to keep modules independent.
 fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
         result.push(TABLE[b0 >> 2] as char);
         result.push(TABLE[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
         if chunk.len() > 1 {

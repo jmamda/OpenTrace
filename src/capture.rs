@@ -1,7 +1,7 @@
+use crate::store::CallRecord;
 use bytes::Bytes;
 use serde_json::Value;
 use std::collections::HashMap;
-use crate::store::CallRecord;
 
 /// Extract model name and streaming flag in a single JSON parse.
 pub fn extract_request_info(body: &str) -> (String, bool) {
@@ -26,11 +26,13 @@ pub fn extract_request_info(body: &str) -> (String, bool) {
 pub fn extract_usage(body: &str) -> Option<(i64, i64)> {
     let v: Value = serde_json::from_str(body).ok()?;
     let usage = v.get("usage")?;
-    let input = usage["prompt_tokens"].as_i64()
+    let input = usage["prompt_tokens"]
+        .as_i64()
         .or_else(|| usage["input_tokens"].as_i64())?;
     // Embeddings have no completion tokens — default to 0 so we still capture
     // the input token count and can estimate cost.
-    let output = usage["completion_tokens"].as_i64()
+    let output = usage["completion_tokens"]
+        .as_i64()
         .or_else(|| usage["output_tokens"].as_i64())
         .unwrap_or(0);
     Some((input, output))
@@ -68,21 +70,31 @@ pub fn extract_usage_from_chunks(chunks: &[Bytes]) -> Option<(i64, i64)> {
         if let Ok(v) = serde_json::from_str::<Value>(data) {
             // Top-level `usage` — OpenAI style and Anthropic `message_delta`.
             if let Some(usage) = v.get("usage") {
-                let inp = usage["prompt_tokens"].as_i64()
+                let inp = usage["prompt_tokens"]
+                    .as_i64()
                     .or_else(|| usage["input_tokens"].as_i64());
-                let out = usage["completion_tokens"].as_i64()
+                let out = usage["completion_tokens"]
+                    .as_i64()
                     .or_else(|| usage["output_tokens"].as_i64());
                 // Always overwrite: later values in the stream are more accurate.
-                if inp.is_some() { input_tokens = inp; }
-                if out.is_some() { output_tokens = out; }
+                if inp.is_some() {
+                    input_tokens = inp;
+                }
+                if out.is_some() {
+                    output_tokens = out;
+                }
             }
 
             // Anthropic `message_start` nests usage under `message.usage`.
             if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
                 let inp = usage["input_tokens"].as_i64();
                 let out = usage["output_tokens"].as_i64();
-                if inp.is_some() { input_tokens = inp; }
-                if out.is_some() { output_tokens = out; }
+                if inp.is_some() {
+                    input_tokens = inp;
+                }
+                if out.is_some() {
+                    output_tokens = out;
+                }
             }
         }
     }
@@ -150,7 +162,9 @@ pub fn extract_response_text_from_chunks(chunks: &[Bytes]) -> String {
         if let Some(tool_calls) = v["choices"][0]["delta"]["tool_calls"].as_array() {
             for tc in tool_calls {
                 let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                let entry = oai_tools.entry(index).or_insert_with(|| (String::new(), String::new()));
+                let entry = oai_tools
+                    .entry(index)
+                    .or_insert_with(|| (String::new(), String::new()));
 
                 if let Some(name) = tc["function"]["name"].as_str() {
                     if entry.0.is_empty() {
@@ -198,8 +212,8 @@ pub fn extract_response_text_from_chunks(chunks: &[Bytes]) -> String {
 
         let mut calls = Vec::with_capacity(sorted.len());
         for (_, (name, raw_args)) in sorted {
-            let args_value: Value = serde_json::from_str(&raw_args)
-                .unwrap_or(Value::String(raw_args));
+            let args_value: Value =
+                serde_json::from_str(&raw_args).unwrap_or(Value::String(raw_args));
             calls.push(serde_json::json!({"name": name, "arguments": args_value}));
         }
         if let Ok(s) = serde_json::to_string(&calls) {
@@ -211,8 +225,8 @@ pub fn extract_response_text_from_chunks(chunks: &[Bytes]) -> String {
     if !ant_tools.is_empty() {
         let mut calls = Vec::with_capacity(ant_tools.len());
         for (name, raw_args) in ant_tools {
-            let args_value: Value = serde_json::from_str(&raw_args)
-                .unwrap_or(Value::String(raw_args));
+            let args_value: Value =
+                serde_json::from_str(&raw_args).unwrap_or(Value::String(raw_args));
             calls.push(serde_json::json!({"name": name, "arguments": args_value}));
         }
         if let Ok(s) = serde_json::to_string(&calls) {
@@ -274,7 +288,10 @@ pub fn detect_provider(upstream: &str) -> String {
     } else if upstream.contains("perplexity") {
         "perplexity".to_string()
     // Zhipu AI — GLM models (api.z.ai / bigmodel.cn)
-    } else if upstream.contains("z.ai") || upstream.contains("bigmodel") || upstream.contains("zhipu") {
+    } else if upstream.contains("z.ai")
+        || upstream.contains("bigmodel")
+        || upstream.contains("zhipu")
+    {
         "zhipu".to_string()
     // Moonshot AI — Kimi models (platform.moonshot.ai / api.moonshot.cn)
     } else if upstream.contains("moonshot") {
@@ -329,17 +346,14 @@ fn fnv1a_64(s: &str) -> u64 {
 /// Returns `None` when no system prompt is present or the body is not valid JSON.
 pub fn extract_prompt_hash(req_body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(req_body).ok()?;
-    let text = v
-        .get("system")
-        .and_then(|s| s.as_str())
-        .or_else(|| {
-            v.get("messages")?
-                .as_array()?
-                .iter()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
-                .get("content")?
-                .as_str()
-        })?;
+    let text = v.get("system").and_then(|s| s.as_str()).or_else(|| {
+        v.get("messages")?
+            .as_array()?
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
+            .get("content")?
+            .as_str()
+    })?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -352,8 +366,8 @@ pub fn extract_prompt_hash(req_body: &str) -> Option<String> {
 pub fn default_upstream_for_provider(provider: &str) -> &'static str {
     match provider {
         "anthropic" => "https://api.anthropic.com",
-        "google"    => "https://generativelanguage.googleapis.com",
-        _           => "https://api.openai.com",
+        "google" => "https://generativelanguage.googleapis.com",
+        _ => "https://api.openai.com",
     }
 }
 
@@ -367,7 +381,7 @@ pub fn default_upstream_for_provider(provider: &str) -> &'static str {
 pub fn classify_error(r: &CallRecord) -> Option<&'static str> {
     match r.status_code {
         401 | 403 => Some("auth"),
-        429       => Some("rate_limit"),
+        429 => Some("rate_limit"),
         s if s >= 500 => Some("upstream_5xx"),
         0 => {
             if let Some(e) = &r.error {
@@ -428,17 +442,19 @@ pub fn estimate_cost_from_body(
         if let Some(usage) = v.get("usage") {
             // Anthropic prompt cache
             let write = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
-            let read  = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+            let read = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
             if write > 0 || read > 0 {
                 let regular = (input_tokens - write - read).max(0);
                 return (regular as f64 * input_price
                     + write as f64 * input_price * 1.25
-                    + read  as f64 * input_price * 0.10
+                    + read as f64 * input_price * 0.10
                     + output_tokens as f64 * output_price)
                     / 1_000_000.0;
             }
             // OpenAI prompt cache
-            let cached = usage["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
+            let cached = usage["prompt_tokens_details"]["cached_tokens"]
+                .as_i64()
+                .unwrap_or(0);
             if cached > 0 {
                 let regular = (input_tokens - cached).max(0);
                 return (regular as f64 * input_price
@@ -469,7 +485,7 @@ pub fn estimate_cost_from_chunks(
 
     // Collect cache token counts across all SSE events.
     let mut ant_write: i64 = 0;
-    let mut ant_read:  i64 = 0;
+    let mut ant_read: i64 = 0;
     let mut oai_cached: i64 = 0;
 
     let mut full_text = String::new();
@@ -489,17 +505,29 @@ pub fn estimate_cost_from_chunks(
             if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
                 let w = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
                 let r = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
-                if w > 0 { ant_write = w; }
-                if r > 0 { ant_read  = r; }
+                if w > 0 {
+                    ant_write = w;
+                }
+                if r > 0 {
+                    ant_read = r;
+                }
             }
             // Anthropic: usage in message_delta; OpenAI: top-level usage
             if let Some(usage) = v.get("usage") {
                 let w = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
                 let r = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
-                if w > 0 { ant_write = w; }
-                if r > 0 { ant_read  = r; }
-                let c = usage["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
-                if c > 0 { oai_cached = c; }
+                if w > 0 {
+                    ant_write = w;
+                }
+                if r > 0 {
+                    ant_read = r;
+                }
+                let c = usage["prompt_tokens_details"]["cached_tokens"]
+                    .as_i64()
+                    .unwrap_or(0);
+                if c > 0 {
+                    oai_cached = c;
+                }
             }
         }
     }
@@ -508,7 +536,7 @@ pub fn estimate_cost_from_chunks(
         let regular = (input_tokens - ant_write - ant_read).max(0);
         return (regular as f64 * input_price
             + ant_write as f64 * input_price * 1.25
-            + ant_read  as f64 * input_price * 0.10
+            + ant_read as f64 * input_price * 0.10
             + output_tokens as f64 * output_price)
             / 1_000_000.0;
     }
@@ -529,196 +557,196 @@ pub fn model_prices(model: &str) -> (f64, f64) {
     // e.g. "gpt-4.1" before "gpt-4", "o1-mini" before "o1", etc.
     match model {
         // ── Embeddings (output_tokens always 0; only input price matters) ──
-        m if m.contains("text-embedding-3-large")    => (0.13,   0.0),
-        m if m.contains("text-embedding-3-small")    => (0.02,   0.0),
-        m if m.contains("text-embedding-ada-002")    => (0.10,   0.0),
+        m if m.contains("text-embedding-3-large") => (0.13, 0.0),
+        m if m.contains("text-embedding-3-small") => (0.02, 0.0),
+        m if m.contains("text-embedding-ada-002") => (0.10, 0.0),
 
         // ── OpenAI o-series reasoning (mini before base) ──────────────────
-        m if m.contains("o1-mini")                   => (1.10,   4.40),
-        m if m.contains("o1-preview")                => (15.00,  60.00),
-        m if m.contains("o1")                        => (15.00,  60.00),
-        m if m.contains("o3-mini")                   => (1.10,   4.40),
-        m if m.contains("o3")                        => (10.00,  40.00),
+        m if m.contains("o1-mini") => (1.10, 4.40),
+        m if m.contains("o1-preview") => (15.00, 60.00),
+        m if m.contains("o1") => (15.00, 60.00),
+        m if m.contains("o3-mini") => (1.10, 4.40),
+        m if m.contains("o3") => (10.00, 40.00),
 
         // ── OpenAI GPT-5 series ───────────────────────────────────────────
         // Ordering: specific versions before generic; gpt-5.1-codex before
         // gpt-5.1 (since the former contains the latter as a substring).
-        m if m.contains("gpt-5.2")                  => (1.75,   14.00),
-        m if m.contains("gpt-5.1-codex")            => (0.25,    2.00),
-        m if m.contains("codex-mini")               => (1.50,    6.00),  // codex-mini-latest
-        m if m.contains("gpt-5.1")                  => (1.25,   10.00),
-        m if m.contains("gpt-5")                    => (1.25,   10.00),  // gpt-5 / gpt-5.0 generic
+        m if m.contains("gpt-5.2") => (1.75, 14.00),
+        m if m.contains("gpt-5.1-codex") => (0.25, 2.00),
+        m if m.contains("codex-mini") => (1.50, 6.00), // codex-mini-latest
+        m if m.contains("gpt-5.1") => (1.25, 10.00),
+        m if m.contains("gpt-5") => (1.25, 10.00), // gpt-5 / gpt-5.0 generic
 
         // ── OpenAI GPT-4.1 (before gpt-4o and gpt-4) ─────────────────────
-        m if m.contains("gpt-4.1-mini")             => (0.40,    1.60),
-        m if m.contains("gpt-4.1-nano")             => (0.10,    0.40),
-        m if m.contains("gpt-4.1")                  => (2.00,    8.00),
+        m if m.contains("gpt-4.1-mini") => (0.40, 1.60),
+        m if m.contains("gpt-4.1-nano") => (0.10, 0.40),
+        m if m.contains("gpt-4.1") => (2.00, 8.00),
 
         // ── OpenAI GPT-4o (mini before base) ──────────────────────────────
-        m if m.contains("gpt-4o-mini")               => (0.15,   0.60),
-        m if m.contains("gpt-4o")                    => (2.50,   10.00),
+        m if m.contains("gpt-4o-mini") => (0.15, 0.60),
+        m if m.contains("gpt-4o") => (2.50, 10.00),
 
         // ── OpenAI GPT-4 legacy ────────────────────────────────────────────
-        m if m.contains("gpt-4-turbo")               => (10.00,  30.00),
-        m if m.contains("gpt-4")                     => (30.00,  60.00),
-        m if m.contains("gpt-3.5")                   => (0.50,   1.50),
+        m if m.contains("gpt-4-turbo") => (10.00, 30.00),
+        m if m.contains("gpt-4") => (30.00, 60.00),
+        m if m.contains("gpt-3.5") => (0.50, 1.50),
 
         // ── Anthropic Claude 4 ────────────────────────────────────────────
         // Opus 4.x is $5/$25 (NOT $15/$75 — that was Claude 3 Opus below).
         // Thinking variants are billed at the same token rate as base.
         // Named versions (4.6, 4.5) listed explicitly then caught by catch-all.
-        m if m.contains("claude-opus-4-6")           => (5.00,   25.00),  // opus 4.6 + -thinking
-        m if m.contains("claude-opus-4-5")           => (5.00,   25.00),
-        m if m.contains("claude-opus-4")             => (5.00,   25.00),  // future opus-4.x
+        m if m.contains("claude-opus-4-6") => (5.00, 25.00), // opus 4.6 + -thinking
+        m if m.contains("claude-opus-4-5") => (5.00, 25.00),
+        m if m.contains("claude-opus-4") => (5.00, 25.00), // future opus-4.x
 
-        m if m.contains("claude-sonnet-4-6")         => (3.00,   15.00),
-        m if m.contains("claude-sonnet-4-5")         => (3.00,   15.00),
-        m if m.contains("claude-sonnet-4")           => (3.00,   15.00),  // future sonnet-4.x
+        m if m.contains("claude-sonnet-4-6") => (3.00, 15.00),
+        m if m.contains("claude-sonnet-4-5") => (3.00, 15.00),
+        m if m.contains("claude-sonnet-4") => (3.00, 15.00), // future sonnet-4.x
 
-        m if m.contains("claude-haiku-4")            => (1.00,    5.00),
+        m if m.contains("claude-haiku-4") => (1.00, 5.00),
 
         // ── Anthropic Claude 3.7 ──────────────────────────────────────────
-        m if m.contains("claude-3-7-sonnet")         => (3.00,   15.00),
+        m if m.contains("claude-3-7-sonnet") => (3.00, 15.00),
 
         // ── Anthropic Claude 3.5 ──────────────────────────────────────────
-        m if m.contains("claude-3-5-sonnet")         => (3.00,   15.00),
-        m if m.contains("claude-3-5-haiku")          => (0.80,   4.00),
+        m if m.contains("claude-3-5-sonnet") => (3.00, 15.00),
+        m if m.contains("claude-3-5-haiku") => (0.80, 4.00),
 
         // ── Anthropic Claude 3 ────────────────────────────────────────────
-        m if m.contains("claude-3-opus")             => (15.00,  75.00),
-        m if m.contains("claude-3-sonnet")           => (3.00,   15.00),
-        m if m.contains("claude-3-haiku")            => (0.25,   1.25),
+        m if m.contains("claude-3-opus") => (15.00, 75.00),
+        m if m.contains("claude-3-sonnet") => (3.00, 15.00),
+        m if m.contains("claude-3-haiku") => (0.25, 1.25),
 
         // ── Google Gemini 3.1 (before 2.5) ───────────────────────────────
-        m if m.contains("gemini-3.1-pro")            => (2.00,   12.00),
-        m if m.contains("gemini-3.1-flash")          => (0.10,    0.40),
-        m if m.contains("gemini-3.1")                => (2.00,   12.00),  // generic 3.1
+        m if m.contains("gemini-3.1-pro") => (2.00, 12.00),
+        m if m.contains("gemini-3.1-flash") => (0.10, 0.40),
+        m if m.contains("gemini-3.1") => (2.00, 12.00), // generic 3.1
 
         // ── Google Gemini 3.0 (before 2.5) ───────────────────────────────
-        m if m.contains("gemini-3-pro")              => (2.00,   12.00),
-        m if m.contains("gemini-3")                  => (2.00,   12.00),
+        m if m.contains("gemini-3-pro") => (2.00, 12.00),
+        m if m.contains("gemini-3") => (2.00, 12.00),
 
         // ── Google Gemini 2.5 ─────────────────────────────────────────────
-        m if m.contains("gemini-2.5-pro")            => (1.25,   10.00),
-        m if m.contains("gemini-2.5-flash")          => (0.075,  0.30),
+        m if m.contains("gemini-2.5-pro") => (1.25, 10.00),
+        m if m.contains("gemini-2.5-flash") => (0.075, 0.30),
 
         // ── Google Gemini 2.0 (flash-lite before flash) ───────────────────
-        m if m.contains("gemini-2.0-flash-lite")     => (0.075,  0.30),
-        m if m.contains("gemini-2.0-flash")          => (0.10,   0.40),
-        m if m.contains("gemini-2.0")                => (0.10,   0.40),
+        m if m.contains("gemini-2.0-flash-lite") => (0.075, 0.30),
+        m if m.contains("gemini-2.0-flash") => (0.10, 0.40),
+        m if m.contains("gemini-2.0") => (0.10, 0.40),
 
         // ── Google Gemini 1.5 (8b before flash before pro) ────────────────
-        m if m.contains("gemini-1.5-flash-8b")       => (0.0375, 0.15),
-        m if m.contains("gemini-1.5-pro")            => (1.25,   5.00),
-        m if m.contains("gemini-1.5-flash")          => (0.075,  0.30),
+        m if m.contains("gemini-1.5-flash-8b") => (0.0375, 0.15),
+        m if m.contains("gemini-1.5-pro") => (1.25, 5.00),
+        m if m.contains("gemini-1.5-flash") => (0.075, 0.30),
 
         // ── xAI Grok (specific versions before generic) ───────────────────
-        m if m.contains("grok-3")                    => (3.00,   15.00),
-        m if m.contains("grok-2")                    => (2.00,   10.00),
-        m if m.contains("grok")                      => (5.00,   15.00),
+        m if m.contains("grok-3") => (3.00, 15.00),
+        m if m.contains("grok-2") => (2.00, 10.00),
+        m if m.contains("grok") => (5.00, 15.00),
 
         // ── Meta Llama 4 ──────────────────────────────────────────────────
         // Bedrock uses "llama4-maverick" (no hyphen between llama and 4).
         m if m.contains("llama-4-maverick") || m.contains("llama4-maverick") => (0.24, 0.77),
-        m if m.contains("llama-4-scout")    || m.contains("llama4-scout")    => (0.20, 0.60),
+        m if m.contains("llama-4-scout") || m.contains("llama4-scout") => (0.20, 0.60),
 
         // ── Meta Llama 3.3 ────────────────────────────────────────────────
         // Bedrock IDs: meta.llama3-3-70b-instruct-v1:0
-        m if m.contains("llama-3.3-70b") || m.contains("llama3-3-70b")      => (0.59, 0.79),
+        m if m.contains("llama-3.3-70b") || m.contains("llama3-3-70b") => (0.59, 0.79),
 
         // ── Meta Llama 3.2 (larger sizes first) ───────────────────────────
         // Bedrock IDs: meta.llama3-2-{90b,11b,3b,1b}-instruct-v1:0
-        m if m.contains("llama-3.2-90b") || m.contains("llama3-2-90b")      => (0.90, 0.90),
-        m if m.contains("llama-3.2-11b") || m.contains("llama3-2-11b")      => (0.18, 0.18),
-        m if m.contains("llama-3.2-3b")  || m.contains("llama3-2-3b")       => (0.06, 0.06),
-        m if m.contains("llama-3.2-1b")  || m.contains("llama3-2-1b")       => (0.04, 0.04),
+        m if m.contains("llama-3.2-90b") || m.contains("llama3-2-90b") => (0.90, 0.90),
+        m if m.contains("llama-3.2-11b") || m.contains("llama3-2-11b") => (0.18, 0.18),
+        m if m.contains("llama-3.2-3b") || m.contains("llama3-2-3b") => (0.06, 0.06),
+        m if m.contains("llama-3.2-1b") || m.contains("llama3-2-1b") => (0.04, 0.04),
 
         // ── Meta Llama 3.1 ────────────────────────────────────────────────
         // Bedrock IDs: meta.llama3-1-{405b,70b,8b}-instruct-v1:0
-        m if m.contains("llama-3.1-405b") || m.contains("llama3-1-405b")    => (3.00, 3.00),
-        m if m.contains("llama-3.1-70b")  || m.contains("llama3-1-70b")     => (0.52, 0.75),
-        m if m.contains("llama-3.1-8b")   || m.contains("llama3-1-8b")      => (0.18, 0.18),
+        m if m.contains("llama-3.1-405b") || m.contains("llama3-1-405b") => (3.00, 3.00),
+        m if m.contains("llama-3.1-70b") || m.contains("llama3-1-70b") => (0.52, 0.75),
+        m if m.contains("llama-3.1-8b") || m.contains("llama3-1-8b") => (0.18, 0.18),
 
         // ── Mistral / Mixtral / Codestral / Pixtral ───────────────────────
-        m if m.contains("mistral-large")             => (2.00,   6.00),
-        m if m.contains("mistral-medium")            => (2.75,   8.10),
-        m if m.contains("mistral-small")             => (0.20,   0.60),
-        m if m.contains("codestral")                 => (0.30,   0.90),
-        m if m.contains("pixtral")                   => (2.00,   6.00),
-        m if m.contains("mixtral")                   => (0.24,   0.24),
+        m if m.contains("mistral-large") => (2.00, 6.00),
+        m if m.contains("mistral-medium") => (2.75, 8.10),
+        m if m.contains("mistral-small") => (0.20, 0.60),
+        m if m.contains("codestral") => (0.30, 0.90),
+        m if m.contains("pixtral") => (2.00, 6.00),
+        m if m.contains("mixtral") => (0.24, 0.24),
 
         // ── DeepSeek (R1 reasoning before generic deepseek) ───────────────
-        m if m.contains("deepseek-r1")               => (0.55,   2.19),
-        m if m.contains("deepseek")                  => (0.14,   0.28),
+        m if m.contains("deepseek-r1") => (0.55, 2.19),
+        m if m.contains("deepseek") => (0.14, 0.28),
 
         // ── Cohere Command (plus before base) ─────────────────────────────
-        m if m.contains("command-r-plus")            => (2.50,   10.00),
-        m if m.contains("command-r")                 => (0.50,   1.50),
+        m if m.contains("command-r-plus") => (2.50, 10.00),
+        m if m.contains("command-r") => (0.50, 1.50),
 
         // ── Perplexity Sonar (pro before base) ────────────────────────────
-        m if m.contains("sonar-pro")                 => (3.00,   15.00),
-        m if m.contains("sonar")                     => (1.00,   5.00),
+        m if m.contains("sonar-pro") => (3.00, 15.00),
+        m if m.contains("sonar") => (1.00, 5.00),
 
         // ── Amazon Nova (premier before pro, lite, micro) ─────────────────
         // Bedrock model IDs: amazon.nova-{premier,pro,lite,micro}-v1:0
-        m if m.contains("nova-premier")              => (2.50,   12.50),
-        m if m.contains("nova-pro")                  => (0.80,    3.20),
-        m if m.contains("nova-lite")                 => (0.06,    0.24),
-        m if m.contains("nova-micro")                => (0.035,   0.14),
+        m if m.contains("nova-premier") => (2.50, 12.50),
+        m if m.contains("nova-pro") => (0.80, 3.20),
+        m if m.contains("nova-lite") => (0.06, 0.24),
+        m if m.contains("nova-micro") => (0.035, 0.14),
 
         // ── AI21 Jamba (large before mini) ────────────────────────────────
         // Model IDs use varied formats: "jamba-large-1.7", "jamba-1-5-large",
         // "ai21.jamba-1-5-large-v1:0".  Use compound guards to match both.
         m if m.contains("jamba") && (m.contains("-large") || m.contains("1.7")) => (2.00, 8.00),
-        m if m.contains("jamba") && m.contains("-mini")  => (0.20,    0.40),
-        m if m.contains("jamba")                          => (2.00,    8.00),  // generic
+        m if m.contains("jamba") && m.contains("-mini") => (0.20, 0.40),
+        m if m.contains("jamba") => (2.00, 8.00), // generic
 
         // ── Alibaba Qwen (Dashscope / OpenRouter: qwen/...) ───────────────
         // QwQ reasoning models (32b-preview pricier than current qwq-plus)
-        m if m.contains("qwq-32b-preview")           => (1.60,    6.40),
-        m if m.contains("qwq")                       => (0.20,    0.60),  // qwq-plus, qwq-32b
+        m if m.contains("qwq-32b-preview") => (1.60, 6.40),
+        m if m.contains("qwq") => (0.20, 0.60), // qwq-plus, qwq-32b
 
         // Qwen3 coder series (coder-next before coder; qwen3 is substring of both)
-        m if m.contains("qwen3-coder-next")          => (0.07,    0.30),
-        m if m.contains("qwen3-coder")               => (1.00,    5.00),  // coder-plus / coder
+        m if m.contains("qwen3-coder-next") => (0.07, 0.30),
+        m if m.contains("qwen3-coder") => (1.00, 5.00), // coder-plus / coder
 
         // Qwen3.5 before Qwen3 ("qwen3" is a substring of "qwen3.5")
-        m if m.contains("qwen3.5")                   => (0.90,    3.60),
+        m if m.contains("qwen3.5") => (0.90, 3.60),
 
         // Qwen3 Max before generic Qwen3 ("qwen3" is a substring of "qwen3-max")
-        m if m.contains("qwen3-max")                 => (1.20,    6.00),
-        m if m.contains("qwen3")                     => (0.40,    1.20),  // qwen3-plus / turbo
+        m if m.contains("qwen3-max") => (1.20, 6.00),
+        m if m.contains("qwen3") => (0.40, 1.20), // qwen3-plus / turbo
 
         // Qwen2.5 sized variants (specific sizes before generic)
-        m if m.contains("qwen2.5-72b")               => (0.15,    0.40),
-        m if m.contains("qwen2.5-7b")                => (0.10,    0.30),
-        m if m.contains("qwen2.5")                   => (0.35,    0.75),
+        m if m.contains("qwen2.5-72b") => (0.15, 0.40),
+        m if m.contains("qwen2.5-7b") => (0.10, 0.30),
+        m if m.contains("qwen2.5") => (0.35, 0.75),
 
         // Legacy Qwen series (max > plus > turbo > generic)
-        m if m.contains("qwen-max")                  => (1.60,    6.40),
-        m if m.contains("qwen-plus")                 => (0.30,    1.20),
-        m if m.contains("qwen-turbo")                => (0.05,    0.20),
-        m if m.contains("qwen")                      => (0.40,    1.20),  // generic fallback
+        m if m.contains("qwen-max") => (1.60, 6.40),
+        m if m.contains("qwen-plus") => (0.30, 1.20),
+        m if m.contains("qwen-turbo") => (0.05, 0.20),
+        m if m.contains("qwen") => (0.40, 1.20), // generic fallback
 
         // ── Kimi / Moonshot AI ────────────────────────────────────────────
-        m if m.contains("kimi-k2.5")                 => (0.60,    3.00),
-        m if m.contains("kimi")                      => (0.60,    3.00),  // generic kimi
+        m if m.contains("kimi-k2.5") => (0.60, 3.00),
+        m if m.contains("kimi") => (0.60, 3.00), // generic kimi
 
         // ── Zhipu AI GLM (api.z.ai) ───────────────────────────────────────
         // Ordering: specific version+variant before version, before generic glm-4.
         // "glm-4.5" is a substring of "glm-4.5-x" and "glm-4.5-flash".
         // "glm-4" is a substring of "glm-4.5", "glm-4.7", etc.
-        m if m.contains("glm-5")                     => (1.00,    3.20),
-        m if m.contains("glm-4.7-x")                 => (4.50,    8.90),  // GLM-4.7-X premium
-        m if m.contains("glm-4.7-flash")             => (0.05,    0.10),
-        m if m.contains("glm-4.7")                   => (0.60,    2.20),
-        m if m.contains("glm-4.5-x")                 => (4.50,    8.90),  // GLM-4.5-X premium
-        m if m.contains("glm-4.5-flash")             => (0.05,    0.10),
-        m if m.contains("glm-4.5")                   => (0.55,    2.00),
-        m if m.contains("glm-4")                     => (0.55,    2.00),  // GLM-4 generic
+        m if m.contains("glm-5") => (1.00, 3.20),
+        m if m.contains("glm-4.7-x") => (4.50, 8.90), // GLM-4.7-X premium
+        m if m.contains("glm-4.7-flash") => (0.05, 0.10),
+        m if m.contains("glm-4.7") => (0.60, 2.20),
+        m if m.contains("glm-4.5-x") => (4.50, 8.90), // GLM-4.5-X premium
+        m if m.contains("glm-4.5-flash") => (0.05, 0.10),
+        m if m.contains("glm-4.5") => (0.55, 2.00),
+        m if m.contains("glm-4") => (0.55, 2.00), // GLM-4 generic
 
         // ── Google Gemma ──────────────────────────────────────────────────
-        m if m.contains("gemma")                     => (0.10,   0.10),
+        m if m.contains("gemma") => (0.10, 0.10),
 
         // ── Fallback ──────────────────────────────────────────────────────
         _ => (1.00, 3.00), // unknown model — cost estimate will be inaccurate
@@ -728,8 +756,8 @@ pub fn model_prices(model: &str) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{now_iso, CallRecord};
     use bytes::Bytes;
-    use crate::store::{CallRecord, now_iso};
 
     fn make_test_record(status_code: u16, error: Option<&str>) -> CallRecord {
         CallRecord {
@@ -1055,9 +1083,7 @@ mod tests {
     fn extract_usage_from_chunks_chunk_with_only_input_tokens_defaults_output_to_zero() {
         // Embedding endpoints return only prompt_tokens — output_tokens defaults to 0
         // so that cost can still be calculated (not silently dropped).
-        let chunks = vec![
-            sse("data: {\"usage\":{\"prompt_tokens\":50}}\n\n"),
-        ];
+        let chunks = vec![sse("data: {\"usage\":{\"prompt_tokens\":50}}\n\n")];
         assert_eq!(extract_usage_from_chunks(&chunks), Some((50, 0)));
     }
 
@@ -1109,9 +1135,9 @@ mod tests {
     #[test]
     fn extract_response_text_no_content_fields() {
         // Usage-only chunks produce no text.
-        let chunks = vec![
-            sse("data: {\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":20}}\n\n"),
-        ];
+        let chunks = vec![sse(
+            "data: {\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":20}}\n\n",
+        )];
         assert_eq!(extract_response_text_from_chunks(&chunks), "");
     }
 
@@ -1124,7 +1150,10 @@ mod tests {
         ];
         let result = extract_response_text_from_chunks(&chunks);
         assert!(!result.is_empty(), "tool call should be captured");
-        assert!(result.contains("get_weather"), "tool name should appear in output");
+        assert!(
+            result.contains("get_weather"),
+            "tool name should appear in output"
+        );
     }
 
     #[test]
@@ -1134,7 +1163,10 @@ mod tests {
             sse("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\",\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"fn\",\"arguments\":\"{}\"}}]}}]}\n\n"),
         ];
         let result = extract_response_text_from_chunks(&chunks);
-        assert_eq!(result, "Hello", "text content should take priority over tool calls");
+        assert_eq!(
+            result, "Hello",
+            "text content should take priority over tool calls"
+        );
     }
 
     #[test]
@@ -1147,7 +1179,10 @@ mod tests {
         ];
         let result = extract_response_text_from_chunks(&chunks);
         assert!(!result.is_empty(), "Anthropic tool use should be captured");
-        assert!(result.contains("get_weather"), "tool name should appear in output");
+        assert!(
+            result.contains("get_weather"),
+            "tool name should appear in output"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1160,7 +1195,10 @@ mod tests {
         // 1_000 input + 500 output = 0.0025 + 0.005 = $0.0075
         let cost = estimate_cost("gpt-4o", 1_000, 500);
         let expected = (1_000.0 * 2.50 + 500.0 * 10.00) / 1_000_000.0;
-        assert!((cost - expected).abs() < 1e-9, "cost={cost} expected={expected}");
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "cost={cost} expected={expected}"
+        );
     }
 
     #[test]
@@ -1205,7 +1243,10 @@ mod tests {
         // Thinking mode is same price as base opus 4.x: $5/$25.
         let cost46 = estimate_cost("claude-opus-4-6-20260205", 1_000_000, 1_000_000);
         let cost46t = estimate_cost("claude-opus-4-6-thinking-20260205", 1_000_000, 1_000_000);
-        assert!((cost46 - cost46t).abs() < 1e-6, "thinking mode should cost same as base");
+        assert!(
+            (cost46 - cost46t).abs() < 1e-6,
+            "thinking mode should cost same as base"
+        );
         // Both should be $5 + $25 = $30 for 1M/1M tokens
         assert!((cost46 - 30.0).abs() < 1e-6);
     }
@@ -1215,7 +1256,10 @@ mod tests {
         // Claude 3 Opus was $15/$75; Claude 4 Opus is $5/$25.
         let c4 = estimate_cost("claude-opus-4-5", 1_000_000, 1_000_000);
         let c3 = estimate_cost("claude-3-opus-20240229", 1_000_000, 1_000_000);
-        assert!(c4 < c3, "claude-opus-4 should be cheaper than claude-3-opus");
+        assert!(
+            c4 < c3,
+            "claude-opus-4 should be cheaper than claude-3-opus"
+        );
     }
 
     #[test]
@@ -1223,7 +1267,10 @@ mod tests {
         // gpt-4o-mini must match its own price row, not the gpt-4o row.
         let cost_mini = estimate_cost("gpt-4o-mini", 1_000_000, 1_000_000);
         let cost_full = estimate_cost("gpt-4o", 1_000_000, 1_000_000);
-        assert!(cost_mini < cost_full, "gpt-4o-mini should be cheaper than gpt-4o");
+        assert!(
+            cost_mini < cost_full,
+            "gpt-4o-mini should be cheaper than gpt-4o"
+        );
     }
 
     #[test]
@@ -1244,14 +1291,21 @@ mod tests {
         // claude-3-5-sonnet: $3.00/M input, $15.00/M output.
         // Cache read = 10% of input price = $0.30/M.
         // 1000 input (900 cached read, 100 regular), 200 output.
-        let body = r#"{"usage":{"input_tokens":1000,"cache_read_input_tokens":900,"output_tokens":200}}"#;
+        let body =
+            r#"{"usage":{"input_tokens":1000,"cache_read_input_tokens":900,"output_tokens":200}}"#;
         let with_cache = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 200);
         let without_cache = estimate_cost("claude-3-5-sonnet-20241022", 1000, 200);
-        assert!(with_cache < without_cache, "cache read should be cheaper: {with_cache} < {without_cache}");
+        assert!(
+            with_cache < without_cache,
+            "cache read should be cheaper: {with_cache} < {without_cache}"
+        );
 
         // Expected: 100 regular * $3/M + 900 cached * $0.30/M + 200 * $15/M
         let expected = (100.0 * 3.00 + 900.0 * 0.30 + 200.0 * 15.00) / 1_000_000.0;
-        assert!((with_cache - expected).abs() < 1e-9, "with_cache={with_cache} expected={expected}");
+        assert!(
+            (with_cache - expected).abs() < 1e-9,
+            "with_cache={with_cache} expected={expected}"
+        );
     }
 
     #[test]
@@ -1261,7 +1315,10 @@ mod tests {
         let with_write = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 0);
         // Expected: 200 regular * $3/M + 800 write * $3.75/M
         let expected = (200.0 * 3.00 + 800.0 * 3.75) / 1_000_000.0;
-        assert!((with_write - expected).abs() < 1e-9, "with_write={with_write} expected={expected}");
+        assert!(
+            (with_write - expected).abs() < 1e-9,
+            "with_write={with_write} expected={expected}"
+        );
     }
 
     #[test]
@@ -1272,7 +1329,10 @@ mod tests {
         let with_cache = estimate_cost_from_body("gpt-4o", body, 1000, 0);
         // Expected: 200 regular * $2.50/M + 800 cached * $1.25/M
         let expected = (200.0 * 2.50 + 800.0 * 1.25) / 1_000_000.0;
-        assert!((with_cache - expected).abs() < 1e-9, "with_cache={with_cache} expected={expected}");
+        assert!(
+            (with_cache - expected).abs() < 1e-9,
+            "with_cache={with_cache} expected={expected}"
+        );
     }
 
     #[test]
@@ -1368,7 +1428,8 @@ mod tests {
 
     #[test]
     fn redact_multiple_fields_all_removed() {
-        let body = r#"{"model":"gpt-4o","messages":[],"system_prompt":"You are a helpful assistant"}"#;
+        let body =
+            r#"{"model":"gpt-4o","messages":[],"system_prompt":"You are a helpful assistant"}"#;
         let fields = vec!["messages".to_string(), "system_prompt".to_string()];
         let result = redact_json_fields(body, &fields);
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1448,7 +1509,10 @@ mod tests {
     #[test]
     fn detect_provider_anthropic_takes_priority_over_openai_if_both_present() {
         // Anthropic check comes first in the if-else chain.
-        assert_eq!(detect_provider("https://anthropic-openai-bridge.example.com"), "anthropic");
+        assert_eq!(
+            detect_provider("https://anthropic-openai-bridge.example.com"),
+            "anthropic"
+        );
     }
 
     #[test]
@@ -1464,7 +1528,10 @@ mod tests {
             "azure-openai"
         );
         // azure-openai must take priority over plain openai (more specific match first)
-        assert_eq!(detect_provider("https://foo.azure.com/openai/models"), "azure-openai");
+        assert_eq!(
+            detect_provider("https://foo.azure.com/openai/models"),
+            "azure-openai"
+        );
     }
 
     #[test]
@@ -1476,7 +1543,10 @@ mod tests {
 
     #[test]
     fn detect_provider_openrouter() {
-        assert_eq!(detect_provider("https://openrouter.ai/api/v1"), "openrouter");
+        assert_eq!(
+            detect_provider("https://openrouter.ai/api/v1"),
+            "openrouter"
+        );
     }
 
     #[test]
@@ -1487,7 +1557,10 @@ mod tests {
     #[test]
     fn detect_provider_perplexity() {
         assert_eq!(detect_provider("https://api.perplexity.ai"), "perplexity");
-        assert_eq!(detect_provider("https://api.perplexity.ai/chat/completions"), "perplexity");
+        assert_eq!(
+            detect_provider("https://api.perplexity.ai/chat/completions"),
+            "perplexity"
+        );
     }
 
     #[test]
@@ -1497,19 +1570,27 @@ mod tests {
             "bedrock"
         );
         assert_eq!(
-            detect_provider("https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3"),
+            detect_provider(
+                "https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3"
+            ),
             "bedrock"
         );
     }
 
     #[test]
     fn detect_provider_fireworks() {
-        assert_eq!(detect_provider("https://api.fireworks.ai/inference/v1"), "fireworks");
+        assert_eq!(
+            detect_provider("https://api.fireworks.ai/inference/v1"),
+            "fireworks"
+        );
     }
 
     #[test]
     fn detect_provider_nvidia() {
-        assert_eq!(detect_provider("https://integrate.api.nvidia.com/v1"), "nvidia");
+        assert_eq!(
+            detect_provider("https://integrate.api.nvidia.com/v1"),
+            "nvidia"
+        );
         assert_eq!(detect_provider("https://api.nvidia.com/v1"), "nvidia");
     }
 
@@ -1519,7 +1600,10 @@ mod tests {
     fn model_prices_gpt41_cheaper_than_gpt4_legacy() {
         let (inp41, out41) = model_prices("gpt-4.1");
         let (inp4, _) = model_prices("gpt-4");
-        assert!(inp41 < inp4, "gpt-4.1 should be cheaper input than legacy gpt-4");
+        assert!(
+            inp41 < inp4,
+            "gpt-4.1 should be cheaper input than legacy gpt-4"
+        );
         assert_eq!((inp41, out41), (2.00, 8.00));
     }
 
@@ -1529,7 +1613,10 @@ mod tests {
         let (inp_mini, out_mini) = model_prices("gpt-4.1-mini");
         let (inp_full, _) = model_prices("gpt-4.1");
         assert_eq!((inp_mini, out_mini), (0.40, 1.60));
-        assert!(inp_mini < inp_full, "gpt-4.1-mini should be cheaper than gpt-4.1");
+        assert!(
+            inp_mini < inp_full,
+            "gpt-4.1-mini should be cheaper than gpt-4.1"
+        );
     }
 
     #[test]
@@ -1573,8 +1660,14 @@ mod tests {
     fn model_prices_deepseek_r1_more_expensive_than_v3() {
         let (inp_r1, out_r1) = model_prices("deepseek-r1");
         let (inp_v3, out_v3) = model_prices("deepseek-v3");
-        assert!(inp_r1 > inp_v3, "DeepSeek R1 reasoning should cost more input than V3");
-        assert!(out_r1 > out_v3, "DeepSeek R1 reasoning should cost more output than V3");
+        assert!(
+            inp_r1 > inp_v3,
+            "DeepSeek R1 reasoning should cost more input than V3"
+        );
+        assert!(
+            out_r1 > out_v3,
+            "DeepSeek R1 reasoning should cost more output than V3"
+        );
     }
 
     #[test]
@@ -1592,7 +1685,10 @@ mod tests {
     fn model_prices_command_r_plus_more_expensive_than_command_r() {
         let (inp_plus, _) = model_prices("command-r-plus");
         let (inp_base, _) = model_prices("command-r");
-        assert!(inp_plus > inp_base, "command-r-plus should cost more than command-r");
+        assert!(
+            inp_plus > inp_base,
+            "command-r-plus should cost more than command-r"
+        );
     }
 
     #[test]
@@ -1672,7 +1768,10 @@ mod tests {
     fn model_prices_gpt51_codex_cheaper_than_gpt51() {
         let (ci, _) = model_prices("gpt-5.1-codex-mini");
         let (i, _) = model_prices("gpt-5.1");
-        assert!(ci < i, "gpt-5.1-codex-mini should be cheaper input than gpt-5.1");
+        assert!(
+            ci < i,
+            "gpt-5.1-codex-mini should be cheaper input than gpt-5.1"
+        );
     }
 
     #[test]
@@ -1685,10 +1784,10 @@ mod tests {
         // "gpt-5" arm is separate from "gpt-5.1"; both have same price so
         // what matters is that "gpt-5.1" model names are not forced through
         // the fallback (i.e., they are matched by some arm, not the _ default).
-        let (i5, _)  = model_prices("gpt-5");
+        let (i5, _) = model_prices("gpt-5");
         let (i51, _) = model_prices("gpt-5.1");
         // Both should have known prices, not the $1.00 fallback
-        assert!(i5  >= 1.20, "gpt-5 should have a known price > fallback");
+        assert!(i5 >= 1.20, "gpt-5 should have a known price > fallback");
         assert!(i51 >= 1.20, "gpt-5.1 should have a known price > fallback");
     }
 
@@ -1713,7 +1812,10 @@ mod tests {
     fn model_prices_gemini_31_more_expensive_than_25_pro() {
         let (i31, _) = model_prices("gemini-3.1-pro");
         let (i25, _) = model_prices("gemini-2.5-pro");
-        assert!(i31 > i25, "gemini-3.1-pro should cost more than gemini-2.5-pro");
+        assert!(
+            i31 > i25,
+            "gemini-3.1-pro should cost more than gemini-2.5-pro"
+        );
     }
 
     #[test]
@@ -1738,7 +1840,10 @@ mod tests {
 
     #[test]
     fn detect_provider_moonshot() {
-        assert_eq!(detect_provider("https://platform.moonshot.ai/v1"), "moonshot");
+        assert_eq!(
+            detect_provider("https://platform.moonshot.ai/v1"),
+            "moonshot"
+        );
         assert_eq!(detect_provider("https://api.moonshot.cn/v1"), "moonshot");
     }
 
@@ -1753,7 +1858,10 @@ mod tests {
     fn model_prices_claude_opus_4_is_5_per_million() {
         assert_eq!(model_prices("claude-opus-4-6"), (5.00, 25.00));
         assert_eq!(model_prices("claude-opus-4-5"), (5.00, 25.00));
-        assert_eq!(model_prices("claude-opus-4-6-thinking-20260205"), (5.00, 25.00));
+        assert_eq!(
+            model_prices("claude-opus-4-6-thinking-20260205"),
+            (5.00, 25.00)
+        );
     }
 
     #[test]
@@ -1768,7 +1876,10 @@ mod tests {
     fn model_prices_claude_opus_46_explicit() {
         assert_eq!(model_prices("claude-opus-4-6"), (5.00, 25.00));
         assert_eq!(model_prices("claude-opus-4-6-20260205"), (5.00, 25.00));
-        assert_eq!(model_prices("claude-opus-4-6-thinking-20260205"), (5.00, 25.00));
+        assert_eq!(
+            model_prices("claude-opus-4-6-thinking-20260205"),
+            (5.00, 25.00)
+        );
     }
 
     #[test]
@@ -1805,7 +1916,10 @@ mod tests {
     #[test]
     fn detect_provider_zhipu() {
         assert_eq!(detect_provider("https://api.z.ai/v1"), "zhipu");
-        assert_eq!(detect_provider("https://open.bigmodel.cn/api/paas/v4"), "zhipu");
+        assert_eq!(
+            detect_provider("https://open.bigmodel.cn/api/paas/v4"),
+            "zhipu"
+        );
         assert_eq!(detect_provider("https://api.zhipu.ai/v1"), "zhipu");
     }
 
@@ -1838,16 +1952,22 @@ mod tests {
     fn model_prices_glm47_not_matched_by_glm4_generic() {
         // glm-4.7 must match its own arm, not the glm-4 catch-all
         let (_i47, o47) = model_prices("glm-4.7");
-        let (_i4,  o4)  = model_prices("glm-4-v");  // some glm-4 generic model
-        // glm-4.7 has higher output price than base glm-4
-        assert!(o47 > o4, "glm-4.7 output price should differ from glm-4 generic");
+        let (_i4, o4) = model_prices("glm-4-v"); // some glm-4 generic model
+                                                 // glm-4.7 has higher output price than base glm-4
+        assert!(
+            o47 > o4,
+            "glm-4.7 output price should differ from glm-4 generic"
+        );
     }
 
     #[test]
     fn model_prices_glm5_more_expensive_than_glm45() {
         let (i5, _) = model_prices("glm-5");
         let (i45, _) = model_prices("glm-4.5");
-        assert!(i5 > i45, "glm-5 should cost more per input token than glm-4.5");
+        assert!(
+            i5 > i45,
+            "glm-5 should cost more per input token than glm-4.5"
+        );
     }
 
     #[test]
@@ -1865,17 +1985,17 @@ mod tests {
     #[test]
     fn model_prices_nova_tiers() {
         assert_eq!(model_prices("amazon.nova-premier-v1:0"), (2.50, 12.50));
-        assert_eq!(model_prices("amazon.nova-pro-v1:0"),     (0.80,  3.20));
-        assert_eq!(model_prices("amazon.nova-lite-v1:0"),    (0.06,  0.24));
-        assert_eq!(model_prices("amazon.nova-micro-v1:0"),   (0.035, 0.14));
+        assert_eq!(model_prices("amazon.nova-pro-v1:0"), (0.80, 3.20));
+        assert_eq!(model_prices("amazon.nova-lite-v1:0"), (0.06, 0.24));
+        assert_eq!(model_prices("amazon.nova-micro-v1:0"), (0.035, 0.14));
     }
 
     #[test]
     fn model_prices_nova_ordered_cheapest_to_priciest() {
         let (micro, _) = model_prices("nova-micro");
-        let (lite, _)  = model_prices("nova-lite");
-        let (pro, _)   = model_prices("nova-pro");
-        let (prem, _)  = model_prices("nova-premier");
+        let (lite, _) = model_prices("nova-lite");
+        let (pro, _) = model_prices("nova-pro");
+        let (prem, _) = model_prices("nova-premier");
         assert!(micro < lite && lite < pro && pro < prem);
     }
 
@@ -1894,9 +2014,9 @@ mod tests {
 
     #[test]
     fn model_prices_jamba_large_and_mini() {
-        assert_eq!(model_prices("jamba-large-1.7"),   (2.00, 8.00));
-        assert_eq!(model_prices("jamba-1-5-large"),   (2.00, 8.00));
-        assert_eq!(model_prices("jamba-1-5-mini"),    (0.20, 0.40));
+        assert_eq!(model_prices("jamba-large-1.7"), (2.00, 8.00));
+        assert_eq!(model_prices("jamba-1-5-large"), (2.00, 8.00));
+        assert_eq!(model_prices("jamba-1-5-mini"), (0.20, 0.40));
         // via Bedrock: ai21.jamba-1-5-large-v1:0
         assert_eq!(model_prices("ai21.jamba-1-5-large-v1:0"), (2.00, 8.00));
     }
@@ -1911,21 +2031,24 @@ mod tests {
 
     #[test]
     fn detect_provider_qwen_dashscope() {
-        assert_eq!(detect_provider("https://dashscope.aliyuncs.com/compatible-mode/v1"), "qwen");
+        assert_eq!(
+            detect_provider("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            "qwen"
+        );
         assert_eq!(detect_provider("https://api.dashscope.ai/v1"), "qwen");
     }
 
     #[test]
     fn model_prices_qwq_series() {
-        assert_eq!(model_prices("qwq-plus"),           (0.20, 0.60));
-        assert_eq!(model_prices("qwq-32b"),            (0.20, 0.60));
-        assert_eq!(model_prices("qwq-32b-preview"),    (1.60, 6.40));
+        assert_eq!(model_prices("qwq-plus"), (0.20, 0.60));
+        assert_eq!(model_prices("qwq-32b"), (0.20, 0.60));
+        assert_eq!(model_prices("qwq-32b-preview"), (1.60, 6.40));
     }
 
     #[test]
     fn model_prices_qwq_preview_pricier_than_qwq_plus() {
         let (i_preview, _) = model_prices("qwq-32b-preview");
-        let (i_plus, _)    = model_prices("qwq-plus");
+        let (i_plus, _) = model_prices("qwq-plus");
         assert!(i_preview > i_plus);
     }
 
@@ -1938,29 +2061,29 @@ mod tests {
 
     #[test]
     fn model_prices_qwen3_max_correct() {
-        assert_eq!(model_prices("qwen3-max"),                    (1.20, 6.00));
-        assert_eq!(model_prices("qwen3-max-2025-09-23"),         (1.20, 6.00));
+        assert_eq!(model_prices("qwen3-max"), (1.20, 6.00));
+        assert_eq!(model_prices("qwen3-max-2025-09-23"), (1.20, 6.00));
         // OpenRouter format: qwen/qwen3-max
-        assert_eq!(model_prices("qwen/qwen3-max"),               (1.20, 6.00));
+        assert_eq!(model_prices("qwen/qwen3-max"), (1.20, 6.00));
     }
 
     #[test]
     fn model_prices_qwen35_plus() {
-        assert_eq!(model_prices("qwen3.5-plus"),                 (0.90, 3.60));
-        assert_eq!(model_prices("qwen3.5-plus-2026-02-15"),      (0.90, 3.60));
+        assert_eq!(model_prices("qwen3.5-plus"), (0.90, 3.60));
+        assert_eq!(model_prices("qwen3.5-plus-2026-02-15"), (0.90, 3.60));
     }
 
     #[test]
     fn model_prices_qwen25_72b() {
-        assert_eq!(model_prices("qwen2.5-72b-instruct"),         (0.15, 0.40));
-        assert_eq!(model_prices("qwen/qwen2.5-72b-instruct"),    (0.15, 0.40));
+        assert_eq!(model_prices("qwen2.5-72b-instruct"), (0.15, 0.40));
+        assert_eq!(model_prices("qwen/qwen2.5-72b-instruct"), (0.15, 0.40));
     }
 
     #[test]
     fn model_prices_qwen_generic_ladder() {
-        let (i_max, _)    = model_prices("qwen-max");
-        let (i_plus, _)   = model_prices("qwen-plus");
-        let (i_turbo, _)  = model_prices("qwen-turbo");
+        let (i_max, _) = model_prices("qwen-max");
+        let (i_plus, _) = model_prices("qwen-plus");
+        let (i_turbo, _) = model_prices("qwen-turbo");
         assert!(i_max > i_plus && i_plus > i_turbo);
     }
 
@@ -1976,27 +2099,45 @@ mod tests {
     #[test]
     fn model_prices_bedrock_llama4_ids() {
         // Bedrock: us.meta.llama4-maverick-17b-instruct-v1:0
-        assert_eq!(model_prices("us.meta.llama4-maverick-17b-instruct-v1:0"), (0.24, 0.77));
-        assert_eq!(model_prices("us.meta.llama4-scout-17b-instruct-v1:0"),    (0.20, 0.60));
+        assert_eq!(
+            model_prices("us.meta.llama4-maverick-17b-instruct-v1:0"),
+            (0.24, 0.77)
+        );
+        assert_eq!(
+            model_prices("us.meta.llama4-scout-17b-instruct-v1:0"),
+            (0.20, 0.60)
+        );
     }
 
     #[test]
     fn model_prices_bedrock_llama31_ids() {
         // Bedrock: meta.llama3-1-70b-instruct-v1:0
-        assert_eq!(model_prices("meta.llama3-1-70b-instruct-v1:0"),  (0.52, 0.75));
-        assert_eq!(model_prices("meta.llama3-1-8b-instruct-v1:0"),   (0.18, 0.18));
-        assert_eq!(model_prices("meta.llama3-1-405b-instruct-v1:0"), (3.00, 3.00));
+        assert_eq!(
+            model_prices("meta.llama3-1-70b-instruct-v1:0"),
+            (0.52, 0.75)
+        );
+        assert_eq!(model_prices("meta.llama3-1-8b-instruct-v1:0"), (0.18, 0.18));
+        assert_eq!(
+            model_prices("meta.llama3-1-405b-instruct-v1:0"),
+            (3.00, 3.00)
+        );
     }
 
     #[test]
     fn model_prices_bedrock_llama33_id() {
-        assert_eq!(model_prices("meta.llama3-3-70b-instruct-v1:0"), (0.59, 0.79));
+        assert_eq!(
+            model_prices("meta.llama3-3-70b-instruct-v1:0"),
+            (0.59, 0.79)
+        );
     }
 
     #[test]
     fn model_prices_bedrock_llama32_ids() {
-        assert_eq!(model_prices("meta.llama3-2-11b-instruct-v1:0"), (0.18, 0.18));
-        assert_eq!(model_prices("meta.llama3-2-1b-instruct-v1:0"),  (0.04, 0.04));
+        assert_eq!(
+            model_prices("meta.llama3-2-11b-instruct-v1:0"),
+            (0.18, 0.18)
+        );
+        assert_eq!(model_prices("meta.llama3-2-1b-instruct-v1:0"), (0.04, 0.04));
     }
 
     // -------------------------------------------------------------------------
@@ -2017,14 +2158,21 @@ mod tests {
     fn prompt_hash_extracted_from_anthropic_system() {
         let body = r#"{"model":"claude-3-5-sonnet-20241022","system":"You are a senior software engineer","messages":[]}"#;
         let hash = extract_prompt_hash(body);
-        assert!(hash.is_some(), "should extract hash from Anthropic system field");
+        assert!(
+            hash.is_some(),
+            "should extract hash from Anthropic system field"
+        );
         assert_eq!(hash.as_deref().unwrap().len(), 16);
     }
 
     #[test]
     fn prompt_hash_none_for_no_system_prompt() {
         let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
-        assert_eq!(extract_prompt_hash(body), None, "no system prompt → no hash");
+        assert_eq!(
+            extract_prompt_hash(body),
+            None,
+            "no system prompt → no hash"
+        );
     }
 
     #[test]
@@ -2040,18 +2188,33 @@ mod tests {
 
     #[test]
     fn default_upstream_anthropic() {
-        assert_eq!(default_upstream_for_provider("anthropic"), "https://api.anthropic.com");
+        assert_eq!(
+            default_upstream_for_provider("anthropic"),
+            "https://api.anthropic.com"
+        );
     }
 
     #[test]
     fn default_upstream_google() {
-        assert_eq!(default_upstream_for_provider("google"), "https://generativelanguage.googleapis.com");
+        assert_eq!(
+            default_upstream_for_provider("google"),
+            "https://generativelanguage.googleapis.com"
+        );
     }
 
     #[test]
     fn default_upstream_unknown_falls_back_to_openai() {
-        assert_eq!(default_upstream_for_provider("openai"), "https://api.openai.com");
-        assert_eq!(default_upstream_for_provider("groq"), "https://api.openai.com");
-        assert_eq!(default_upstream_for_provider("unknown"), "https://api.openai.com");
+        assert_eq!(
+            default_upstream_for_provider("openai"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            default_upstream_for_provider("groq"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            default_upstream_for_provider("unknown"),
+            "https://api.openai.com"
+        );
     }
 }

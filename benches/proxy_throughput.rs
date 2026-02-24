@@ -82,11 +82,30 @@ fn openai_sse_chunks() -> Vec<Bytes> {
 fn openai_sse_content_chunks() -> Vec<Bytes> {
     // We generate 18 content-carrying chunks plus a usage chunk and a [DONE].
     let words = [
-        "The", " Rust", " ownership", " system", " enforces", " strict",
-        " compile-time", " guarantees", " that", " prevent", " data", " races",
-        " and", " dangling", " pointers,", " making", " it", " ideal",
+        "The",
+        " Rust",
+        " ownership",
+        " system",
+        " enforces",
+        " strict",
+        " compile-time",
+        " guarantees",
+        " that",
+        " prevent",
+        " data",
+        " races",
+        " and",
+        " dangling",
+        " pointers,",
+        " making",
+        " it",
+        " ideal",
     ];
-    assert_eq!(words.len(), 18, "must be exactly 18 content words for 20 chunks total");
+    assert_eq!(
+        words.len(),
+        18,
+        "must be exactly 18 content words for 20 chunks total"
+    );
 
     let mut chunks: Vec<Bytes> = words
         .iter()
@@ -247,7 +266,12 @@ fn bench_store_query_filtered(c: &mut Criterion) {
         r.model = model.to_string();
         r.status_code = status;
         // Spread timestamps so ordering is realistic.
-        r.timestamp = format!("2026-02-22T{:02}:{:02}:{:02}.000Z", (i / 3600) % 24, (i / 60) % 60, i % 60);
+        r.timestamp = format!(
+            "2026-02-22T{:02}:{:02}:{:02}.000Z",
+            (i / 3600) % 24,
+            (i / 60) % 60,
+            i % 60
+        );
         store.insert(&r).expect("insert failed during setup");
     }
 

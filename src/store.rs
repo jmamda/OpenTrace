@@ -30,9 +30,9 @@ pub struct CallRecord {
 pub struct EvalStats {
     pub total_calls: i64,
     pub error_count: i64,
-    pub error_rate: f64,       // error_count / total_calls, or 0.0 if no calls
-    pub latency_p99: u64,      // milliseconds
-    pub avg_cost_usd: f64,     // average cost per call, 0.0 if no cost data
+    pub error_rate: f64,   // error_count / total_calls, or 0.0 if no calls
+    pub latency_p99: u64,  // milliseconds
+    pub avg_cost_usd: f64, // average cost per call, 0.0 if no cost data
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,9 +94,9 @@ pub struct EndpointStats {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenPercentiles {
-    pub input_p50:  u64,
-    pub input_p95:  u64,
-    pub input_p99:  u64,
+    pub input_p50: u64,
+    pub input_p95: u64,
+    pub input_p99: u64,
     pub output_p50: u64,
     pub output_p95: u64,
     pub output_p99: u64,
@@ -226,9 +226,11 @@ impl Store {
     /// This avoids touching the filesystem and keeps every test isolated.
     #[allow(dead_code)]
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .context("failed to open in-memory DB")?;
-        let store = Self { conn, path: PathBuf::from(":memory:") };
+        let conn = Connection::open_in_memory().context("failed to open in-memory DB")?;
+        let store = Self {
+            conn,
+            path: PathBuf::from(":memory:"),
+        };
         store.init()?;
         Ok(store)
     }
@@ -237,12 +239,14 @@ impl Store {
     /// Intended for integration tests that need a real file DB in a temp dir.
     pub fn open_at(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("failed to create parent directory for DB")?;
+            std::fs::create_dir_all(parent).context("failed to create parent directory for DB")?;
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open DB at {}", path.display()))?;
-        let store = Self { conn, path: path.to_path_buf() };
+        let store = Self {
+            conn,
+            path: path.to_path_buf(),
+        };
         store.init()?;
         Ok(store)
     }
@@ -250,8 +254,7 @@ impl Store {
     pub fn open() -> Result<Self> {
         let db_path = db_path()?;
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("failed to create .trace directory")?;
+            std::fs::create_dir_all(parent).context("failed to create .trace directory")?;
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open DB at {}", db_path.display()))?;
@@ -264,13 +267,17 @@ impl Store {
             let _ = std::fs::set_permissions(&db_path, perms);
         }
 
-        let store = Self { conn, path: db_path };
+        let store = Self {
+            conn,
+            path: db_path,
+        };
         store.init()?;
         Ok(store)
     }
 
     fn init(&self) -> Result<()> {
-        self.conn.execute_batch("
+        self.conn.execute_batch(
+            "
             PRAGMA busy_timeout = 5000;
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
@@ -346,7 +353,8 @@ impl Store {
                     VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
                             new.request_body, new.response_body, new.error);
                 END;
-        ")?;
+        ",
+        )?;
 
         // Migrate existing databases that predate ttft_ms / provider_request_id.
         // ALTER TABLE ADD COLUMN fails with "duplicate column name" if the column
@@ -394,11 +402,24 @@ impl Store {
                 provider_request_id, trace_id, parent_id, prompt_hash
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
-                r.id, r.timestamp, r.provider, r.model, r.endpoint,
-                r.status_code, r.latency_ms, r.ttft_ms.map(|v| v as i64),
-                r.input_tokens, r.output_tokens,
-                r.cost_usd, r.request_body, r.response_body, r.error,
-                r.provider_request_id, r.trace_id, r.parent_id, r.prompt_hash,
+                r.id,
+                r.timestamp,
+                r.provider,
+                r.model,
+                r.endpoint,
+                r.status_code,
+                r.latency_ms,
+                r.ttft_ms.map(|v| v as i64),
+                r.input_tokens,
+                r.output_tokens,
+                r.cost_usd,
+                r.request_body,
+                r.response_body,
+                r.error,
+                r.provider_request_id,
+                r.trace_id,
+                r.parent_id,
+                r.prompt_hash,
             ],
         )?;
         Ok(())
@@ -410,16 +431,21 @@ impl Store {
         let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
         // Escape SQL LIKE wildcards so a model filter of "gpt_4" matches
         // "gpt_4" literally rather than "gpt-4" or "gpt14" etc.
-        let model_filter: Option<String> = filter.model.as_deref()
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
-        let provider_filter: Option<String> = filter.provider.as_deref()
+        let provider_filter: Option<String> = filter
+            .provider
+            .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         // status_code = 0 means upstream connection failure — include in --errors.
-        let sql = format!("
+        let sql = format!(
+            "
             SELECT {SELECT_COLS}
             FROM calls
             WHERE (?1 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
@@ -429,11 +455,19 @@ impl Store {
               AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
               {status_clause}
             ORDER BY timestamp DESC
-            LIMIT ?6");
+            LIMIT ?6"
+        );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![errors_only_flag, model_filter, since, until, provider_filter, limit_i64],
+            params![
+                errors_only_flag,
+                model_filter,
+                since,
+                until,
+                provider_filter,
+                limit_i64
+            ],
             row_to_record,
         )?;
 
@@ -448,15 +482,20 @@ impl Store {
     /// Intended for `trace export` where the caller streams results to stdout.
     pub fn query_all_filtered(&self, filter: &QueryFilter) -> Result<Vec<CallRecord>> {
         let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
-        let model_filter: Option<String> = filter.model.as_deref()
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
-        let provider_filter: Option<String> = filter.provider.as_deref()
+        let provider_filter: Option<String> = filter
+            .provider
+            .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
-        let sql = format!("
+        let sql = format!(
+            "
             SELECT {SELECT_COLS}
             FROM calls
             WHERE (?1 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
@@ -465,11 +504,18 @@ impl Store {
               AND (?4 IS NULL OR timestamp <= ?4)
               AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
               {status_clause}
-            ORDER BY timestamp ASC");
+            ORDER BY timestamp ASC"
+        );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![errors_only_flag, model_filter, since, until, provider_filter],
+            params![
+                errors_only_flag,
+                model_filter,
+                since,
+                until,
+                provider_filter
+            ],
             row_to_record,
         )?;
 
@@ -508,7 +554,11 @@ impl Store {
             let record = row_to_record(row)?;
             let rank: f64 = row.get(18)?;
             let snippet: String = row.get(19).unwrap_or_default();
-            Ok(SearchResult { record, rank, snippet })
+            Ok(SearchResult {
+                record,
+                rank,
+                snippet,
+            })
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -521,7 +571,9 @@ impl Store {
     /// Returns (0.0, 0.0, 0.0) when the database is empty.
     pub fn latency_percentiles(&self, filter: &QueryFilter) -> Result<(f64, f64, f64)> {
         let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
-        let model_filter: Option<String> = filter.model.as_deref()
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
         let since = filter.since.clone();
         let until = filter.until.clone();
@@ -536,9 +588,10 @@ impl Store {
 
         let mut stmt = self.conn.prepare(sql)?;
         let latencies: Vec<u64> = stmt
-            .query_map(params![errors_only_flag, model_filter, since, until], |row| {
-                row.get::<_, i64>(0).map(|v| v as u64)
-            })?
+            .query_map(
+                params![errors_only_flag, model_filter, since, until],
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
+            )?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -608,13 +661,18 @@ impl Store {
     ) -> Result<Vec<CallRecord>> {
         let limit_i64 = limit.min(10_000) as i64;
         let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
-        let model_filter: Option<String> = filter.model.as_deref()
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
-        let provider_filter: Option<String> = filter.provider.as_deref()
+        let provider_filter: Option<String> = filter
+            .provider
+            .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
-        let sql = format!("
+        let sql = format!(
+            "
             SELECT {SELECT_COLS}
             FROM calls
             WHERE timestamp > ?1
@@ -623,11 +681,18 @@ impl Store {
               AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\')
               {status_clause}
             ORDER BY timestamp ASC
-            LIMIT ?5");
+            LIMIT ?5"
+        );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![after_ts, errors_only_flag, model_filter, provider_filter, limit_i64],
+            params![
+                after_ts,
+                errors_only_flag,
+                model_filter,
+                provider_filter,
+                limit_i64
+            ],
             row_to_record,
         )?;
 
@@ -670,21 +735,37 @@ impl Store {
     }
 
     pub fn stats(&self) -> Result<Stats> {
-        let total_calls: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM calls", [], |r| r.get(0))?;
+        let total_calls: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM calls", [], |r| r.get(0))?;
         let total_input_tokens: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(input_tokens), 0) FROM calls", [], |r| r.get(0))?;
+            "SELECT COALESCE(SUM(input_tokens), 0) FROM calls",
+            [],
+            |r| r.get(0),
+        )?;
         let total_output_tokens: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(output_tokens), 0) FROM calls", [], |r| r.get(0))?;
-        let total_cost_usd: f64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM calls", [], |r| r.get(0))?;
+            "SELECT COALESCE(SUM(output_tokens), 0) FROM calls",
+            [],
+            |r| r.get(0),
+        )?;
+        let total_cost_usd: f64 =
+            self.conn
+                .query_row("SELECT COALESCE(SUM(cost_usd), 0.0) FROM calls", [], |r| {
+                    r.get(0)
+                })?;
         let avg_latency_ms: f64 = self.conn.query_row(
-            "SELECT COALESCE(AVG(latency_ms), 0.0) FROM calls", [], |r| r.get(0))?;
+            "SELECT COALESCE(AVG(latency_ms), 0.0) FROM calls",
+            [],
+            |r| r.get(0),
+        )?;
         let error_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM calls WHERE error IS NOT NULL OR status_code >= 400 OR status_code = 0",
             [], |r| r.get(0))?;
         let calls_last_hour: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM calls WHERE timestamp >= datetime('now', '-1 hour')", [], |r| r.get(0))?;
+            "SELECT COUNT(*) FROM calls WHERE timestamp >= datetime('now', '-1 hour')",
+            [],
+            |r| r.get(0),
+        )?;
 
         Ok(Stats {
             total_calls,
@@ -837,8 +918,9 @@ impl Store {
     }
 
     pub fn total_calls(&self) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM calls", [], |r| r.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM calls", [], |r| r.get(0))?;
         Ok(count)
     }
 
@@ -874,8 +956,12 @@ impl Store {
 
         if rows.is_empty() {
             return Ok(TokenPercentiles {
-                input_p50: 0, input_p95: 0, input_p99: 0,
-                output_p50: 0, output_p95: 0, output_p99: 0,
+                input_p50: 0,
+                input_p95: 0,
+                input_p99: 0,
+                output_p50: 0,
+                output_p95: 0,
+                output_p99: 0,
             });
         }
 
@@ -888,9 +974,9 @@ impl Store {
         let pct = |v: &[u64], p: usize| v[(n * p / 100).min(n - 1)];
 
         Ok(TokenPercentiles {
-            input_p50:  pct(&inputs,  50),
-            input_p95:  pct(&inputs,  95),
-            input_p99:  pct(&inputs,  99),
+            input_p50: pct(&inputs, 50),
+            input_p95: pct(&inputs, 95),
+            input_p99: pct(&inputs, 99),
             output_p50: pct(&outputs, 50),
             output_p95: pct(&outputs, 95),
             output_p99: pct(&outputs, 99),
@@ -900,9 +986,8 @@ impl Store {
     /// Return all calls that share the same trace_id, ordered by timestamp.
     /// Used by `trace show --tree` to render the full call chain.
     pub fn query_trace_tree(&self, trace_id: &str) -> Result<Vec<CallRecord>> {
-        let sql = format!(
-            "SELECT {SELECT_COLS} FROM calls WHERE trace_id = ?1 ORDER BY timestamp ASC"
-        );
+        let sql =
+            format!("SELECT {SELECT_COLS} FROM calls WHERE trace_id = ?1 ORDER BY timestamp ASC");
         let mut stmt = self.conn.prepare(&sql)?;
         let records = stmt
             .query_map(params![trace_id], row_to_record)?
@@ -916,7 +1001,9 @@ impl Store {
     pub fn eval_stats(&self, filter: &QueryFilter) -> Result<EvalStats> {
         // Escape SQL LIKE wildcards in the model filter, matching the pattern
         // used by query_filtered and query_all_filtered.
-        let model_filter: Option<String> = filter.model.as_deref()
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
@@ -924,7 +1011,9 @@ impl Store {
         // build_status_clause produces only u16 integer literals — no injection risk.
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
-        let provider_filter: Option<String> = filter.provider.as_deref()
+        let provider_filter: Option<String> = filter
+            .provider
+            .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
 
         // Aggregate query for counts and avg cost.
@@ -943,10 +1032,11 @@ impl Store {
                AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\') \
                {status_clause}"
         );
-        let (total_calls, error_count, avg_cost_usd): (i64, i64, f64) =
-            self.conn.query_row(&agg_sql, params![model_filter, since, until, provider_filter], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+        let (total_calls, error_count, avg_cost_usd): (i64, i64, f64) = self.conn.query_row(
+            &agg_sql,
+            params![model_filter, since, until, provider_filter],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
 
         let error_rate = if total_calls > 0 {
             error_count as f64 / total_calls as f64
@@ -965,7 +1055,10 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&lat_sql)?;
         let mut latencies: Vec<u64> = stmt
-            .query_map(params![model_filter, since, until, provider_filter], |row| row.get::<_, i64>(0))?
+            .query_map(
+                params![model_filter, since, until, provider_filter],
+                |row| row.get::<_, i64>(0),
+            )?
             .filter_map(|r| r.ok())
             .map(|v| v as u64)
             .collect();
@@ -997,9 +1090,16 @@ impl Store {
         let models = [model_a, model_b];
         let mut out: Vec<ModelComparison> = Vec::with_capacity(2);
         for model in &models {
-            let (calls, avg_cost_usd, total_cost_usd, avg_latency_ms, avg_input_tokens, avg_output_tokens, error_count): (i64, f64, f64, f64, f64, f64, i64) =
-                self.conn.query_row(
-                    "SELECT COUNT(*),
+            let (
+                calls,
+                avg_cost_usd,
+                total_cost_usd,
+                avg_latency_ms,
+                avg_input_tokens,
+                avg_output_tokens,
+                error_count,
+            ): (i64, f64, f64, f64, f64, f64, i64) = self.conn.query_row(
+                "SELECT COUNT(*),
                             COALESCE(AVG(cost_usd), 0.0),
                             COALESCE(SUM(cost_usd), 0.0),
                             COALESCE(AVG(latency_ms), 0.0),
@@ -1010,11 +1110,25 @@ impl Store {
                      WHERE model = ?1
                        AND (?2 IS NULL OR timestamp >= ?2)
                        AND (?3 IS NULL OR timestamp <= ?3)",
-                    params![model, since, until],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-                )?;
+                params![model, since, until],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?;
 
-            let error_rate = if calls > 0 { error_count as f64 / calls as f64 } else { 0.0 };
+            let error_rate = if calls > 0 {
+                error_count as f64 / calls as f64
+            } else {
+                0.0
+            };
 
             // Compute p99 from sorted latency vec (same pattern as latency_percentiles).
             let mut stmt = self.conn.prepare(
@@ -1054,9 +1168,12 @@ impl Store {
         Ok((a, b))
     }
     /// List prompt fingerprints grouped by hash, with per-group stats.
-    pub fn list_prompts(&self, since: Option<&str>, model: Option<&str>) -> Result<Vec<PromptStats>> {
-        let model_filter: Option<String> = model
-            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+    pub fn list_prompts(
+        &self,
+        since: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Vec<PromptStats>> {
+        let model_filter: Option<String> = model.map(|m| m.replace('%', "\\%").replace('_', "\\_"));
 
         let sql = "
             SELECT c.prompt_hash,
@@ -1085,26 +1202,40 @@ impl Store {
             let first_seen: String = row.get(4)?;
             let last_seen: String = row.get(5)?;
             let sample_body: Option<String> = row.get(6)?;
-            Ok((hash, call_count, avg_cost_usd, avg_latency_ms, first_seen, last_seen, sample_body))
+            Ok((
+                hash,
+                call_count,
+                avg_cost_usd,
+                avg_latency_ms,
+                first_seen,
+                last_seen,
+                sample_body,
+            ))
         })?;
 
         let mut results = Vec::new();
         for row in rows {
-            let (hash, call_count, avg_cost_usd, avg_latency_ms, first_seen, last_seen, sample_body) = row?;
+            let (
+                hash,
+                call_count,
+                avg_cost_usd,
+                avg_latency_ms,
+                first_seen,
+                last_seen,
+                sample_body,
+            ) = row?;
             let preview = sample_body
                 .as_deref()
                 .and_then(|body| {
                     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-                    let text = v.get("system")
-                        .and_then(|s| s.as_str())
-                        .or_else(|| {
-                            v.get("messages")?
-                                .as_array()?
-                                .iter()
-                                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
-                                .get("content")?
-                                .as_str()
-                        })?;
+                    let text = v.get("system").and_then(|s| s.as_str()).or_else(|| {
+                        v.get("messages")?
+                            .as_array()?
+                            .iter()
+                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))?
+                            .get("content")?
+                            .as_str()
+                    })?;
                     let trimmed = text.trim();
                     if trimmed.is_empty() {
                         return None;
@@ -1136,7 +1267,9 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let Some(body) = body else { return Ok(None); };
+        let Some(body) = body else {
+            return Ok(None);
+        };
         let v: serde_json::Value = match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -1156,13 +1289,14 @@ impl Store {
         Ok(text)
     }
 
-        /// Flush the WAL to the main database file and defragment.
+    /// Flush the WAL to the main database file and defragment.
     /// Returns `(bytes_before, bytes_after)` from the filesystem.
     pub fn vacuum(&self) -> Result<(u64, u64)> {
         let before = std::fs::metadata(&self.path)
             .with_context(|| format!("cannot stat DB at {}", self.path.display()))?
             .len();
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
         let after = std::fs::metadata(&self.path)
             .with_context(|| format!("cannot stat DB at {}", self.path.display()))?
             .len();
@@ -1321,7 +1455,9 @@ mod tests {
     fn insert_multiple_records_query_returns_all() {
         let store = Store::open_in_memory().unwrap();
         for i in 0..5u32 {
-            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
         let results = store.query_filtered(100, &QueryFilter::default()).unwrap();
         assert_eq!(results.len(), 5);
@@ -1337,9 +1473,15 @@ mod tests {
         store.insert(&make_record("ok-1", "gpt-4o", 200)).unwrap();
         store.insert(&make_record("ok-2", "gpt-4o", 201)).unwrap();
 
-        let filter = QueryFilter { errors_only: true, ..Default::default() };
+        let filter = QueryFilter {
+            errors_only: true,
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
-        assert!(results.is_empty(), "no errors should be returned for 2xx calls");
+        assert!(
+            results.is_empty(),
+            "no errors should be returned for 2xx calls"
+        );
     }
 
     #[test]
@@ -1348,7 +1490,10 @@ mod tests {
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
         store.insert(&make_record("bad", "gpt-4o", 400)).unwrap();
 
-        let filter = QueryFilter { errors_only: true, ..Default::default() };
+        let filter = QueryFilter {
+            errors_only: true,
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "bad");
@@ -1360,7 +1505,10 @@ mod tests {
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
         store.insert(&make_record("err", "gpt-4o", 500)).unwrap();
 
-        let filter = QueryFilter { errors_only: true, ..Default::default() };
+        let filter = QueryFilter {
+            errors_only: true,
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "err");
@@ -1376,7 +1524,10 @@ mod tests {
         store.insert(&r).unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
 
-        let filter = QueryFilter { errors_only: true, ..Default::default() };
+        let filter = QueryFilter {
+            errors_only: true,
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "conn-fail");
@@ -1391,7 +1542,10 @@ mod tests {
         store.insert(&r).unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
 
-        let filter = QueryFilter { errors_only: true, ..Default::default() };
+        let filter = QueryFilter {
+            errors_only: true,
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "warn");
@@ -1405,7 +1559,9 @@ mod tests {
     fn query_filtered_model_exact_match() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("a", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("b", "claude-3-5-sonnet-20241022", 200)).unwrap();
+        store
+            .insert(&make_record("b", "claude-3-5-sonnet-20241022", 200))
+            .unwrap();
 
         let filter = QueryFilter {
             model: Some("gpt-4o".to_string()),
@@ -1419,9 +1575,13 @@ mod tests {
     #[test]
     fn query_filtered_model_substring_match() {
         let store = Store::open_in_memory().unwrap();
-        store.insert(&make_record("a", "gpt-4o-2024-11-20", 200)).unwrap();
+        store
+            .insert(&make_record("a", "gpt-4o-2024-11-20", 200))
+            .unwrap();
         store.insert(&make_record("b", "gpt-4o-mini", 200)).unwrap();
-        store.insert(&make_record("c", "claude-opus-4", 200)).unwrap();
+        store
+            .insert(&make_record("c", "claude-opus-4", 200))
+            .unwrap();
 
         // "gpt-4o" is a substring of both gpt-4o-... records.
         let filter = QueryFilter {
@@ -1452,7 +1612,9 @@ mod tests {
     fn query_filtered_no_model_filter_returns_all() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("a", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("b", "claude-opus-4", 200)).unwrap();
+        store
+            .insert(&make_record("b", "claude-opus-4", 200))
+            .unwrap();
 
         let filter = QueryFilter::default();
         let results = store.query_filtered(100, &filter).unwrap();
@@ -1467,7 +1629,9 @@ mod tests {
     fn query_filtered_limit_respected() {
         let store = Store::open_in_memory().unwrap();
         for i in 0..10u32 {
-            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
         let results = store.query_filtered(3, &QueryFilter::default()).unwrap();
         assert_eq!(results.len(), 3);
@@ -1480,8 +1644,20 @@ mod tests {
     #[test]
     fn get_by_id_returns_correct_record() {
         let store = Store::open_in_memory().unwrap();
-        store.insert(&make_record("aabbccdd-1111-2222-3333-444455556666", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("bbcc0000-0000-0000-0000-000000000000", "claude", 200)).unwrap();
+        store
+            .insert(&make_record(
+                "aabbccdd-1111-2222-3333-444455556666",
+                "gpt-4o",
+                200,
+            ))
+            .unwrap();
+        store
+            .insert(&make_record(
+                "bbcc0000-0000-0000-0000-000000000000",
+                "claude",
+                200,
+            ))
+            .unwrap();
 
         let result = store.get_by_id("aabbccdd").unwrap();
         assert!(result.is_some());
@@ -1512,7 +1688,9 @@ mod tests {
         store.insert(&make_record("new-id", "gpt-4o", 200)).unwrap();
 
         let filter = QueryFilter::default();
-        let results = store.query_after("2020-06-01T00:00:00.000Z", &filter, 100).unwrap();
+        let results = store
+            .query_after("2020-06-01T00:00:00.000Z", &filter, 100)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "new-id");
     }
@@ -1524,7 +1702,9 @@ mod tests {
 
         let filter = QueryFilter::default();
         // After a far-future timestamp — nothing should match.
-        let results = store.query_after("9999-01-01T00:00:00.000Z", &filter, 100).unwrap();
+        let results = store
+            .query_after("9999-01-01T00:00:00.000Z", &filter, 100)
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1616,7 +1796,9 @@ mod tests {
     fn stats_error_count_includes_status_400_and_status_0() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("bad-req", "gpt-4o", 400)).unwrap();
+        store
+            .insert(&make_record("bad-req", "gpt-4o", 400))
+            .unwrap();
         // status 0 = connection failure
         let mut r = make_record("conn-fail", "gpt-4o", 0);
         r.error = Some("timeout".to_string());
@@ -1648,10 +1830,16 @@ mod tests {
         let endpoint_stats = store.stats_by_endpoint().unwrap();
         assert_eq!(endpoint_stats.len(), 2);
 
-        let chat = endpoint_stats.iter().find(|e| e.endpoint == "/v1/chat/completions").unwrap();
+        let chat = endpoint_stats
+            .iter()
+            .find(|e| e.endpoint == "/v1/chat/completions")
+            .unwrap();
         assert_eq!(chat.calls, 1);
 
-        let emb = endpoint_stats.iter().find(|e| e.endpoint == "/v1/embeddings").unwrap();
+        let emb = endpoint_stats
+            .iter()
+            .find(|e| e.endpoint == "/v1/embeddings")
+            .unwrap();
         assert_eq!(emb.calls, 1);
     }
 
@@ -1670,7 +1858,9 @@ mod tests {
     fn clear_removes_all_records_and_returns_count() {
         let store = Store::open_in_memory().unwrap();
         for i in 0..5u32 {
-            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
 
         let deleted = store.clear().unwrap();
@@ -1710,7 +1900,9 @@ mod tests {
     fn query_all_filtered_returns_all_without_limit() {
         let store = Store::open_in_memory().unwrap();
         for i in 0..15u32 {
-            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
         // query_filtered with limit=10 would only return 10; query_all_filtered returns all.
         let all = store.query_all_filtered(&QueryFilter::default()).unwrap();
@@ -1721,12 +1913,19 @@ mod tests {
     fn query_all_filtered_model_filter_applied() {
         let store = Store::open_in_memory().unwrap();
         for i in 0..5u32 {
-            store.insert(&make_record(&format!("gpt-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("gpt-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
         for i in 0..3u32 {
-            store.insert(&make_record(&format!("cl-{i}"), "claude-opus-4", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("cl-{i}"), "claude-opus-4", 200))
+                .unwrap();
         }
-        let filter = QueryFilter { model: Some("gpt".to_string()), ..Default::default() };
+        let filter = QueryFilter {
+            model: Some("gpt".to_string()),
+            ..Default::default()
+        };
         let results = store.query_all_filtered(&filter).unwrap();
         assert_eq!(results.len(), 5);
         assert!(results.iter().all(|r| r.model == "gpt-4o"));
@@ -1812,7 +2011,10 @@ mod tests {
 
         let map = store.latency_percentiles_per_model().unwrap();
         assert!(map.contains_key("gpt-4o"), "gpt-4o should have percentiles");
-        assert!(map.contains_key("claude-opus-4"), "claude-opus-4 should have percentiles");
+        assert!(
+            map.contains_key("claude-opus-4"),
+            "claude-opus-4 should have percentiles"
+        );
 
         // gpt-4o p99 (10 records: 100..1000ms): index 10*99/100 = 9 → latencies[9] = 1000ms
         let (_, _, gpt_p99) = map["gpt-4o"];
@@ -1833,7 +2035,9 @@ mod tests {
         assert_eq!(store.total_calls().unwrap(), 0);
 
         for i in 0..7u32 {
-            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
         assert_eq!(store.total_calls().unwrap(), 7);
     }
@@ -1924,7 +2128,9 @@ mod tests {
     fn stats_by_model_error_count_per_model() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
-        store.insert(&make_error_record("bad", "gpt-4o", 500, "err")).unwrap();
+        store
+            .insert(&make_error_record("bad", "gpt-4o", 500, "err"))
+            .unwrap();
 
         let model_stats = store.stats_by_model().unwrap();
         assert_eq!(model_stats.len(), 1);
@@ -1943,7 +2149,10 @@ mod tests {
         r.error = Some("too many requests".to_string());
         store.insert(&r).unwrap();
 
-        let filter = QueryFilter { status: Some(429), ..Default::default() };
+        let filter = QueryFilter {
+            status: Some(429),
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "rate-limited");
@@ -1953,10 +2162,17 @@ mod tests {
     fn status_filter_range() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("not-found", "gpt-4o", 404)).unwrap();
-        store.insert(&make_record("server-err", "gpt-4o", 500)).unwrap();
+        store
+            .insert(&make_record("not-found", "gpt-4o", 404))
+            .unwrap();
+        store
+            .insert(&make_record("server-err", "gpt-4o", 500))
+            .unwrap();
 
-        let filter = QueryFilter { status_range: Some((400, 499)), ..Default::default() };
+        let filter = QueryFilter {
+            status_range: Some((400, 499)),
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "not-found");
@@ -1967,7 +2183,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
 
-        let filter = QueryFilter { status: Some(429), ..Default::default() };
+        let filter = QueryFilter {
+            status: Some(429),
+            ..Default::default()
+        };
         let results = store.query_filtered(100, &filter).unwrap();
         assert!(results.is_empty());
     }
@@ -1976,10 +2195,17 @@ mod tests {
     fn status_filter_query_all_filtered() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("ok", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("not-found", "gpt-4o", 404)).unwrap();
-        store.insert(&make_record("server-err", "gpt-4o", 500)).unwrap();
+        store
+            .insert(&make_record("not-found", "gpt-4o", 404))
+            .unwrap();
+        store
+            .insert(&make_record("server-err", "gpt-4o", 500))
+            .unwrap();
 
-        let filter = QueryFilter { status_range: Some((400, 599)), ..Default::default() };
+        let filter = QueryFilter {
+            status_range: Some((400, 599)),
+            ..Default::default()
+        };
         let results = store.query_all_filtered(&filter).unwrap();
         assert_eq!(results.len(), 2);
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
@@ -2002,8 +2228,13 @@ mod tests {
         new_ok.timestamp = "2025-01-02T00:00:00.000Z".to_string();
         store.insert(&new_ok).unwrap();
 
-        let filter = QueryFilter { status: Some(500), ..Default::default() };
-        let results = store.query_after("2024-01-01T00:00:00.000Z", &filter, 100).unwrap();
+        let filter = QueryFilter {
+            status: Some(500),
+            ..Default::default()
+        };
+        let results = store
+            .query_after("2024-01-01T00:00:00.000Z", &filter, 100)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "new-500");
     }
@@ -2084,14 +2315,21 @@ mod tests {
         // Insert 100 records then flush the WAL into the main file
         // via a first vacuum so that the pre-clear baseline is accurate.
         for i in 0..100u32 {
-            store.insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
         let _ = store.vacuum().expect("first vacuum to flush WAL");
 
         // Delete all records and vacuum — main file must not grow.
         store.clear().unwrap();
         let (before, after) = store.vacuum().expect("second vacuum");
-        assert!(after <= before, "after vacuum DB should not grow (before={} after={})", before, after);
+        assert!(
+            after <= before,
+            "after vacuum DB should not grow (before={} after={})",
+            before,
+            after
+        );
 
         let _ = std::fs::remove_file(&db_path);
     }
@@ -2130,7 +2368,9 @@ mod tests {
 
         let tree = store.query_trace_tree("trace-abc").unwrap();
         assert_eq!(tree.len(), 2);
-        assert!(tree.iter().all(|r| r.trace_id.as_deref() == Some("trace-abc")));
+        assert!(tree
+            .iter()
+            .all(|r| r.trace_id.as_deref() == Some("trace-abc")));
     }
 
     #[test]
@@ -2149,7 +2389,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("e1", "gpt-4o", 200)).unwrap();
         store.insert(&make_record("e2", "gpt-4o", 200)).unwrap();
-        store.insert(&make_error_record("e3", "gpt-4o", 500, "server error")).unwrap();
+        store
+            .insert(&make_error_record("e3", "gpt-4o", 500, "server error"))
+            .unwrap();
         let stats = store.eval_stats(&QueryFilter::default()).unwrap();
         assert_eq!(stats.total_calls, 3);
         assert_eq!(stats.error_count, 1);
@@ -2169,8 +2411,13 @@ mod tests {
     fn eval_stats_model_filter() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("m1", "gpt-4o", 200)).unwrap();
-        store.insert(&make_record("m2", "claude-3-opus", 200)).unwrap();
-        let filter = QueryFilter { model: Some("gpt-4o".to_string()), ..Default::default() };
+        store
+            .insert(&make_record("m2", "claude-3-opus", 200))
+            .unwrap();
+        let filter = QueryFilter {
+            model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
         let stats = store.eval_stats(&filter).unwrap();
         assert_eq!(stats.total_calls, 1);
     }
@@ -2205,7 +2452,9 @@ mod tests {
         r3.output_tokens = Some(280);
         store.insert(&r3).unwrap();
 
-        let (a, b) = store.compare_models("gpt-4o", "claude-3-5-sonnet", None, None).unwrap();
+        let (a, b) = store
+            .compare_models("gpt-4o", "claude-3-5-sonnet", None, None)
+            .unwrap();
         assert_eq!(a.model, "gpt-4o");
         assert_eq!(a.calls, 2);
         assert!((a.total_cost_usd - 0.006).abs() < 1e-9);
@@ -2219,7 +2468,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("only-a", "gpt-4o", 200)).unwrap();
 
-        let (a, b) = store.compare_models("gpt-4o", "nonexistent-model", None, None).unwrap();
+        let (a, b) = store
+            .compare_models("gpt-4o", "nonexistent-model", None, None)
+            .unwrap();
         assert_eq!(a.calls, 1);
         assert_eq!(b.calls, 0);
         assert_eq!(b.latency_p99, 0);
@@ -2243,9 +2494,15 @@ mod tests {
         let body_a = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a helpful assistant"}]}"#;
         let body_b = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a senior engineer"}]}"#;
 
-        store.insert(&make_record_with_hash("p1", "gpt-4o", "hash-aaa", body_a)).unwrap();
-        store.insert(&make_record_with_hash("p2", "gpt-4o", "hash-aaa", body_a)).unwrap();
-        store.insert(&make_record_with_hash("p3", "gpt-4o", "hash-bbb", body_b)).unwrap();
+        store
+            .insert(&make_record_with_hash("p1", "gpt-4o", "hash-aaa", body_a))
+            .unwrap();
+        store
+            .insert(&make_record_with_hash("p2", "gpt-4o", "hash-aaa", body_a))
+            .unwrap();
+        store
+            .insert(&make_record_with_hash("p3", "gpt-4o", "hash-bbb", body_b))
+            .unwrap();
         // One record without a hash - should not appear
         store.insert(&make_record("p4", "gpt-4o", 200)).unwrap();
 
@@ -2253,7 +2510,10 @@ mod tests {
         assert_eq!(prompts.len(), 2, "should have 2 distinct hashes");
         let top = prompts.iter().find(|p| p.hash == "hash-aaa").unwrap();
         assert_eq!(top.call_count, 2);
-        assert!(!top.preview.is_empty(), "preview should be extracted from request body");
+        assert!(
+            !top.preview.is_empty(),
+            "preview should be extracted from request body"
+        );
     }
 
     #[test]
@@ -2276,8 +2536,12 @@ mod tests {
     #[test]
     fn search_calls_finds_by_model() {
         let store = Store::open_in_memory().unwrap();
-        store.insert(&make_record("a", "gpt-4o-search-unique", 200)).unwrap();
-        store.insert(&make_record("b", "claude-opus-4", 200)).unwrap();
+        store
+            .insert(&make_record("a", "gpt-4o-search-unique", 200))
+            .unwrap();
+        store
+            .insert(&make_record("b", "claude-opus-4", 200))
+            .unwrap();
         let results = store.search_calls("gpt-4o-search-unique", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].record.id, "a");
@@ -2287,7 +2551,9 @@ mod tests {
     fn search_calls_returns_empty_for_no_match() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_record("a", "gpt-4o", 200)).unwrap();
-        let results = store.search_calls("nonexistent-model-xyz-99999", 10).unwrap();
+        let results = store
+            .search_calls("nonexistent-model-xyz-99999", 10)
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -2295,7 +2561,9 @@ mod tests {
     fn search_calls_finds_in_request_body() {
         let store = Store::open_in_memory().unwrap();
         let mut r = make_record("body-test", "gpt-4o", 200);
-        r.request_body = Some(r#"{"messages":[{"role":"user","content":"tell me about semaphores"}]}"#.to_string());
+        r.request_body = Some(
+            r#"{"messages":[{"role":"user","content":"tell me about semaphores"}]}"#.to_string(),
+        );
         store.insert(&r).unwrap();
         let results = store.search_calls("semaphores", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -2338,7 +2606,10 @@ mod tests {
         store.insert(&r1).unwrap();
         store.insert(&r2).unwrap();
 
-        let filter = QueryFilter { provider: Some("anthropic".to_string()), ..Default::default() };
+        let filter = QueryFilter {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
         let results = store.query_filtered(10, &filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].provider, "anthropic");
@@ -2351,7 +2622,10 @@ mod tests {
         r1.provider = "azure-openai".to_string();
         store.insert(&r1).unwrap();
 
-        let filter = QueryFilter { provider: Some("openai".to_string()), ..Default::default() };
+        let filter = QueryFilter {
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
         let results = store.query_filtered(10, &filter).unwrap();
         assert_eq!(results.len(), 1, "substring match should find azure-openai");
     }
@@ -2370,7 +2644,10 @@ mod tests {
         store.insert(&r3).unwrap();
 
         let stats = store.stats_by_provider().unwrap();
-        assert!(stats.len() >= 2, "should have at least openai and anthropic");
+        assert!(
+            stats.len() >= 2,
+            "should have at least openai and anthropic"
+        );
         let openai = stats.iter().find(|p| p.provider == "openai").unwrap();
         assert_eq!(openai.calls, 2);
     }

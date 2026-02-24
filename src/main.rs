@@ -76,7 +76,11 @@ enum Commands {
         langfuse_secret_key: Option<String>,
 
         /// Langfuse base URL for self-hosted deployments [default: https://cloud.langfuse.com].
-        #[arg(long, env = "LANGFUSE_BASEURL", default_value = "https://cloud.langfuse.com")]
+        #[arg(
+            long,
+            env = "LANGFUSE_BASEURL",
+            default_value = "https://cloud.langfuse.com"
+        )]
         langfuse_url: String,
 
         /// Forward calls to LangSmith (provide API key).
@@ -84,7 +88,11 @@ enum Commands {
         langsmith_api_key: Option<String>,
 
         /// LangSmith base endpoint [default: https://api.smith.langchain.com].
-        #[arg(long, env = "LANGCHAIN_ENDPOINT", default_value = "https://api.smith.langchain.com")]
+        #[arg(
+            long,
+            env = "LANGCHAIN_ENDPOINT",
+            default_value = "https://api.smith.langchain.com"
+        )]
         langsmith_endpoint: String,
 
         /// Forward calls to W&B Weave (provide API key; also set --weave-project).
@@ -445,50 +453,127 @@ async fn main() -> Result<()> {
     let cfg_path = config::config_path();
 
     match cli.command.unwrap_or(Commands::Stats {
-        breakdown: false, endpoint: false, provider_breakdown: false,
-        since: None, until: None, provider: None,
+        breakdown: false,
+        endpoint: false,
+        provider_breakdown: false,
+        since: None,
+        until: None,
+        provider: None,
     }) {
         Commands::Start {
-            port, upstream, bind, verbose, upstream_timeout, retention_days,
-            no_request_bodies, metrics_port, otel_endpoint,
-            langfuse_public_key, langfuse_secret_key, langfuse_url,
-            langsmith_api_key, langsmith_endpoint,
-            weave_api_key, weave_project,
-            phoenix_endpoint, phoenix_api_key,
-            redact_fields, budget_alert_usd, budget_period, route,
+            port,
+            upstream,
+            bind,
+            verbose,
+            upstream_timeout,
+            retention_days,
+            no_request_bodies,
+            metrics_port,
+            otel_endpoint,
+            langfuse_public_key,
+            langfuse_secret_key,
+            langfuse_url,
+            langsmith_api_key,
+            langsmith_endpoint,
+            weave_api_key,
+            weave_project,
+            phoenix_endpoint,
+            phoenix_api_key,
+            redact_fields,
+            budget_alert_usd,
+            budget_period,
+            route,
         } => {
             cmd_start(
-                port, upstream, bind, verbose, upstream_timeout, retention_days,
-                no_request_bodies, metrics_port, otel_endpoint,
-                langfuse_public_key, langfuse_secret_key, langfuse_url,
-                langsmith_api_key, langsmith_endpoint,
-                weave_api_key, weave_project,
-                phoenix_endpoint, phoenix_api_key,
-                redact_fields, budget_alert_usd, budget_period, route,
+                port,
+                upstream,
+                bind,
+                verbose,
+                upstream_timeout,
+                retention_days,
+                no_request_bodies,
+                metrics_port,
+                otel_endpoint,
+                langfuse_public_key,
+                langfuse_secret_key,
+                langfuse_url,
+                langsmith_api_key,
+                langsmith_endpoint,
+                weave_api_key,
+                weave_project,
+                phoenix_endpoint,
+                phoenix_api_key,
+                redact_fields,
+                budget_alert_usd,
+                budget_period,
+                route,
                 &cfg,
-            ).await
+            )
+            .await
         }
-        Commands::Query { last, json, bodies, full, model, provider, errors, since, until, status, status_range } => {
-            cmd_query(last, json, bodies, full, model, provider, errors, since, until, status, status_range)
-        }
-        Commands::Watch { model, provider, errors, status, status_range } => {
-            cmd_watch(model, provider, errors, status, status_range).await
-        }
-        Commands::Show { id, no_bodies, tree } => {
-            cmd_show(id, no_bodies, tree)
-        }
-        Commands::Stats { breakdown, endpoint, provider_breakdown, since, until, provider } => {
-            cmd_stats(breakdown, endpoint, provider_breakdown, since, until, provider)
-        }
-        Commands::Info => {
-            cmd_info()
-        }
-        Commands::Clear { yes } => {
-            cmd_clear(yes)
-        }
-        Commands::Export { format, model, provider, since, until, status, status_range } => {
-            cmd_export(format, model, provider, since, until, status, status_range)
-        }
+        Commands::Query {
+            last,
+            json,
+            bodies,
+            full,
+            model,
+            provider,
+            errors,
+            since,
+            until,
+            status,
+            status_range,
+        } => cmd_query(
+            last,
+            json,
+            bodies,
+            full,
+            model,
+            provider,
+            errors,
+            since,
+            until,
+            status,
+            status_range,
+        ),
+        Commands::Watch {
+            model,
+            provider,
+            errors,
+            status,
+            status_range,
+        } => cmd_watch(model, provider, errors, status, status_range).await,
+        Commands::Show {
+            id,
+            no_bodies,
+            tree,
+        } => cmd_show(id, no_bodies, tree),
+        Commands::Stats {
+            breakdown,
+            endpoint,
+            provider_breakdown,
+            since,
+            until,
+            provider,
+        } => cmd_stats(
+            breakdown,
+            endpoint,
+            provider_breakdown,
+            since,
+            until,
+            provider,
+        ),
+        Commands::Info => cmd_info(),
+        Commands::Clear { yes } => cmd_clear(yes),
+        Commands::Export {
+            format,
+            model,
+            provider,
+            since,
+            until,
+            status,
+            status_range,
+        } => cmd_export(format, model, provider, since, until, status, status_range),
         Commands::Serve { port } => {
             let serve_cfg = cfg.serve.as_ref();
             let resolved_port = port
@@ -496,36 +581,39 @@ async fn main() -> Result<()> {
                 .unwrap_or(8080);
             serve::cmd_serve(resolved_port).await
         }
-        Commands::Report { since, until, model, provider, format, fail_over_usd } => {
-            cmd_report(since, until, model, provider, format, fail_over_usd)
-        }
-        Commands::Config { action } => {
-            cmd_config(action, &cfg, cfg_path.as_deref())
-        }
-        Commands::Vacuum { db } => {
-            cmd_vacuum(db)
-        }
-        Commands::Eval { rules, since, until, model, provider } => {
-            cmd_eval(rules, since, until, model, provider)
-        }
-        Commands::Search { query, limit, json } => {
-            cmd_search(query, limit, json)
-        }
-        Commands::Compare { model_a, model_b, since, until } => {
-            cmd_compare(model_a, model_b, since, until)
-        }
-        Commands::Prompts { action } => {
-            cmd_prompts(action)
-        }
-        Commands::Replay { id, model, upstream } => {
-            cmd_replay(id, model, upstream).await
-        }
+        Commands::Report {
+            since,
+            until,
+            model,
+            provider,
+            format,
+            fail_over_usd,
+        } => cmd_report(since, until, model, provider, format, fail_over_usd),
+        Commands::Config { action } => cmd_config(action, &cfg, cfg_path.as_deref()),
+        Commands::Vacuum { db } => cmd_vacuum(db),
+        Commands::Eval {
+            rules,
+            since,
+            until,
+            model,
+            provider,
+        } => cmd_eval(rules, since, until, model, provider),
+        Commands::Search { query, limit, json } => cmd_search(query, limit, json),
+        Commands::Compare {
+            model_a,
+            model_b,
+            since,
+            until,
+        } => cmd_compare(model_a, model_b, since, until),
+        Commands::Prompts { action } => cmd_prompts(action),
+        Commands::Replay {
+            id,
+            model,
+            upstream,
+        } => cmd_replay(id, model, upstream).await,
         Commands::Playground { port } => {
             let resolved = port.unwrap_or(8080);
-            println!(
-                "Playground: http://localhost:{}/playground",
-                resolved
-            );
+            println!("Playground: http://localhost:{}/playground", resolved);
             println!(
                 "Run `trace serve --port {}` first if the dashboard is not already running.",
                 resolved
@@ -563,7 +651,9 @@ async fn cmd_start(
 ) -> Result<()> {
     // Merge CLI/env args with config file defaults. Priority: CLI > env > config > hardcoded.
     let start_cfg = cfg.start.as_ref();
-    let port = port.or_else(|| start_cfg.and_then(|s| s.port)).unwrap_or(4000);
+    let port = port
+        .or_else(|| start_cfg.and_then(|s| s.port))
+        .unwrap_or(4000);
     let upstream = upstream
         .or_else(|| start_cfg.and_then(|s| s.upstream.clone()))
         .unwrap_or_else(|| "https://api.openai.com".to_string());
@@ -624,7 +714,10 @@ async fn cmd_start(
             if !matches!(scheme, "http" | "https") {
                 anyhow::bail!("--route URL {:?} must use http:// or https://", url);
             }
-            entries.push(proxy::UpstreamRoute { path, upstream: Arc::new(url) });
+            entries.push(proxy::UpstreamRoute {
+                path,
+                upstream: Arc::new(url),
+            });
         }
 
         if let Some(cfg_routes) = start_cfg.and_then(|s| s.routes.as_ref()) {
@@ -671,12 +764,19 @@ async fn cmd_start(
     let db_path = store::db_path()?;
 
     println!("{}", format!("trace v{}", env!("CARGO_PKG_VERSION")).bold());
-    println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
+    println!(
+        "  listening  {}",
+        format!("http://{}:{}", bind, port).cyan()
+    );
     println!("  upstream   {}", upstream.cyan());
     if !routes.is_empty() {
         println!("  routes     {} rule(s):", routes.len());
         for r in &routes {
-            println!("               {} -> {}", r.path.cyan(), r.upstream.as_ref().cyan());
+            println!(
+                "               {} -> {}",
+                r.path.cyan(),
+                r.upstream.as_ref().cyan()
+            );
         }
         println!("               * -> {} (default)", upstream.cyan());
     }
@@ -685,7 +785,10 @@ async fn cmd_start(
         println!("  retention  {} days", retention_days.to_string().cyan());
     }
     if metrics_port > 0 {
-        println!("  metrics    {}", format!("http://0.0.0.0:{}/metrics", metrics_port).cyan());
+        println!(
+            "  metrics    {}",
+            format!("http://0.0.0.0:{}/metrics", metrics_port).cyan()
+        );
     }
     if let Some(ref ep) = otel_endpoint {
         println!("  otel       {}", ep.cyan());
@@ -711,42 +814,75 @@ async fn cmd_start(
     println!();
     println!("Set your LLM client:");
     if routes.is_empty() {
-        println!("  {}", format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow());
+        println!(
+            "  {}",
+            format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow()
+        );
     } else {
-        println!("  {}  # gpt-* models", format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow());
-        println!("  {}  # claude-* models", format!("ANTHROPIC_BASE_URL=http://localhost:{}", port).yellow());
+        println!(
+            "  {}  # gpt-* models",
+            format!("OPENAI_BASE_URL=http://localhost:{}/v1", port).yellow()
+        );
+        println!(
+            "  {}  # claude-* models",
+            format!("ANTHROPIC_BASE_URL=http://localhost:{}", port).yellow()
+        );
     }
     println!();
 
     // Warn when binding on non-localhost.
     let is_localhost = matches!(bind.as_str(), "127.0.0.1" | "::1" | "localhost");
     if !is_localhost {
-        eprintln!("{}", format!(
-            "WARNING: proxy is bound to {} and is reachable from the network.",
-            bind
-        ).yellow().bold());
-        eprintln!("{}", "All captured LLM requests (including prompts) will be visible to network peers.".yellow());
+        eprintln!(
+            "{}",
+            format!(
+                "WARNING: proxy is bound to {} and is reachable from the network.",
+                bind
+            )
+            .yellow()
+            .bold()
+        );
+        eprintln!(
+            "{}",
+            "All captured LLM requests (including prompts) will be visible to network peers."
+                .yellow()
+        );
         eprintln!();
     }
 
     if !upstream.starts_with("https://") {
-        eprintln!("{}", format!(
-            "WARNING: upstream '{}' is not HTTPS — traffic may be unencrypted.",
-            upstream
-        ).yellow());
+        eprintln!(
+            "{}",
+            format!(
+                "WARNING: upstream '{}' is not HTTPS — traffic may be unencrypted.",
+                upstream
+            )
+            .yellow()
+        );
         eprintln!();
     }
 
     for r in &routes {
         if !r.upstream.starts_with("https://") {
-            eprintln!("{}", format!(
-                "WARNING: route upstream '{}' ({}) is not HTTPS — traffic may be unencrypted.",
-                r.upstream, r.path
-            ).yellow());
+            eprintln!(
+                "{}",
+                format!(
+                    "WARNING: route upstream '{}' ({}) is not HTTPS — traffic may be unencrypted.",
+                    r.upstream, r.path
+                )
+                .yellow()
+            );
         }
     }
 
-    println!("{}", format!("Note: full request/response bodies (including prompts) are stored in {}", db_path.display()).dimmed());
+    println!(
+        "{}",
+        format!(
+            "Note: full request/response bodies (including prompts) are stored in {}",
+            db_path.display()
+        )
+        .dimmed()
+    );
     #[cfg(windows)]
     eprintln!("{}", "WARNING: on Windows, the trace database has default NTFS permissions and may be readable by other administrators on this machine.".yellow());
     println!();
@@ -765,18 +901,22 @@ async fn cmd_start(
     };
 
     // Build OtelExporter if --otel-endpoint is set.
-    let otel_exporter: Option<Arc<otel::OtelExporter>> = otel_endpoint.as_deref().map(|ep| {
-        Arc::new(otel::OtelExporter::new(ep.to_string()))
-    });
+    let otel_exporter: Option<Arc<otel::OtelExporter>> = otel_endpoint
+        .as_deref()
+        .map(|ep| Arc::new(otel::OtelExporter::new(ep.to_string())));
 
     // Build optional external sinks.
-    let langfuse_sink: Option<Arc<sink::LangfuseSink>> =
-        match (langfuse_public_key.as_deref(), langfuse_secret_key.as_deref()) {
-            (Some(pub_k), Some(sec_k)) => {
-                Some(Arc::new(sink::LangfuseSink::new(&langfuse_url, pub_k, sec_k)))
-            }
-            _ => None,
-        };
+    let langfuse_sink: Option<Arc<sink::LangfuseSink>> = match (
+        langfuse_public_key.as_deref(),
+        langfuse_secret_key.as_deref(),
+    ) {
+        (Some(pub_k), Some(sec_k)) => Some(Arc::new(sink::LangfuseSink::new(
+            &langfuse_url,
+            pub_k,
+            sec_k,
+        ))),
+        _ => None,
+    };
 
     let langsmith_sink: Option<Arc<sink::LangSmithSink>> = langsmith_api_key
         .as_deref()
@@ -784,9 +924,11 @@ async fn cmd_start(
 
     let weave_sink: Option<Arc<sink::WeaveSink>> =
         match (weave_api_key.as_deref(), weave_project.as_deref()) {
-            (Some(key), Some(proj)) => {
-                Some(Arc::new(sink::WeaveSink::new("https://trace.wandb.ai", key, proj)))
-            }
+            (Some(key), Some(proj)) => Some(Arc::new(sink::WeaveSink::new(
+                "https://trace.wandb.ai",
+                key,
+                proj,
+            ))),
             _ => None,
         };
 
@@ -819,20 +961,32 @@ async fn cmd_start(
                 });
             }
             if let Some(ref s) = langfuse_writer {
-                let s = s.clone(); let r = record.clone();
-                tokio::spawn(async move { s.send(&r).await; });
+                let s = s.clone();
+                let r = record.clone();
+                tokio::spawn(async move {
+                    s.send(&r).await;
+                });
             }
             if let Some(ref s) = langsmith_writer {
-                let s = s.clone(); let r = record.clone();
-                tokio::spawn(async move { s.send(&r).await; });
+                let s = s.clone();
+                let r = record.clone();
+                tokio::spawn(async move {
+                    s.send(&r).await;
+                });
             }
             if let Some(ref s) = weave_writer {
-                let s = s.clone(); let r = record.clone();
-                tokio::spawn(async move { s.send(&r).await; });
+                let s = s.clone();
+                let r = record.clone();
+                tokio::spawn(async move {
+                    s.send(&r).await;
+                });
             }
             if let Some(ref s) = phoenix_writer {
-                let s = s.clone(); let r = record.clone();
-                tokio::spawn(async move { s.send(&r).await; });
+                let s = s.clone();
+                let r = record.clone();
+                tokio::spawn(async move {
+                    s.send(&r).await;
+                });
             }
         }
     });
@@ -844,7 +998,10 @@ async fn cmd_start(
                 tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
                 if let Ok(s) = store::Store::open() {
                     match s.prune_older_than(retention_days) {
-                        Ok(n) if n > 0 => eprintln!("[trace] pruned {} records older than {} days", n, retention_days),
+                        Ok(n) if n > 0 => eprintln!(
+                            "[trace] pruned {} records older than {} days",
+                            n, retention_days
+                        ),
                         Ok(_) => {}
                         Err(e) => eprintln!("[trace] prune error: {e}"),
                     }
@@ -870,10 +1027,14 @@ async fn cmd_start(
         match check_client.head(&check_url).send().await {
             Ok(_) => {}
             Err(e) if e.is_connect() || e.is_timeout() => {
-                eprintln!("{}", format!(
-                    "WARNING: upstream '{}' did not respond ({}). Proxy will start anyway.",
-                    check_url, e
-                ).yellow());
+                eprintln!(
+                    "{}",
+                    format!(
+                        "WARNING: upstream '{}' did not respond ({}). Proxy will start anyway.",
+                        check_url, e
+                    )
+                    .yellow()
+                );
                 eprintln!();
             }
             Err(_) => {}
@@ -892,7 +1053,8 @@ async fn cmd_start(
 
     // Flush DROPPED_RECORDS counter to DB every 10s.
     {
-        let flush_store = store::Store::open().context("failed to open trace database for metrics")?;
+        let flush_store =
+            store::Store::open().context("failed to open trace database for metrics")?;
         let metrics_flush = metrics_state.clone();
         tokio::spawn(async move {
             let mut last_flushed: u64 = 0;
@@ -958,14 +1120,12 @@ async fn cmd_start(
             let metrics_app: Router = Router::new()
                 .route(
                     "/metrics",
-                    get(
-                        |State(m): State<Arc<metrics::MetricsState>>| async move {
-                            axum::response::Response::builder()
-                                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                                .body(axum::body::Body::from(m.render_prometheus()))
-                                .unwrap()
-                        },
-                    ),
+                    get(|State(m): State<Arc<metrics::MetricsState>>| async move {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                            .body(axum::body::Body::from(m.render_prometheus()))
+                            .unwrap()
+                    }),
                 )
                 .with_state(metrics_for_server);
 
@@ -975,7 +1135,10 @@ async fn cmd_start(
                     axum::serve(listener, metrics_app).await.ok();
                 }
                 Err(e) => {
-                    eprintln!("[trace] failed to bind metrics port {}: {}", metrics_port, e);
+                    eprintln!(
+                        "[trace] failed to bind metrics port {}: {}",
+                        metrics_port, e
+                    );
                 }
             }
         });
@@ -1002,10 +1165,7 @@ async fn cmd_start(
         .await
         .context("server error")?;
 
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        writer_handle,
-    ).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer_handle).await;
 
     Ok(())
 }
@@ -1054,7 +1214,15 @@ fn cmd_query(
     let until = until.map(parse_until_ts).transpose()?;
 
     let store = store::Store::open().context("failed to open trace database")?;
-    let filter = store::QueryFilter { errors_only: errors, model, provider, since, until, status, status_range };
+    let filter = store::QueryFilter {
+        errors_only: errors,
+        model,
+        provider,
+        since,
+        until,
+        status,
+        status_range,
+    };
     let mut calls = store.query_filtered(limit, &filter)?;
 
     calls.reverse();
@@ -1103,10 +1271,18 @@ fn cmd_query(
     let total_cost: f64 = calls.iter().filter_map(|c| c.cost_usd).sum();
     println!();
     if total_cost > 0.0 {
-        println!("{} calls shown  •  total cost ${:.4}  •  run {} for full breakdown.",
-            calls.len(), total_cost, "trace stats".yellow());
+        println!(
+            "{} calls shown  •  total cost ${:.4}  •  run {} for full breakdown.",
+            calls.len(),
+            total_cost,
+            "trace stats".yellow()
+        );
     } else {
-        println!("{} calls shown. Run {} for totals.", calls.len(), "trace stats".yellow());
+        println!(
+            "{} calls shown. Run {} for totals.",
+            calls.len(),
+            "trace stats".yellow()
+        );
     }
     Ok(())
 }
@@ -1194,8 +1370,15 @@ async fn cmd_watch(
 }
 
 fn print_budget_line(spent: f64, limit: f64, period: &str) {
-    let pct = if limit > 0.0 { (spent / limit * 100.0) as u32 } else { 0 };
-    let line = format!("budget  ${:.2} / ${:.2} this {}  ({}%)", spent, limit, period, pct);
+    let pct = if limit > 0.0 {
+        (spent / limit * 100.0) as u32
+    } else {
+        0
+    };
+    let line = format!(
+        "budget  ${:.2} / ${:.2} this {}  ({}%)",
+        spent, limit, period, pct
+    );
     if pct >= 80 {
         println!("{}", line.red());
     } else {
@@ -1226,12 +1409,27 @@ fn cmd_show(id: String, no_bodies: bool, tree: bool) -> Result<()> {
             if let Some(ttft) = r.ttft_ms {
                 println!("  ttft         {}ms", ttft.to_string().cyan());
             }
-            println!("  in tokens    {}",
-                r.input_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()).cyan());
-            println!("  out tokens   {}",
-                r.output_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()).cyan());
-            println!("  cost         {}",
-                r.cost_usd.map(|c| format!("${:.6}", c)).unwrap_or_else(|| "-".to_string()).cyan());
+            println!(
+                "  in tokens    {}",
+                r.input_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+                    .cyan()
+            );
+            println!(
+                "  out tokens   {}",
+                r.output_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+                    .cyan()
+            );
+            println!(
+                "  cost         {}",
+                r.cost_usd
+                    .map(|c| format!("${:.6}", c))
+                    .unwrap_or_else(|| "-".to_string())
+                    .cyan()
+            );
             if let Some(ref pid) = r.provider_request_id {
                 println!("  provider id  {}", pid.cyan());
             }
@@ -1240,7 +1438,10 @@ fn cmd_show(id: String, no_bodies: bool, tree: bool) -> Result<()> {
             }
             if no_bodies {
                 println!();
-                println!("{}", "(bodies hidden — use without --no-bodies to display)".dimmed());
+                println!(
+                    "{}",
+                    "(bodies hidden — use without --no-bodies to display)".dimmed()
+                );
             } else {
                 if let Some(ref req) = r.request_body {
                     println!();
@@ -1268,18 +1469,24 @@ fn cmd_show(id: String, no_bodies: bool, tree: bool) -> Result<()> {
                             let prefix = if is_root { "  ●" } else { "  └" };
                             let id_str = s.id[..8.min(s.id.len())].to_string();
                             let marker = if is_self { " ◀ this call" } else { "" };
-                            let status_str = if s.status_code == 0 || s.status_code >= 400 || s.error.is_some() {
+                            let status_str = if s.status_code == 0
+                                || s.status_code >= 400
+                                || s.error.is_some()
+                            {
                                 s.status_code.to_string().red().to_string()
                             } else {
                                 s.status_code.to_string().green().to_string()
                             };
-                            println!("{} {} {} {} {}ms {}{}",
+                            println!(
+                                "{} {} {} {} {}ms {}{}",
                                 prefix,
                                 id_str.cyan(),
                                 s.model.as_str(),
                                 status_str,
                                 s.latency_ms,
-                                s.timestamp[..19.min(s.timestamp.len())].to_string().dimmed(),
+                                s.timestamp[..19.min(s.timestamp.len())]
+                                    .to_string()
+                                    .dimmed(),
                                 marker.dimmed(),
                             );
                         }
@@ -1307,7 +1514,12 @@ fn cmd_stats(
 ) -> Result<()> {
     let since = since.map(parse_since_ts).transpose()?;
     let until = until.map(parse_until_ts).transpose()?;
-    let filter = store::QueryFilter { since: since.clone(), until: until.clone(), provider: provider.clone(), ..Default::default() };
+    let filter = store::QueryFilter {
+        since: since.clone(),
+        until: until.clone(),
+        provider: provider.clone(),
+        ..Default::default()
+    };
 
     let store = store::Store::open().context("failed to open trace database")?;
     let s = store.stats()?;
@@ -1316,18 +1528,30 @@ fn cmd_stats(
     println!("{}", "trace stats".bold());
     println!();
     println!("  total calls       {}", s.total_calls.to_string().cyan());
-    println!("  calls last hour   {}", s.calls_last_hour.to_string().cyan());
-    println!("  errors            {}", if s.error_count > 0 {
-        let rate = if s.total_calls > 0 {
-            format!(" ({:.1}%)", s.error_count as f64 / s.total_calls as f64 * 100.0)
+    println!(
+        "  calls last hour   {}",
+        s.calls_last_hour.to_string().cyan()
+    );
+    println!(
+        "  errors            {}",
+        if s.error_count > 0 {
+            let rate = if s.total_calls > 0 {
+                format!(
+                    " ({:.1}%)",
+                    s.error_count as f64 / s.total_calls as f64 * 100.0
+                )
+            } else {
+                String::new()
+            };
+            format!("{}{}", s.error_count.to_string().red(), rate.dimmed())
         } else {
-            String::new()
-        };
-        format!("{}{}", s.error_count.to_string().red(), rate.dimmed())
-    } else {
-        "0".green().to_string()
-    });
-    println!("  avg latency       {}ms", format!("{:.0}", s.avg_latency_ms).cyan());
+            "0".green().to_string()
+        }
+    );
+    println!(
+        "  avg latency       {}ms",
+        format!("{:.0}", s.avg_latency_ms).cyan()
+    );
     if s.total_calls > 0 {
         println!("  latency p50       {}ms", format!("{:.0}", p50).cyan());
         println!("  latency p95       {}ms", format!("{:.0}", p95).cyan());
@@ -1337,18 +1561,36 @@ fn cmd_stats(
     if tp.input_p50 > 0 || tp.output_p50 > 0 || tp.input_p99 > 0 {
         println!();
         println!("{}", "Token percentiles (input / output):".bold());
-        println!("  p50   {:>6} / {:>6}",
-            fmt_num_commas(tp.input_p50 as i64), fmt_num_commas(tp.output_p50 as i64));
-        println!("  p95   {:>6} / {:>6}",
-            fmt_num_commas(tp.input_p95 as i64), fmt_num_commas(tp.output_p95 as i64));
-        println!("  p99   {:>6} / {:>6}",
-            fmt_num_commas(tp.input_p99 as i64), fmt_num_commas(tp.output_p99 as i64));
+        println!(
+            "  p50   {:>6} / {:>6}",
+            fmt_num_commas(tp.input_p50 as i64),
+            fmt_num_commas(tp.output_p50 as i64)
+        );
+        println!(
+            "  p95   {:>6} / {:>6}",
+            fmt_num_commas(tp.input_p95 as i64),
+            fmt_num_commas(tp.output_p95 as i64)
+        );
+        println!(
+            "  p99   {:>6} / {:>6}",
+            fmt_num_commas(tp.input_p99 as i64),
+            fmt_num_commas(tp.output_p99 as i64)
+        );
     }
 
     println!();
-    println!("  input tokens      {}", s.total_input_tokens.to_string().cyan());
-    println!("  output tokens     {}", s.total_output_tokens.to_string().cyan());
-    println!("  estimated cost    {}", format!("${:.4}", s.total_cost_usd).cyan());
+    println!(
+        "  input tokens      {}",
+        s.total_input_tokens.to_string().cyan()
+    );
+    println!(
+        "  output tokens     {}",
+        s.total_output_tokens.to_string().cyan()
+    );
+    println!(
+        "  estimated cost    {}",
+        format!("${:.4}", s.total_cost_usd).cyan()
+    );
 
     let dropped: u64 = store
         .get_meta("dropped_records")
@@ -1358,12 +1600,15 @@ fn cmd_stats(
         .unwrap_or(0);
     if dropped > 0 {
         println!();
-        println!("  {} {} records dropped due to DB write backpressure",
+        println!(
+            "  {} {} records dropped due to DB write backpressure",
             "WARNING:".yellow().bold(),
             dropped.to_string().red()
         );
-        println!("  {} consider reducing request rate or increasing disk I/O capacity",
-            "hint:".dimmed());
+        println!(
+            "  {} consider reducing request rate or increasing disk I/O capacity",
+            "hint:".dimmed()
+        );
     }
 
     if breakdown {
@@ -1374,10 +1619,14 @@ fn cmd_stats(
             println!("  {}", "(no data)".dimmed());
         } else {
             let p99_map = store.latency_percentiles_per_model()?;
-            println!("{}", format!(
-                "  {:<30}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}  {:>8}",
-                "model", "calls", "in", "out", "cost", "avg ms", "p99 ms"
-            ).underline());
+            println!(
+                "{}",
+                format!(
+                    "  {:<30}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}  {:>8}",
+                    "model", "calls", "in", "out", "cost", "avg ms", "p99 ms"
+                )
+                .underline()
+            );
             for m in &models {
                 let in_str = if m.total_input_tokens > 0 {
                     format!("{:>8}", fmt_tokens(m.total_input_tokens))
@@ -1395,10 +1644,7 @@ fn cmd_stats(
                 } else {
                     String::new()
                 };
-                let (_, _, model_p99) = p99_map
-                    .get(&m.model)
-                    .copied()
-                    .unwrap_or((0.0, 0.0, 0.0));
+                let (_, _, model_p99) = p99_map.get(&m.model).copied().unwrap_or((0.0, 0.0, 0.0));
                 println!(
                     "  {:<30}  {:>6}  {}  {}  {}  {:>7.0}ms  {:>6.0}ms{}",
                     truncate(&m.model, 30),
@@ -1421,10 +1667,14 @@ fn cmd_stats(
         if endpoints.is_empty() {
             println!("  {}", "(no data)".dimmed());
         } else {
-            println!("{}", format!(
-                "  {:<35}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}",
-                "endpoint", "calls", "in", "out", "cost", "avg ms"
-            ).underline());
+            println!(
+                "{}",
+                format!(
+                    "  {:<35}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}",
+                    "endpoint", "calls", "in", "out", "cost", "avg ms"
+                )
+                .underline()
+            );
             for e in &endpoints {
                 let in_str = if e.total_input_tokens > 0 {
                     format!("{:>8}", fmt_tokens(e.total_input_tokens))
@@ -1463,10 +1713,14 @@ fn cmd_stats(
         if providers.is_empty() {
             println!("  {}", "(no data)".dimmed());
         } else {
-            println!("{}", format!(
-                "  {:<18}  {:>6}  {:>9}  {:>8}  {:>6}",
-                "provider", "calls", "cost", "avg ms", "errors"
-            ).underline());
+            println!(
+                "{}",
+                format!(
+                    "  {:<18}  {:>6}  {:>9}  {:>8}  {:>6}",
+                    "provider", "calls", "cost", "avg ms", "errors"
+                )
+                .underline()
+            );
             for p in &providers {
                 let cost_str = format!("${:>8.4}", p.total_cost_usd);
                 let err_str = if p.error_count > 0 {
@@ -1501,7 +1755,10 @@ fn cmd_info() -> Result<()> {
         let size = std::fs::metadata(&db_path)?.len();
         println!("  DB size  {}", format_bytes(size).cyan());
     } else {
-        println!("  DB size  {}", "(not created yet — start the proxy first)".dimmed());
+        println!(
+            "  DB size  {}",
+            "(not created yet — start the proxy first)".dimmed()
+        );
     }
     Ok(())
 }
@@ -1532,7 +1789,11 @@ fn cmd_clear(yes: bool) -> Result<()> {
 
     let count = store.clear()?;
     let noun = if count == 1 { "call" } else { "calls" };
-    println!("{} {} deleted and database compacted.", count.to_string().cyan(), noun);
+    println!(
+        "{} {} deleted and database compacted.",
+        count.to_string().cyan(),
+        noun
+    );
     Ok(())
 }
 
@@ -1666,7 +1927,11 @@ fn cmd_report(
 
     // Sort by cost descending.
     let mut rows: Vec<ModelReportRow> = model_map.into_values().collect();
-    rows.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let period_from = since.as_deref().unwrap_or("(all time)");
     let period_to = until.as_deref().unwrap_or("now");
@@ -1748,11 +2013,7 @@ fn print_report_text(
     println!("{}", sep);
     println!(
         "{:<28}  {:>6}  {:>12}  {:>12}  ${:>9.4}",
-        "TOTAL",
-        total_calls,
-        "",
-        "",
-        total_cost
+        "TOTAL", total_calls, "", "", total_cost
     );
 }
 
@@ -1764,13 +2025,17 @@ fn format_report_github(rows: &[ModelReportRow], total_calls: i64, total_cost: f
     for r in rows {
         out.push_str(&format!(
             "| {} | {} | {} | {} | ${:.4} |\n",
-            r.model, r.calls,
+            r.model,
+            r.calls,
             fmt_num_commas(r.input_tokens),
             fmt_num_commas(r.output_tokens),
             r.cost_usd
         ));
     }
-    out.push_str(&format!("\n**Total: {} calls / ${:.4}**\n", total_calls, total_cost));
+    out.push_str(&format!(
+        "\n**Total: {} calls / ${:.4}**\n",
+        total_calls, total_cost
+    ));
     out
 }
 
@@ -1784,12 +2049,10 @@ fn cmd_config(
     cfg_path: Option<&std::path::Path>,
 ) -> Result<()> {
     match action {
-        ConfigAction::Path => {
-            match cfg_path {
-                Some(p) => println!("{}", p.display()),
-                None => println!("no config file found"),
-            }
-        }
+        ConfigAction::Path => match cfg_path {
+            Some(p) => println!("{}", p.display()),
+            None => println!("no config file found"),
+        },
         ConfigAction::Show => {
             match cfg_path {
                 Some(p) => println!("Config file: {}", p.display()),
@@ -1798,14 +2061,36 @@ fn cmd_config(
             println!();
             println!("[start]");
             if let Some(ref s) = cfg.start {
-                println!("  port            = {}", s.port.map(|v| v.to_string()).unwrap_or_else(|| "4000 (default)".to_string()));
-                println!("  upstream        = {}", s.upstream.as_deref().unwrap_or("https://api.openai.com (default)"));
-                if let Some(v) = s.retention_days { println!("  retention_days  = {}", v); }
-                if let Some(v) = s.metrics_port { println!("  metrics_port    = {}", v); }
-                if let Some(ref v) = s.otel_endpoint { println!("  otel_endpoint   = {}", v); }
-                if let Some(ref v) = s.redact_fields { println!("  redact_fields   = {:?}", v); }
-                if let Some(v) = s.budget_alert_usd { println!("  budget_alert_usd = {}", v); }
-                if let Some(ref v) = s.budget_period { println!("  budget_period   = {}", v); }
+                println!(
+                    "  port            = {}",
+                    s.port
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "4000 (default)".to_string())
+                );
+                println!(
+                    "  upstream        = {}",
+                    s.upstream
+                        .as_deref()
+                        .unwrap_or("https://api.openai.com (default)")
+                );
+                if let Some(v) = s.retention_days {
+                    println!("  retention_days  = {}", v);
+                }
+                if let Some(v) = s.metrics_port {
+                    println!("  metrics_port    = {}", v);
+                }
+                if let Some(ref v) = s.otel_endpoint {
+                    println!("  otel_endpoint   = {}", v);
+                }
+                if let Some(ref v) = s.redact_fields {
+                    println!("  redact_fields   = {:?}", v);
+                }
+                if let Some(v) = s.budget_alert_usd {
+                    println!("  budget_alert_usd = {}", v);
+                }
+                if let Some(ref v) = s.budget_period {
+                    println!("  budget_period   = {}", v);
+                }
                 if let Some(ref routes) = s.routes {
                     for r in routes {
                         println!("  route           {} -> {}", r.path, r.upstream);
@@ -1817,7 +2102,12 @@ fn cmd_config(
             println!();
             println!("[serve]");
             if let Some(ref s) = cfg.serve {
-                println!("  port = {}", s.port.map(|v| v.to_string()).unwrap_or_else(|| "8080 (default)".to_string()));
+                println!(
+                    "  port = {}",
+                    s.port
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "8080 (default)".to_string())
+                );
             } else {
                 println!("  (using all defaults)");
             }
@@ -1826,11 +2116,8 @@ fn cmd_config(
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_else(|_| ".".to_string());
-            let config_dir = std::path::PathBuf::from(home)
-                .join(".config")
-                .join("trace");
-            std::fs::create_dir_all(&config_dir)
-                .context("failed to create ~/.config/trace")?;
+            let config_dir = std::path::PathBuf::from(home).join(".config").join("trace");
+            std::fs::create_dir_all(&config_dir).context("failed to create ~/.config/trace")?;
             let config_path = config_dir.join("config.toml");
             if config_path.exists() {
                 println!("Config file already exists: {}", config_path.display());
@@ -1850,10 +2137,15 @@ fn cmd_config(
 // ---------------------------------------------------------------------------
 
 fn print_query_header() {
-    println!("{}", format!(
-        "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
-        "id", "timestamp", "model", "status", "latency", "ttft", "in", "out", "cost"
-    ).bold().underline());
+    println!(
+        "{}",
+        format!(
+            "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
+            "id", "timestamp", "model", "status", "latency", "ttft", "in", "out", "cost"
+        )
+        .bold()
+        .underline()
+    );
 }
 
 fn print_watch_header(cumulative_cost: f64) {
@@ -1862,14 +2154,24 @@ fn print_watch_header(cumulative_cost: f64) {
     } else {
         String::new()
     };
-    println!("{}{}", format!(
-        "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
-        "id", "timestamp", "model", "status", "latency", "ttft", "in", "out", "cost"
-    ).bold().underline(), cost_str.dimmed());
+    println!(
+        "{}{}",
+        format!(
+            "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
+            "id", "timestamp", "model", "status", "latency", "ttft", "in", "out", "cost"
+        )
+        .bold()
+        .underline(),
+        cost_str.dimmed()
+    );
 }
 
 fn print_call_row(call: &store::CallRecord) {
-    let id_short = if call.id.len() >= 8 { &call.id[..8] } else { &call.id };
+    let id_short = if call.id.len() >= 8 {
+        &call.id[..8]
+    } else {
+        &call.id
+    };
     let ts = call.timestamp.get(..19).unwrap_or(&call.timestamp);
     let model_short = truncate(&call.model, 22);
     let is_error = call.status_code == 0 || call.status_code >= 400 || call.error.is_some();
@@ -1886,23 +2188,35 @@ fn print_call_row(call: &store::CallRecord) {
         format!("{:>6}", call.status_code).green().to_string()
     };
     let latency_str = format!("{:>6}ms", call.latency_ms);
-    let ttft_str = call.ttft_ms
+    let ttft_str = call
+        .ttft_ms
         .map(|t| format!("{:>5}ms", t))
         .unwrap_or_else(|| format!("{:>7}", "-"));
-    let in_str = call.input_tokens
+    let in_str = call
+        .input_tokens
         .map(|t| format!("{:>6}", t))
         .unwrap_or_else(|| "     -".to_string());
-    let out_str = call.output_tokens
+    let out_str = call
+        .output_tokens
         .map(|t| format!("{:>6}", t))
         .unwrap_or_else(|| "     -".to_string());
-    let cost_str = call.cost_usd
+    let cost_str = call
+        .cost_usd
         .map(|c| format!("${:>8.4}", c))
         .unwrap_or_else(|| "         -".to_string());
 
     println!(
         "{:<8}  {:<19}  {:<22}  {}{}  {}  {}  {}  {}  {}",
-        id_short, ts, model_short, status_str, error_tag,
-        latency_str, ttft_str, in_str, out_str, cost_str
+        id_short,
+        ts,
+        model_short,
+        status_str,
+        error_tag,
+        latency_str,
+        ttft_str,
+        in_str,
+        out_str,
+        cost_str
     );
 }
 
@@ -1921,8 +2235,12 @@ fn parse_status_range(s: &str) -> std::result::Result<(u16, u16), String> {
     if parts.len() != 2 {
         return Err(format!("expected format LO-HI (e.g. 400-499), got {:?}", s));
     }
-    let lo: u16 = parts[0].parse().map_err(|_| format!("invalid status code {:?}", parts[0]))?;
-    let hi: u16 = parts[1].parse().map_err(|_| format!("invalid status code {:?}", parts[1]))?;
+    let lo: u16 = parts[0]
+        .parse()
+        .map_err(|_| format!("invalid status code {:?}", parts[0]))?;
+    let hi: u16 = parts[1]
+        .parse()
+        .map_err(|_| format!("invalid status code {:?}", parts[1]))?;
     if lo > hi {
         return Err(format!("range lo ({}) must be <= hi ({})", lo, hi));
     }
@@ -1936,13 +2254,26 @@ fn cmd_vacuum(db: Option<std::path::PathBuf>) -> Result<()> {
     };
     let store = store::Store::open_at(&db_path)?;
     let (before, after) = store.vacuum()?;
-    println!("Vacuumed: {:.1} MB → {:.1} MB", before as f64 / 1e6, after as f64 / 1e6);
+    println!(
+        "Vacuumed: {:.1} MB → {:.1} MB",
+        before as f64 / 1e6,
+        after as f64 / 1e6
+    );
     Ok(())
 }
 
-fn cmd_eval(rules: Vec<String>, since: Option<String>, until: Option<String>, model: Option<String>, provider: Option<String>) -> Result<()> {
+fn cmd_eval(
+    rules: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+) -> Result<()> {
     if rules.is_empty() {
-        println!("{}", "No rules specified. Use --rule \"latency_p99 < 2000\".".yellow());
+        println!(
+            "{}",
+            "No rules specified. Use --rule \"latency_p99 < 2000\".".yellow()
+        );
         return Ok(());
     }
 
@@ -1961,7 +2292,10 @@ fn cmd_eval(rules: Vec<String>, since: Option<String>, until: Option<String>, mo
     println!("  total_calls    {}", stats.total_calls.to_string().cyan());
     println!("  error_count    {}", stats.error_count.to_string().cyan());
     println!("  error_rate     {:.4}", stats.error_rate);
-    println!("  latency_p99    {}ms", stats.latency_p99.to_string().cyan());
+    println!(
+        "  latency_p99    {}ms",
+        stats.latency_p99.to_string().cyan()
+    );
     println!("  avg_cost_usd   ${:.6}", stats.avg_cost_usd);
     println!();
 
@@ -2000,21 +2334,23 @@ fn eval_check_rule(rule: &str, stats: &store::EvalStats) -> std::result::Result<
     }
     let metric = parts[0];
     let op = parts[1];
-    let rhs: f64 = parts[2].parse().map_err(|_| format!("invalid number: {}", parts[2]))?;
+    let rhs: f64 = parts[2]
+        .parse()
+        .map_err(|_| format!("invalid number: {}", parts[2]))?;
 
     let lhs: f64 = match metric {
-        "latency_p99"   => stats.latency_p99 as f64,
-        "error_rate"    => stats.error_rate,
-        "error_count"   => stats.error_count as f64,
-        "avg_cost_usd"  => stats.avg_cost_usd,
-        "total_calls"   => stats.total_calls as f64,
-        other           => return Err(format!("unknown metric: {}", other)),
+        "latency_p99" => stats.latency_p99 as f64,
+        "error_rate" => stats.error_rate,
+        "error_count" => stats.error_count as f64,
+        "avg_cost_usd" => stats.avg_cost_usd,
+        "total_calls" => stats.total_calls as f64,
+        other => return Err(format!("unknown metric: {}", other)),
     };
 
     let result = match op {
-        "<"  => lhs <  rhs,
+        "<" => lhs < rhs,
         "<=" => lhs <= rhs,
-        ">"  => lhs >  rhs,
+        ">" => lhs > rhs,
         ">=" => lhs >= rhs,
         "=" | "==" => (lhs - rhs).abs() < f64::EPSILON,
         other => return Err(format!("unknown operator: {}", other)),
@@ -2037,7 +2373,10 @@ fn cmd_search(query: String, limit: Option<usize>, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", format!("trace search — {} result(s) for {:?}", results.len(), query).bold());
+    println!(
+        "{}",
+        format!("trace search — {} result(s) for {:?}", results.len(), query).bold()
+    );
     println!();
     print_query_header();
     for sr in &results {
@@ -2062,62 +2401,104 @@ fn cmd_compare(
     let (a, b) = store.compare_models(&model_a, &model_b, since.as_deref(), until.as_deref())?;
 
     println!("{}", "trace compare".bold());
-    println!("{}: {}  vs  {}", "models".dimmed(), model_a.cyan(), model_b.cyan());
+    println!(
+        "{}: {}  vs  {}",
+        "models".dimmed(),
+        model_a.cyan(),
+        model_b.cyan()
+    );
     println!("{}", "─".repeat(62));
 
     fn delta_pct(a: f64, b: f64) -> String {
-        if a == 0.0 { return "  n/a".to_string(); }
+        if a == 0.0 {
+            return "  n/a".to_string();
+        }
         let d = (b - a) / a * 100.0;
-        if d.abs() < 0.5 { "   ~".to_string() } else { format!("{:+.0}%", d) }
+        if d.abs() < 0.5 {
+            "   ~".to_string()
+        } else {
+            format!("{:+.0}%", d)
+        }
     }
     fn indicator(a: f64, b: f64, lower_is_better: bool) -> &'static str {
-        if (b - a).abs() < 0.001 * a.abs().max(1.0) { return ""; }
+        if (b - a).abs() < 0.001 * a.abs().max(1.0) {
+            return "";
+        }
         let b_better = if lower_is_better { b < a } else { b > a };
-        if b_better { "  ✓" } else { "  ✗" }
+        if b_better {
+            "  ✓"
+        } else {
+            "  ✗"
+        }
     }
 
-    println!("{:<22}  {:>16}  {:>22}  delta", "", model_a.as_str(), model_b.as_str());
-    println!("{:<22}  {:>16}  {:>22}  {}", "calls", fmt_num_commas(a.calls), fmt_num_commas(b.calls), delta_pct(a.calls as f64, b.calls as f64));
-    println!("{:<22}  {:>16}  {:>22}  {}{}",
+    println!(
+        "{:<22}  {:>16}  {:>22}  delta",
+        "",
+        model_a.as_str(),
+        model_b.as_str()
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}",
+        "calls",
+        fmt_num_commas(a.calls),
+        fmt_num_commas(b.calls),
+        delta_pct(a.calls as f64, b.calls as f64)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}{}",
         "avg cost/call",
         format!("${:.6}", a.avg_cost_usd),
         format!("${:.6}", b.avg_cost_usd),
         delta_pct(a.avg_cost_usd, b.avg_cost_usd),
-        indicator(a.avg_cost_usd, b.avg_cost_usd, true));
-    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        indicator(a.avg_cost_usd, b.avg_cost_usd, true)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}{}",
         "total cost",
         format!("${:.4}", a.total_cost_usd),
         format!("${:.4}", b.total_cost_usd),
         delta_pct(a.total_cost_usd, b.total_cost_usd),
-        indicator(a.total_cost_usd, b.total_cost_usd, true));
-    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        indicator(a.total_cost_usd, b.total_cost_usd, true)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}{}",
         "avg latency",
         format!("{:.0}ms", a.avg_latency_ms),
         format!("{:.0}ms", b.avg_latency_ms),
         delta_pct(a.avg_latency_ms, b.avg_latency_ms),
-        indicator(a.avg_latency_ms, b.avg_latency_ms, true));
-    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        indicator(a.avg_latency_ms, b.avg_latency_ms, true)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}{}",
         "p99 latency",
         format!("{}ms", a.latency_p99),
         format!("{}ms", b.latency_p99),
         delta_pct(a.latency_p99 as f64, b.latency_p99 as f64),
-        indicator(a.latency_p99 as f64, b.latency_p99 as f64, true));
-    println!("{:<22}  {:>16}  {:>22}  {}{}",
+        indicator(a.latency_p99 as f64, b.latency_p99 as f64, true)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}{}",
         "error rate",
         format!("{:.1}%", a.error_rate * 100.0),
         format!("{:.1}%", b.error_rate * 100.0),
         delta_pct(a.error_rate, b.error_rate),
-        indicator(a.error_rate, b.error_rate, true));
-    println!("{:<22}  {:>16}  {:>22}  {}",
+        indicator(a.error_rate, b.error_rate, true)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}",
         "avg input tokens",
         format!("{:.0}", a.avg_input_tokens),
         format!("{:.0}", b.avg_input_tokens),
-        delta_pct(a.avg_input_tokens, b.avg_input_tokens));
-    println!("{:<22}  {:>16}  {:>22}  {}",
+        delta_pct(a.avg_input_tokens, b.avg_input_tokens)
+    );
+    println!(
+        "{:<22}  {:>16}  {:>22}  {}",
         "avg output tokens",
         format!("{:.0}", a.avg_output_tokens),
         format!("{:.0}", b.avg_output_tokens),
-        delta_pct(a.avg_output_tokens, b.avg_output_tokens));
+        delta_pct(a.avg_output_tokens, b.avg_output_tokens)
+    );
     Ok(())
 }
 fn cmd_prompts(action: PromptsAction) -> Result<()> {
@@ -2127,13 +2508,21 @@ fn cmd_prompts(action: PromptsAction) -> Result<()> {
             let since = since.map(parse_since_ts).transpose()?;
             let prompts = store.list_prompts(since.as_deref(), model.as_deref())?;
             if prompts.is_empty() {
-                println!("{}", "No prompt fingerprints found. Are system prompts being captured?".dimmed());
+                println!(
+                    "{}",
+                    "No prompt fingerprints found. Are system prompts being captured?".dimmed()
+                );
                 return Ok(());
             }
-            println!("{}", format!(
-                "{:<16}  {:>6}  {:>9}  {:>8}  {:<12}  {}",
-                "hash", "calls", "avg_cost", "avg_lat", "first_seen", "preview"
-            ).bold().underline());
+            println!(
+                "{}",
+                format!(
+                    "{:<16}  {:>6}  {:>9}  {:>8}  {:<12}  {}",
+                    "hash", "calls", "avg_cost", "avg_lat", "first_seen", "preview"
+                )
+                .bold()
+                .underline()
+            );
             for p in &prompts {
                 let first = p.first_seen.get(..10).unwrap_or(&p.first_seen);
                 println!(
@@ -2147,17 +2536,15 @@ fn cmd_prompts(action: PromptsAction) -> Result<()> {
                 );
             }
         }
-        PromptsAction::Show { hash } => {
-            match store.get_prompt_text(&hash)? {
-                None => {
-                    println!("{}", format!("No prompt found for hash: {}", hash).red());
-                }
-                Some(text) => {
-                    println!("{}", "prompt text:".bold());
-                    println!("{}", text);
-                }
+        PromptsAction::Show { hash } => match store.get_prompt_text(&hash)? {
+            None => {
+                println!("{}", format!("No prompt found for hash: {}", hash).red());
             }
-        }
+            Some(text) => {
+                println!("{}", "prompt text:".bold());
+                println!("{}", text);
+            }
+        },
     }
     Ok(())
 }
@@ -2195,15 +2582,21 @@ async fn cmd_replay(
         .ok_or_else(|| anyhow::anyhow!("no call found with id prefix: {}", id))?;
 
     let req_body_str = record.request_body.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("call {} has no stored request body (was it captured with --no-request-bodies?)", &id)
+        anyhow::anyhow!(
+            "call {} has no stored request body (was it captured with --no-request-bodies?)",
+            &id
+        )
     })?;
 
     // Optionally patch the model field.
     let patched_body: String = if let Some(ref new_model) = model_override {
-        let mut v: serde_json::Value = serde_json::from_str(req_body_str)
-            .context("stored request body is not valid JSON")?;
+        let mut v: serde_json::Value =
+            serde_json::from_str(req_body_str).context("stored request body is not valid JSON")?;
         if let Some(obj) = v.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(new_model.clone()));
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(new_model.clone()),
+            );
         }
         serde_json::to_string(&v)?
     } else {
@@ -2213,9 +2606,7 @@ async fn cmd_replay(
     // Resolve upstream URL.
     let upstream = upstream_override
         .or_else(|| std::env::var("TRACE_UPSTREAM").ok())
-        .unwrap_or_else(|| {
-            capture::default_upstream_for_provider(&record.provider).to_string()
-        });
+        .unwrap_or_else(|| capture::default_upstream_for_provider(&record.provider).to_string());
 
     let replay_model = model_override.as_deref().unwrap_or(&record.model);
 
@@ -2255,23 +2646,38 @@ async fn cmd_replay(
     println!("  id: {}", record.id[..8.min(record.id.len())].cyan());
     println!();
 
-    let orig_cost_str = record.cost_usd
+    let orig_cost_str = record
+        .cost_usd
         .map(|c| format!("${:.6}", c))
         .unwrap_or_else(|| "-".to_string());
     let replay_cost_str = replay_cost
         .map(|c| format!("${:.6}", c))
         .unwrap_or_else(|| "-".to_string());
 
-    println!("{}", "Original ─────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "Original ─────────────────────────────────────────".dimmed()
+    );
     println!("  model        {}", record.model.cyan());
     println!("  status       {}", record.status_code.to_string().green());
     println!("  latency      {}ms", record.latency_ms.to_string().cyan());
-    println!("  in/out       {} / {}",
-        record.input_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
-        record.output_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+    println!(
+        "  in/out       {} / {}",
+        record
+            .input_tokens
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        record
+            .output_tokens
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
     println!("  cost         {}", orig_cost_str.cyan());
     println!();
-    println!("{}", "Replay ────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "Replay ────────────────────────────────────────────".dimmed()
+    );
     println!("  model        {}", replay_model.cyan());
 
     let status_str = if replay_status >= 400 {
@@ -2289,11 +2695,21 @@ async fn cmd_replay(
     } else {
         String::new()
     };
-    println!("  latency      {}ms{}", replay_latency_ms.to_string().cyan(), lat_delta);
+    println!(
+        "  latency      {}ms{}",
+        replay_latency_ms.to_string().cyan(),
+        lat_delta
+    );
 
-    println!("  in/out       {} / {}",
-        replay_in.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
-        replay_out.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+    println!(
+        "  in/out       {} / {}",
+        replay_in
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        replay_out
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
 
     // Cost delta
     let cost_delta = match (record.cost_usd, replay_cost) {
@@ -2514,7 +2930,9 @@ mod tests {
                 .unwrap();
         }
 
-        let records = store.query_all_filtered(&crate::store::QueryFilter::default()).unwrap();
+        let records = store
+            .query_all_filtered(&crate::store::QueryFilter::default())
+            .unwrap();
         assert_eq!(records.len(), 3);
 
         for r in &records {
@@ -2542,7 +2960,9 @@ mod tests {
     fn export_model_filter_applied() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_export_record("a", "gpt-4o")).unwrap();
-        store.insert(&make_export_record("b", "claude-opus-4")).unwrap();
+        store
+            .insert(&make_export_record("b", "claude-opus-4"))
+            .unwrap();
         store.insert(&make_export_record("c", "gpt-4o")).unwrap();
 
         let filter = crate::store::QueryFilter {
@@ -2586,11 +3006,19 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_cost_record("a", "gpt-4o", 1.5)).unwrap();
         store.insert(&make_cost_record("b", "gpt-4o", 2.0)).unwrap();
-        store.insert(&make_cost_record("c", "claude-opus-4", 0.75)).unwrap();
+        store
+            .insert(&make_cost_record("c", "claude-opus-4", 0.75))
+            .unwrap();
 
-        let records = store.query_all_filtered(&crate::store::QueryFilter::default()).unwrap();
+        let records = store
+            .query_all_filtered(&crate::store::QueryFilter::default())
+            .unwrap();
         let total: f64 = records.iter().map(|r| r.cost_usd.unwrap_or(0.0)).sum();
-        assert!((total - 4.25).abs() < 1e-9, "total cost should be $4.25, got ${}", total);
+        assert!(
+            (total - 4.25).abs() < 1e-9,
+            "total cost should be $4.25, got ${}",
+            total
+        );
     }
 
     #[test]
@@ -2598,11 +3026,17 @@ mod tests {
         // Verify threshold comparison logic: $6.00 total > $5.00 limit.
         let total_cost = 6.0_f64;
         let limit = 5.0_f64;
-        assert!(total_cost > limit, "cost exceeds threshold — should trigger failure");
+        assert!(
+            total_cost > limit,
+            "cost exceeds threshold — should trigger failure"
+        );
 
         // Below threshold should not trigger.
         let below = 4.99_f64;
-        assert!(below <= limit, "cost below threshold should not trigger failure");
+        assert!(
+            below <= limit,
+            "cost below threshold should not trigger failure"
+        );
     }
 
     #[test]
@@ -2615,9 +3049,18 @@ mod tests {
             cost_usd: 0.8423,
         }];
         let output = format_report_github(&rows, 142, 0.8423);
-        assert!(output.contains("| model |"), "GitHub output must contain table header");
-        assert!(output.contains("gpt-4o"), "GitHub output must contain model name");
-        assert!(output.contains("**Total:"), "GitHub output must contain total line");
+        assert!(
+            output.contains("| model |"),
+            "GitHub output must contain table header"
+        );
+        assert!(
+            output.contains("gpt-4o"),
+            "GitHub output must contain model name"
+        );
+        assert!(
+            output.contains("**Total:"),
+            "GitHub output must contain total line"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2799,7 +3242,10 @@ mod tests {
 
     #[test]
     fn parse_status_range_inverted_fails() {
-        assert!(parse_status_range("499-400").is_err(), "lo > hi should fail");
+        assert!(
+            parse_status_range("499-400").is_err(),
+            "lo > hi should fail"
+        );
     }
 
     #[test]
@@ -2859,8 +3305,11 @@ mod tests {
     #[test]
     fn eval_check_rule_latency_pass() {
         let stats = store::EvalStats {
-            total_calls: 10, error_count: 1, error_rate: 0.1,
-            latency_p99: 1500, avg_cost_usd: 0.001,
+            total_calls: 10,
+            error_count: 1,
+            error_rate: 0.1,
+            latency_p99: 1500,
+            avg_cost_usd: 0.001,
         };
         assert_eq!(eval_check_rule("latency_p99 < 2000", &stats), Ok(true));
         assert_eq!(eval_check_rule("latency_p99 < 1000", &stats), Ok(false));
@@ -2869,8 +3318,11 @@ mod tests {
     #[test]
     fn eval_check_rule_error_rate_pass() {
         let stats = store::EvalStats {
-            total_calls: 100, error_count: 3, error_rate: 0.03,
-            latency_p99: 500, avg_cost_usd: 0.0005,
+            total_calls: 100,
+            error_count: 3,
+            error_rate: 0.03,
+            latency_p99: 500,
+            avg_cost_usd: 0.0005,
         };
         assert_eq!(eval_check_rule("error_rate < 0.05", &stats), Ok(true));
         assert_eq!(eval_check_rule("error_rate < 0.01", &stats), Ok(false));
@@ -2879,8 +3331,11 @@ mod tests {
     #[test]
     fn eval_check_rule_bad_metric() {
         let stats = store::EvalStats {
-            total_calls: 1, error_count: 0, error_rate: 0.0,
-            latency_p99: 100, avg_cost_usd: 0.0,
+            total_calls: 1,
+            error_count: 0,
+            error_rate: 0.0,
+            latency_p99: 100,
+            avg_cost_usd: 0.0,
         };
         assert!(eval_check_rule("unknown_metric < 100", &stats).is_err());
     }
@@ -2888,8 +3343,11 @@ mod tests {
     #[test]
     fn eval_check_rule_bad_format() {
         let stats = store::EvalStats {
-            total_calls: 1, error_count: 0, error_rate: 0.0,
-            latency_p99: 100, avg_cost_usd: 0.0,
+            total_calls: 1,
+            error_count: 0,
+            error_rate: 0.0,
+            latency_p99: 100,
+            avg_cost_usd: 0.0,
         };
         assert!(eval_check_rule("malformed", &stats).is_err());
     }

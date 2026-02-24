@@ -21,7 +21,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use crate::store::{CallRecord, DailyStat, ModelStats, ProviderStats, QueryFilter, SearchResult, Stats, Store};
+use crate::store::{
+    CallRecord, DailyStat, ModelStats, ProviderStats, QueryFilter, SearchResult, Stats, Store,
+};
 
 // ---------------------------------------------------------------------------
 // Dashboard HTML
@@ -803,9 +805,16 @@ async fn api_stats_handler(State(state): State<ServeState>) -> Json<StatsRespons
         calls_last_hour: 0,
     });
     let models = store.stats_by_model().unwrap_or_default();
-    let (_, _, p99) = store.latency_percentiles(&QueryFilter::default()).unwrap_or((0.0, 0.0, 0.0));
+    let (_, _, p99) = store
+        .latency_percentiles(&QueryFilter::default())
+        .unwrap_or((0.0, 0.0, 0.0));
     let providers = store.stats_by_provider().unwrap_or_default();
-    Json(StatsResponse { stats, models, p99_latency_ms: p99, providers })
+    Json(StatsResponse {
+        stats,
+        models,
+        p99_latency_ms: p99,
+        providers,
+    })
 }
 
 async fn api_search_handler(
@@ -848,7 +857,10 @@ async fn api_detail_handler(
     let store = state.store.lock().unwrap();
     match store.get_by_id(&id) {
         Ok(Some(record)) => Ok(Json(record)),
-        Ok(None) => Err((StatusCode::NOT_FOUND, format!("No call found with id prefix: {id}"))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            format!("No call found with id prefix: {id}"),
+        )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
@@ -868,7 +880,10 @@ pub async fn cmd_serve(port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     println!("OpenTrace dashboard  → http://localhost:{}", port);
-    println!("Playground           → http://localhost:{}/playground", port);
+    println!(
+        "Playground           → http://localhost:{}/playground",
+        port
+    );
     println!("Press Ctrl-C to stop.");
 
     axum::serve(listener, app).await?;
@@ -918,7 +933,9 @@ mod tests {
     fn test_app() -> (Router, Arc<Mutex<Store>>) {
         let store = Store::open_in_memory().unwrap();
         let store = Arc::new(Mutex::new(store));
-        let state = ServeState { store: Arc::clone(&store) };
+        let state = ServeState {
+            store: Arc::clone(&store),
+        };
         (router(state), store)
     }
 
@@ -926,11 +943,21 @@ mod tests {
     async fn serve_api_calls_handler_returns_records() {
         let (app, store) = test_app();
         for i in 0..3u32 {
-            store.lock().unwrap().insert(&make_record(&format!("id-{i}"), "gpt-4o", 200)).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .insert(&make_record(&format!("id-{i}"), "gpt-4o", 200))
+                .unwrap();
         }
-        let resp = app.oneshot(
-            axum::http::Request::builder().uri("/api/calls").body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/calls")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let records: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
@@ -940,9 +967,15 @@ mod tests {
     #[tokio::test]
     async fn serve_api_stats_has_expected_fields() {
         let (app, _) = test_app();
-        let resp = app.oneshot(
-            axum::http::Request::builder().uri("/api/stats").body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/stats")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -953,11 +986,25 @@ mod tests {
     #[tokio::test]
     async fn serve_errors_filter_applied() {
         let (app, store) = test_app();
-        store.lock().unwrap().insert(&make_error_record("err-1")).unwrap();
-        store.lock().unwrap().insert(&make_record("ok-1", "gpt-4o", 200)).unwrap();
-        let resp = app.oneshot(
-            axum::http::Request::builder().uri("/api/calls?errors=true").body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        store
+            .lock()
+            .unwrap()
+            .insert(&make_error_record("err-1"))
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .insert(&make_record("ok-1", "gpt-4o", 200))
+            .unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/calls?errors=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let records: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert_eq!(records.len(), 1);
@@ -966,12 +1013,20 @@ mod tests {
     #[tokio::test]
     async fn serve_api_search_returns_results() {
         let (app, store) = test_app();
-        store.lock().unwrap().insert(&make_record("srch-1", "gpt-4o-serve-search-test", 200)).unwrap();
-        let resp = app.oneshot(
-            axum::http::Request::builder()
-                .uri("/api/search?q=gpt-4o-serve-search-test")
-                .body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        store
+            .lock()
+            .unwrap()
+            .insert(&make_record("srch-1", "gpt-4o-serve-search-test", 200))
+            .unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/search?q=gpt-4o-serve-search-test")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -981,10 +1036,20 @@ mod tests {
     #[tokio::test]
     async fn serve_api_heatmap_returns_array() {
         let (app, store) = test_app();
-        store.lock().unwrap().insert(&make_record("hm-1", "gpt-4o", 200)).unwrap();
-        let resp = app.oneshot(
-            axum::http::Request::builder().uri("/api/heatmap?days=7").body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        store
+            .lock()
+            .unwrap()
+            .insert(&make_record("hm-1", "gpt-4o", 200))
+            .unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/heatmap?days=7")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -994,21 +1059,35 @@ mod tests {
     #[tokio::test]
     async fn serve_playground_route_returns_200() {
         let (app, _) = test_app();
-        let resp = app.oneshot(
-            axum::http::Request::builder().uri("/playground").body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/playground")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
     async fn serve_api_detail_returns_record() {
         let (app, store) = test_app();
-        store.lock().unwrap().insert(&make_record("detail-test-id-1234", "gpt-4o", 200)).unwrap();
-        let resp = app.oneshot(
-            axum::http::Request::builder()
-                .uri("/api/detail/detail-test-id-1234")
-                .body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        store
+            .lock()
+            .unwrap()
+            .insert(&make_record("detail-test-id-1234", "gpt-4o", 200))
+            .unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/detail/detail-test-id-1234")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1018,11 +1097,15 @@ mod tests {
     #[tokio::test]
     async fn serve_api_detail_returns_404_for_unknown_id() {
         let (app, _) = test_app();
-        let resp = app.oneshot(
-            axum::http::Request::builder()
-                .uri("/api/detail/nonexistent-id")
-                .body(axum::body::Body::empty()).unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/detail/nonexistent-id")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 404);
     }
 }

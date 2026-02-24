@@ -192,7 +192,9 @@ async fn handle(
     let req_str = match std::str::from_utf8(&req_bytes) {
         Ok(s) => s.to_string(),
         Err(_) => {
-            if verbose { eprintln!("[trace] warning: request body is not UTF-8"); }
+            if verbose {
+                eprintln!("[trace] warning: request body is not UTF-8");
+            }
             "(binary body)".to_string()
         }
     };
@@ -209,11 +211,16 @@ async fn handle(
     };
 
     // Compute prompt hash from the stored request body (after redaction).
-    let prompt_hash = stored_req_body.as_deref().and_then(capture::extract_prompt_hash);
+    let prompt_hash = stored_req_body
+        .as_deref()
+        .and_then(capture::extract_prompt_hash);
 
     // Warn on first use of unknown model so cost estimates are transparent.
     if verbose && !capture::is_known_model(&model) {
-        eprintln!("[trace] warning: unknown model '{}', cost estimated at $1/$3 per MTok", model);
+        eprintln!(
+            "[trace] warning: unknown model '{}', cost estimated at $1/$3 per MTok",
+            model
+        );
     }
 
     // Build upstream URL — include query string so params like ?limit=10 are forwarded.
@@ -239,7 +246,8 @@ async fn handle(
 
     for (name, value) in &headers {
         let n = name.as_str().to_lowercase();
-        if matches!(n.as_str(),
+        if matches!(
+            n.as_str(),
             // Standard hop-by-hop headers
             "host" | "connection" | "transfer-encoding" | "content-length"
             | "te" | "trailers" | "upgrade" | "keep-alive"
@@ -260,7 +268,10 @@ async fn handle(
             Some(i) => format!("{}?[redacted]", &upstream_url[..i]),
             None => upstream_url.clone(),
         };
-        eprintln!("[trace] → {} {} (model={}, stream={})", method, logged_url, model, streaming);
+        eprintln!(
+            "[trace] → {} {} (model={}, stream={})",
+            method, logged_url, model, streaming
+        );
     }
 
     let upstream_resp = match req_builder.send().await {
@@ -318,7 +329,10 @@ async fn handle(
     let mut builder = Response::builder().status(status.as_u16());
     for (k, v) in &resp_headers {
         let n = k.as_str().to_lowercase();
-        if matches!(n.as_str(), "connection" | "transfer-encoding" | "keep-alive") {
+        if matches!(
+            n.as_str(),
+            "connection" | "transfer-encoding" | "keep-alive"
+        ) {
             continue;
         }
         builder = builder.header(k, v);
@@ -371,9 +385,7 @@ async fn handle(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(std::io::Error::other(
-                            e.to_string()
-                        ))).await;
+                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                         break;
                     }
                 }
@@ -385,13 +397,21 @@ async fn handle(
                 .unwrap_or((None, None));
 
             let cost_usd = match (input_tokens, output_tokens) {
-                (Some(i), Some(o)) => Some(capture::estimate_cost_from_chunks(&model, &accumulated, i, o)),
+                (Some(i), Some(o)) => Some(capture::estimate_cost_from_chunks(
+                    &model,
+                    &accumulated,
+                    i,
+                    o,
+                )),
                 _ => None,
             };
 
             // Extract and store the text content from SSE chunks.
             let response_body = if overflow {
-                Some(format!("(too large to store — {} bytes accumulated)", accumulated_bytes))
+                Some(format!(
+                    "(too large to store — {} bytes accumulated)",
+                    accumulated_bytes
+                ))
             } else {
                 let text = capture::extract_response_text_from_chunks(&accumulated);
                 if text.is_empty() {
@@ -406,8 +426,11 @@ async fn handle(
             if verbose {
                 eprintln!(
                     "[trace] ← {} {}ms ttft={:?}ms in={:?} out={:?} cost=${:.6}",
-                    status.as_u16(), latency_ms,
-                    ttft_ms, input_tokens, output_tokens,
+                    status.as_u16(),
+                    latency_ms,
+                    ttft_ms,
+                    input_tokens,
+                    output_tokens,
                     cost_usd.unwrap_or(0.0)
                 );
             }
@@ -436,9 +459,14 @@ async fn handle(
         });
 
         let stream_body = Body::from_stream(ReceiverStream::new(rx));
-        Ok(builder.body(stream_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        Ok(builder
+            .body(stream_body)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
     } else {
-        let resp_bytes = upstream_resp.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let resp_bytes = upstream_resp
+            .bytes()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
         let latency_ms = start.elapsed().as_millis() as u64;
         // For non-streaming, TTFT equals total latency — the full response IS
         // the first (and only) delivery of tokens.
@@ -462,19 +490,25 @@ async fn handle(
             match std::str::from_utf8(&resp_bytes) {
                 Ok(s) => Some(s.to_string()),
                 Err(_) => {
-                    if verbose { eprintln!("[trace] warning: response body is not UTF-8"); }
+                    if verbose {
+                        eprintln!("[trace] warning: response body is not UTF-8");
+                    }
                     None
                 }
             }
         };
-        let (input_tokens, output_tokens) = resp_str.as_deref()
+        let (input_tokens, output_tokens) = resp_str
+            .as_deref()
             .and_then(capture::extract_usage)
             .map(|(i, o)| (Some(i), Some(o)))
             .unwrap_or((None, None));
 
         let cost_usd = match (input_tokens, output_tokens) {
             (Some(i), Some(o)) => Some(capture::estimate_cost_from_body(
-                &model, resp_str.as_deref().unwrap_or(""), i, o,
+                &model,
+                resp_str.as_deref().unwrap_or(""),
+                i,
+                o,
             )),
             _ => None,
         };
@@ -482,8 +516,10 @@ async fn handle(
         if verbose {
             eprintln!(
                 "[trace] ← {} {}ms in={:?} out={:?} cost=${:.6}",
-                status.as_u16(), latency_ms,
-                input_tokens, output_tokens,
+                status.as_u16(),
+                latency_ms,
+                input_tokens,
+                output_tokens,
                 cost_usd.unwrap_or(0.0)
             );
         }
@@ -510,7 +546,9 @@ async fn handle(
         };
         try_store(&store_tx, record, verbose);
 
-        Ok(builder.body(Body::from(resp_bytes)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        Ok(builder
+            .body(Body::from(resp_bytes))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
     }
 }
 
@@ -519,7 +557,10 @@ mod tests {
     use super::*;
 
     fn route(path: &str, upstream: &str) -> UpstreamRoute {
-        UpstreamRoute { path: path.to_string(), upstream: Arc::new(upstream.to_string()) }
+        UpstreamRoute {
+            path: path.to_string(),
+            upstream: Arc::new(upstream.to_string()),
+        }
     }
 
     #[test]
@@ -580,7 +621,8 @@ mod tests {
         let routes = vec![route("/v1/messages", "https://api.anthropic.com")];
         let result = resolve_upstream(&default, &routes, "/v1/messages2");
         assert_eq!(
-            result.as_str(), "https://api.openai.com",
+            result.as_str(),
+            "https://api.openai.com",
             "/v1/messages should not match /v1/messages2 — no path-segment boundary"
         );
     }
@@ -612,7 +654,10 @@ mod tests {
                 .unwrap(),
         );
         let (trace_id, parent_id) = extract_trace_ids(&headers);
-        assert_eq!(trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(
+            trace_id.as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
         assert_eq!(parent_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 

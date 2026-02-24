@@ -25,7 +25,11 @@ pub fn to_langfuse_line(r: &CallRecord) -> String {
     };
     let req_body = parse_body(r.request_body.as_deref());
     let resp_body = parse_body(r.response_body.as_deref());
-    let level = if r.error.is_some() { "ERROR" } else { "DEFAULT" };
+    let level = if r.error.is_some() {
+        "ERROR"
+    } else {
+        "DEFAULT"
+    };
 
     let v = json!({
         "batch": [{
@@ -204,7 +208,9 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: Some(0.002),
             request_body: Some(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string()),
-            response_body: Some(r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#.to_string()),
+            response_body: Some(
+                r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#.to_string(),
+            ),
             error: None,
             provider_request_id: None,
             trace_id: None,
@@ -261,7 +267,10 @@ mod tests {
     fn add_ms_increases_timestamp() {
         let ts = "2026-02-23T10:00:00Z";
         let result = add_ms(ts, 1500); // 1.5 seconds
-        assert!(result.contains("10:00:01") || result.contains("10:00:00"), "timestamp should advance");
+        assert!(
+            result.contains("10:00:01") || result.contains("10:00:00"),
+            "timestamp should advance"
+        );
         assert_ne!(result, ts);
     }
 

@@ -147,8 +147,7 @@ impl MetricsState {
                 }
             }
             buckets[4] += 1; // +Inf always
-            *inner.latency_sum.entry(r.model.clone()).or_insert(0.0) +=
-                r.latency_ms as f64;
+            *inner.latency_sum.entry(r.model.clone()).or_insert(0.0) += r.latency_ms as f64;
             *inner.latency_count.entry(r.model.clone()).or_insert(0) += 1;
         }
 
@@ -274,7 +273,9 @@ impl MetricsState {
         }
 
         // --- opentrace_dropped_records_total ---------------------------------
-        out.push_str("# HELP opentrace_dropped_records_total Records dropped due to DB backpressure\n");
+        out.push_str(
+            "# HELP opentrace_dropped_records_total Records dropped due to DB backpressure\n",
+        );
         out.push_str("# TYPE opentrace_dropped_records_total gauge\n");
         out.push_str(&format!(
             "opentrace_dropped_records_total {}\n",

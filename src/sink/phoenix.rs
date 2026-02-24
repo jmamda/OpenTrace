@@ -60,12 +60,16 @@ impl PhoenixSink {
         if let Some(ref body) = record.request_body {
             let t = truncate_to_10k(body);
             attrs.push(json!({"key": "input.value",     "value": {"stringValue": t}}));
-            attrs.push(json!({"key": "input.mime_type", "value": {"stringValue": "application/json"}}));
+            attrs.push(
+                json!({"key": "input.mime_type", "value": {"stringValue": "application/json"}}),
+            );
         }
         if let Some(ref body) = record.response_body {
             let t = truncate_to_10k(body);
             attrs.push(json!({"key": "output.value",     "value": {"stringValue": t}}));
-            attrs.push(json!({"key": "output.mime_type", "value": {"stringValue": "application/json"}}));
+            attrs.push(
+                json!({"key": "output.mime_type", "value": {"stringValue": "application/json"}}),
+            );
         }
 
         let is_error =
@@ -143,13 +147,20 @@ fn timestamp_to_nanos(ts: &str) -> u64 {
 
 /// Standard Base64 encoder (RFC 4648, no line breaks).
 fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
         result.push(TABLE[b0 >> 2] as char);
         result.push(TABLE[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
         if chunk.len() > 1 {
@@ -237,8 +248,7 @@ mod tests {
     #[test]
     fn error_status_code_zero_is_error() {
         let r = make_record(0, Some("connection refused"));
-        let is_error =
-            r.status_code == 0 || r.status_code >= 400 || r.error.is_some();
+        let is_error = r.status_code == 0 || r.status_code >= 400 || r.error.is_some();
         assert!(is_error);
     }
 

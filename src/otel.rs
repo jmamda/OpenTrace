@@ -110,15 +110,14 @@ impl OtelExporter {
             attrs.push(json!({"key": "error.type", "value": {"stringValue": err}}));
         }
 
-        let is_error =
-            r.status_code == 0 || r.status_code >= 400 || r.error.is_some();
+        let is_error = r.status_code == 0 || r.status_code >= 400 || r.error.is_some();
         let status = if is_error {
             json!({
                 "code": 2,   // STATUS_CODE_ERROR
                 "message": r.error.as_deref().unwrap_or("upstream error")
             })
         } else {
-            json!({"code": 1})  // STATUS_CODE_OK
+            json!({"code": 1}) // STATUS_CODE_OK
         };
 
         let mut span = json!({
@@ -200,19 +199,19 @@ fn derive_operation(endpoint: &str) -> &'static str {
 /// Map an internal provider slug to the OTel `gen_ai.system` well-known value.
 fn map_provider(p: &str) -> &str {
     match p {
-        "openai"      => "openai",
-        "anthropic"   => "anthropic",
-        "bedrock"     => "aws.bedrock",
-        "azure"       => "azure.ai.openai",
-        "google"      => "gcp.vertex_ai",
-        "cohere"      => "cohere",
-        "deepseek"    => "deepseek",
-        "groq"        => "groq",
-        "mistral"     => "mistral_ai",
-        "perplexity"  => "perplexity",
-        "xai"         => "x_ai",
-        "ollama"      => "ollama",
-        other         => other,
+        "openai" => "openai",
+        "anthropic" => "anthropic",
+        "bedrock" => "aws.bedrock",
+        "azure" => "azure.ai.openai",
+        "google" => "gcp.vertex_ai",
+        "cohere" => "cohere",
+        "deepseek" => "deepseek",
+        "groq" => "groq",
+        "mistral" => "mistral_ai",
+        "perplexity" => "perplexity",
+        "xai" => "x_ai",
+        "ollama" => "ollama",
+        other => other,
     }
 }
 
@@ -227,13 +226,20 @@ pub fn timestamp_to_nanos(ts: &str) -> u64 {
 
 /// Standard Base64 encoder (RFC 4648, no line breaks).
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
         result.push(TABLE[b0 >> 2] as char);
         result.push(TABLE[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
         if chunk.len() > 1 {
@@ -303,44 +309,66 @@ mod tests {
 
         // Attributes must include all expected keys.
         let attrs = span["attributes"].as_array().unwrap();
-        let find = |key: &str| -> Option<&Value> {
-            attrs.iter().find(|a| a["key"].as_str() == Some(key))
-        };
+        let find =
+            |key: &str| -> Option<&Value> { attrs.iter().find(|a| a["key"].as_str() == Some(key)) };
 
         // gen_ai.* semantic convention attributes
         assert_eq!(
-            find("gen_ai.request.model").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("gen_ai.request.model").unwrap()["value"]["stringValue"]
+                .as_str()
+                .unwrap(),
             "gpt-4o"
         );
         assert_eq!(
-            find("gen_ai.system").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("gen_ai.system").unwrap()["value"]["stringValue"]
+                .as_str()
+                .unwrap(),
             "openai"
         );
         assert_eq!(
-            find("http.status_code").unwrap()["value"]["intValue"].as_i64().unwrap(),
+            find("http.status_code").unwrap()["value"]["intValue"]
+                .as_i64()
+                .unwrap(),
             200
         );
         assert_eq!(
-            find("gen_ai.usage.input_tokens").unwrap()["value"]["intValue"].as_i64().unwrap(),
+            find("gen_ai.usage.input_tokens").unwrap()["value"]["intValue"]
+                .as_i64()
+                .unwrap(),
             100
         );
         assert_eq!(
-            find("gen_ai.usage.output_tokens").unwrap()["value"]["intValue"].as_i64().unwrap(),
+            find("gen_ai.usage.output_tokens").unwrap()["value"]["intValue"]
+                .as_i64()
+                .unwrap(),
             50
         );
-        assert!(find("llm.cost_usd").is_some(), "cost_usd attr should be present");
-        assert!(find("llm.ttft_ms").is_some(), "ttft_ms attr should be present");
+        assert!(
+            find("llm.cost_usd").is_some(),
+            "cost_usd attr should be present"
+        );
+        assert!(
+            find("llm.ttft_ms").is_some(),
+            "ttft_ms attr should be present"
+        );
 
         // OpenInference attributes
         assert_eq!(
-            find("openinference.span.kind").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("openinference.span.kind").unwrap()["value"]["stringValue"]
+                .as_str()
+                .unwrap(),
             "LLM"
         );
         assert_eq!(
-            find("llm.model_name").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("llm.model_name").unwrap()["value"]["stringValue"]
+                .as_str()
+                .unwrap(),
             "gpt-4o"
         );
-        assert!(find("llm.token_count.total").is_some(), "token total should be present");
+        assert!(
+            find("llm.token_count.total").is_some(),
+            "token total should be present"
+        );
     }
 
     #[test]
@@ -352,7 +380,10 @@ mod tests {
         assert_eq!(span["status"]["code"].as_u64().unwrap(), 2);
         assert!(span["status"]["message"].as_str().is_some());
         // exception event should be present
-        assert!(span["events"].as_array().is_some(), "error should produce exception event");
+        assert!(
+            span["events"].as_array().is_some(),
+            "error should produce exception event"
+        );
     }
 
     #[test]
@@ -360,7 +391,13 @@ mod tests {
         let r = make_record(200, 200, None);
         let span = OtelExporter::build_span(&r);
         assert_eq!(span["status"]["code"].as_u64().unwrap(), 1); // OK
-        assert!(span["events"].is_null() || span["events"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        assert!(
+            span["events"].is_null()
+                || span["events"]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -369,19 +406,15 @@ mod tests {
         let r = make_record(200, 500, None); // 500 ms
         let span = OtelExporter::build_span(&r);
 
-        let start: u64 = span["startTimeUnixNano"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let end: u64 = span["endTimeUnixNano"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let start: u64 = span["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
+        let end: u64 = span["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
 
         assert!(start > 0, "startTimeUnixNano should be non-zero");
-        assert_eq!(end - start, 500 * 1_000_000, "end - start should equal latency_ms * 1e6");
+        assert_eq!(
+            end - start,
+            500 * 1_000_000,
+            "end - start should equal latency_ms * 1e6"
+        );
     }
 
     #[test]
@@ -391,7 +424,11 @@ mod tests {
         r.output_tokens = None;
         r.cost_usd = None;
         let span = OtelExporter::build_span(&r);
-        assert_eq!(span["status"]["code"].as_u64().unwrap(), 2, "status_code=0 must be ERROR");
+        assert_eq!(
+            span["status"]["code"].as_u64().unwrap(),
+            2,
+            "status_code=0 must be ERROR"
+        );
     }
 
     #[test]
@@ -401,11 +438,12 @@ mod tests {
         let span = OtelExporter::build_span(&r);
         assert_eq!(span["name"].as_str().unwrap(), "embeddings gpt-4o");
         let attrs = span["attributes"].as_array().unwrap();
-        let find = |key: &str| -> Option<&Value> {
-            attrs.iter().find(|a| a["key"].as_str() == Some(key))
-        };
+        let find =
+            |key: &str| -> Option<&Value> { attrs.iter().find(|a| a["key"].as_str() == Some(key)) };
         assert_eq!(
-            find("gen_ai.operation.name").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("gen_ai.operation.name").unwrap()["value"]["stringValue"]
+                .as_str()
+                .unwrap(),
             "embeddings"
         );
     }
