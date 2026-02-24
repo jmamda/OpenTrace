@@ -371,8 +371,8 @@ async fn handle(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other, e.to_string()
+                        let _ = tx.send(Err(std::io::Error::other(
+                            e.to_string()
                         ))).await;
                         break;
                     }

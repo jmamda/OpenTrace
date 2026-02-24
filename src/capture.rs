@@ -90,10 +90,7 @@ pub fn extract_usage_from_chunks(chunks: &[Bytes]) -> Option<(i64, i64)> {
     // If we have input tokens, return them even if output tokens are missing.
     // Defaulting output to 0 is consistent with how extract_usage() handles
     // embedding endpoints (which never return completion_tokens).
-    match input_tokens {
-        Some(i) => Some((i, output_tokens.unwrap_or(0))),
-        None => None,
-    }
+    input_tokens.map(|i| (i, output_tokens.unwrap_or(0)))
 }
 
 /// Extract the concatenated text content from SSE chunks.
@@ -168,22 +165,22 @@ pub fn extract_response_text_from_chunks(chunks: &[Bytes]) -> String {
 
         // ---- Anthropic tool use -----------------------------------------
         // content_block_start: {"type":"content_block_start","content_block":{"type":"tool_use","name":"..."}}
-        if v["type"].as_str() == Some("content_block_start") {
-            if v["content_block"]["type"].as_str() == Some("tool_use") {
-                if let Some(name) = v["content_block"]["name"].as_str() {
-                    ant_tools.push((name.to_string(), String::new()));
-                }
+        if v["type"].as_str() == Some("content_block_start")
+            && v["content_block"]["type"].as_str() == Some("tool_use")
+        {
+            if let Some(name) = v["content_block"]["name"].as_str() {
+                ant_tools.push((name.to_string(), String::new()));
             }
         }
 
         // content_block_delta: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"..."}}
-        if v["type"].as_str() == Some("content_block_delta") {
-            if v["delta"]["type"].as_str() == Some("input_json_delta") {
-                if let Some(frag) = v["delta"]["partial_json"].as_str() {
-                    // Append to the most recently opened tool use block.
-                    if let Some(last) = ant_tools.last_mut() {
-                        last.1.push_str(frag);
-                    }
+        if v["type"].as_str() == Some("content_block_delta")
+            && v["delta"]["type"].as_str() == Some("input_json_delta")
+        {
+            if let Some(frag) = v["delta"]["partial_json"].as_str() {
+                // Append to the most recently opened tool use block.
+                if let Some(last) = ant_tools.last_mut() {
+                    last.1.push_str(frag);
                 }
             }
         }

@@ -132,6 +132,32 @@ fn truncate_10k(s: &str) -> &str {
     &s[..end]
 }
 
+/// Standard Base64 encoder (RFC 4648, no line breaks).
+/// Copied inline — no import from `otel` to keep modules independent.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        result.push(TABLE[b0 >> 2] as char);
+        result.push(TABLE[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
+        if chunk.len() > 1 {
+            result.push(TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(TABLE[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -210,30 +236,4 @@ mod tests {
     fn base64_encode_basic() {
         assert_eq!(base64_encode(b"foo"), "Zm9v");
     }
-}
-
-/// Standard Base64 encoder (RFC 4648, no line breaks).
-/// Copied inline — no import from `otel` to keep modules independent.
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        result.push(TABLE[b0 >> 2] as char);
-        result.push(TABLE[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
-        if chunk.len() > 1 {
-            result.push(TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(TABLE[b2 & 0x3f] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
 }

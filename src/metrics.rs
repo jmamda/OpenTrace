@@ -50,6 +50,12 @@ pub struct MetricsState {
     inner: Mutex<MetricsInner>,
 }
 
+impl Default for MetricsState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsState {
     pub fn new() -> Self {
         MetricsState {
