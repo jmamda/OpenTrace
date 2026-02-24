@@ -27,6 +27,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the proxy server
     Start {
@@ -592,7 +593,7 @@ async fn cmd_start(
 
     // Validate upstream URL scheme early — prevent footguns like file:/// or ftp://.
     {
-        let scheme = upstream.splitn(2, "://").next().unwrap_or("");
+        let scheme = upstream.split("://").next().unwrap_or("");
         if !matches!(scheme, "http" | "https") {
             anyhow::bail!(
                 "upstream URL must use http:// or https://, got: {:?}\n  Example: trace start --upstream https://api.openai.com",
@@ -619,7 +620,7 @@ async fn cmd_start(
             if !path.starts_with('/') {
                 anyhow::bail!("--route path {:?} must start with '/'", path);
             }
-            let scheme = url.splitn(2, "://").next().unwrap_or("");
+            let scheme = url.split("://").next().unwrap_or("");
             if !matches!(scheme, "http" | "https") {
                 anyhow::bail!("--route URL {:?} must use http:// or https://", url);
             }
@@ -631,7 +632,7 @@ async fn cmd_start(
                 if !r.path.starts_with('/') {
                     anyhow::bail!("config route path {:?} must start with '/'", r.path);
                 }
-                let scheme = r.upstream.splitn(2, "://").next().unwrap_or("");
+                let scheme = r.upstream.split("://").next().unwrap_or("");
                 if !matches!(scheme, "http" | "https") {
                     anyhow::bail!(
                         "config route upstream {:?} must use http:// or https://",
@@ -1035,6 +1036,7 @@ async fn shutdown_signal() {
     eprintln!("[trace] shutting down gracefully...");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_query(
     limit: usize,
     json: bool,
@@ -1169,7 +1171,7 @@ async fn cmd_watch(
         }
 
         budget_tick += 1;
-        if budget_tick % 40 == 0 {
+        if budget_tick.is_multiple_of(40) {
             if let Some(limit) = budget_alert_usd {
                 let since = period_start_iso(&budget_period);
                 budget_spent = store.cost_since(&since).unwrap_or(budget_spent);
@@ -2074,7 +2076,7 @@ fn cmd_compare(
         if b_better { "  ✓" } else { "  ✗" }
     }
 
-    println!("{:<22}  {:>16}  {:>22}  {}", "", model_a.as_str(), model_b.as_str(), "delta");
+    println!("{:<22}  {:>16}  {:>22}  delta", "", model_a.as_str(), model_b.as_str());
     println!("{:<22}  {:>16}  {:>22}  {}", "calls", fmt_num_commas(a.calls), fmt_num_commas(b.calls), delta_pct(a.calls as f64, b.calls as f64));
     println!("{:<22}  {:>16}  {:>22}  {}{}",
         "avg cost/call",
@@ -2371,13 +2373,11 @@ fn truncate(s: &str, max: usize) -> String {
 fn dim_json(s: &str, max: usize) -> String {
     let trimmed = s.trim();
     let mut clipped = String::new();
-    let mut count = 0;
-    for c in trimmed.chars() {
+    for (count, c) in trimmed.chars().enumerate() {
         if count >= max {
             return format!("{}…", clipped).dimmed().to_string();
         }
         clipped.push(c);
-        count += 1;
     }
     trimmed.dimmed().to_string()
 }
@@ -2444,8 +2444,7 @@ mod tests {
     #[test]
     fn playground_command_default_port() {
         // Just verify the variant exists and resolves the default port correctly
-        let port: Option<u16> = None;
-        let resolved = port.unwrap_or(8080);
+        let resolved: u16 = 8080;
         assert_eq!(resolved, 8080);
     }
 
@@ -2603,7 +2602,7 @@ mod tests {
 
         // Below threshold should not trigger.
         let below = 4.99_f64;
-        assert!(!(below > limit), "cost below threshold should not trigger failure");
+        assert!(below <= limit, "cost below threshold should not trigger failure");
     }
 
     #[test]
