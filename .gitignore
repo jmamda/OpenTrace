@@ -1,1 +1,5 @@
 /target
+dev-test.sh
+*.db
+*.db-wal
+*.db-shm

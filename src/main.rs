@@ -1,9 +1,11 @@
 mod capture;
 mod config;
+mod export_formats;
 mod metrics;
 mod otel;
 mod proxy;
 mod serve;
+mod sink;
 mod store;
 
 use anyhow::{Context, Result};
@@ -16,7 +18,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.3.4",
+    version = "0.3.5",
     long_about = None,
 )]
 struct Cli {
@@ -63,6 +65,42 @@ enum Commands {
         /// Send spans to this OTLP HTTP endpoint (e.g. http://localhost:4318).
         #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
         otel_endpoint: Option<String>,
+
+        /// Forward calls to Langfuse (provide public key; also set --langfuse-secret-key).
+        #[arg(long, env = "LANGFUSE_PUBLIC_KEY")]
+        langfuse_public_key: Option<String>,
+
+        /// Langfuse secret key (required when --langfuse-public-key is set).
+        #[arg(long, env = "LANGFUSE_SECRET_KEY")]
+        langfuse_secret_key: Option<String>,
+
+        /// Langfuse base URL for self-hosted deployments [default: https://cloud.langfuse.com].
+        #[arg(long, env = "LANGFUSE_BASEURL", default_value = "https://cloud.langfuse.com")]
+        langfuse_url: String,
+
+        /// Forward calls to LangSmith (provide API key).
+        #[arg(long, env = "LANGCHAIN_API_KEY")]
+        langsmith_api_key: Option<String>,
+
+        /// LangSmith base endpoint [default: https://api.smith.langchain.com].
+        #[arg(long, env = "LANGCHAIN_ENDPOINT", default_value = "https://api.smith.langchain.com")]
+        langsmith_endpoint: String,
+
+        /// Forward calls to W&B Weave (provide API key; also set --weave-project).
+        #[arg(long, env = "WANDB_API_KEY")]
+        weave_api_key: Option<String>,
+
+        /// W&B Weave project in entity/project format.
+        #[arg(long, env = "WANDB_PROJECT")]
+        weave_project: Option<String>,
+
+        /// Forward calls to Arize Phoenix via OTLP (provide endpoint, e.g. http://localhost:6006).
+        #[arg(long, env = "PHOENIX_COLLECTOR_ENDPOINT")]
+        phoenix_endpoint: Option<String>,
+
+        /// Arize Phoenix API key (optional, required for Phoenix cloud).
+        #[arg(long, env = "PHOENIX_API_KEY")]
+        phoenix_api_key: Option<String>,
 
         /// Comma-separated top-level JSON keys to redact from stored request bodies.
         /// Example: --redact-fields messages,system_prompt
@@ -205,7 +243,7 @@ enum Commands {
 
     /// Export captured calls to stdout (pipe to a file with > calls.jsonl)
     Export {
-        /// Output format: jsonl (default) or csv
+        /// Output format: jsonl (default), csv, langfuse, langsmith, weave
         #[arg(long, default_value = "jsonl")]
         format: String,
 
@@ -412,11 +450,19 @@ async fn main() -> Result<()> {
         Commands::Start {
             port, upstream, bind, verbose, upstream_timeout, retention_days,
             no_request_bodies, metrics_port, otel_endpoint,
+            langfuse_public_key, langfuse_secret_key, langfuse_url,
+            langsmith_api_key, langsmith_endpoint,
+            weave_api_key, weave_project,
+            phoenix_endpoint, phoenix_api_key,
             redact_fields, budget_alert_usd, budget_period, route,
         } => {
             cmd_start(
                 port, upstream, bind, verbose, upstream_timeout, retention_days,
                 no_request_bodies, metrics_port, otel_endpoint,
+                langfuse_public_key, langfuse_secret_key, langfuse_url,
+                langsmith_api_key, langsmith_endpoint,
+                weave_api_key, weave_project,
+                phoenix_endpoint, phoenix_api_key,
                 redact_fields, budget_alert_usd, budget_period, route,
                 &cfg,
             ).await
@@ -499,6 +545,15 @@ async fn cmd_start(
     no_request_bodies: bool,
     metrics_port: Option<u16>,
     otel_endpoint: Option<String>,
+    langfuse_public_key: Option<String>,
+    langfuse_secret_key: Option<String>,
+    langfuse_url: String,
+    langsmith_api_key: Option<String>,
+    langsmith_endpoint: String,
+    weave_api_key: Option<String>,
+    weave_project: Option<String>,
+    phoenix_endpoint: Option<String>,
+    phoenix_api_key: Option<String>,
     redact_fields_str: Option<String>,
     budget_alert_usd: Option<f64>,
     budget_period: Option<String>,
@@ -614,7 +669,7 @@ async fn cmd_start(
     let store = store::Store::open().context("failed to open trace database")?;
     let db_path = store::db_path()?;
 
-    println!("{}", "trace v0.28.0".bold());
+    println!("{}", format!("trace v{}", env!("CARGO_PKG_VERSION")).bold());
     println!("  listening  {}", format!("http://{}:{}", bind, port).cyan());
     println!("  upstream   {}", upstream.cyan());
     if !routes.is_empty() {
@@ -633,6 +688,18 @@ async fn cmd_start(
     }
     if let Some(ref ep) = otel_endpoint {
         println!("  otel       {}", ep.cyan());
+    }
+    if langfuse_public_key.is_some() && langfuse_secret_key.is_some() {
+        println!("  langfuse   {}", langfuse_url.cyan());
+    }
+    if langsmith_api_key.is_some() {
+        println!("  langsmith  {}", langsmith_endpoint.cyan());
+    }
+    if weave_api_key.is_some() && weave_project.is_some() {
+        println!("  weave      {}", "trace.wandb.ai".cyan());
+    }
+    if let Some(ref ep) = phoenix_endpoint {
+        println!("  phoenix    {}", ep.cyan());
     }
     if !redact_fields.is_empty() {
         println!("  redact     {}", redact_fields.join(", ").cyan());
@@ -701,10 +768,39 @@ async fn cmd_start(
         Arc::new(otel::OtelExporter::new(ep.to_string()))
     });
 
+    // Build optional external sinks.
+    let langfuse_sink: Option<Arc<sink::LangfuseSink>> =
+        match (langfuse_public_key.as_deref(), langfuse_secret_key.as_deref()) {
+            (Some(pub_k), Some(sec_k)) => {
+                Some(Arc::new(sink::LangfuseSink::new(&langfuse_url, pub_k, sec_k)))
+            }
+            _ => None,
+        };
+
+    let langsmith_sink: Option<Arc<sink::LangSmithSink>> = langsmith_api_key
+        .as_deref()
+        .map(|k| Arc::new(sink::LangSmithSink::new(&langsmith_endpoint, k)));
+
+    let weave_sink: Option<Arc<sink::WeaveSink>> =
+        match (weave_api_key.as_deref(), weave_project.as_deref()) {
+            (Some(key), Some(proj)) => {
+                Some(Arc::new(sink::WeaveSink::new("https://trace.wandb.ai", key, proj)))
+            }
+            _ => None,
+        };
+
+    let phoenix_sink: Option<Arc<sink::PhoenixSink>> = phoenix_endpoint
+        .as_deref()
+        .map(|ep| Arc::new(sink::PhoenixSink::new(ep, phoenix_api_key.as_deref())));
+
     let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(20_000);
 
     let metrics_writer = metrics_state.clone();
     let otel_writer = otel_exporter.clone();
+    let langfuse_writer = langfuse_sink.clone();
+    let langsmith_writer = langsmith_sink.clone();
+    let weave_writer = weave_sink.clone();
+    let phoenix_writer = phoenix_sink.clone();
 
     let writer_handle = tokio::spawn(async move {
         while let Some(record) = store_rx.recv().await {
@@ -720,6 +816,22 @@ async fn cmd_start(
                 tokio::spawn(async move {
                     otel.export_span(&r).await;
                 });
+            }
+            if let Some(ref s) = langfuse_writer {
+                let s = s.clone(); let r = record.clone();
+                tokio::spawn(async move { s.send(&r).await; });
+            }
+            if let Some(ref s) = langsmith_writer {
+                let s = s.clone(); let r = record.clone();
+                tokio::spawn(async move { s.send(&r).await; });
+            }
+            if let Some(ref s) = weave_writer {
+                let s = s.clone(); let r = record.clone();
+                tokio::spawn(async move { s.send(&r).await; });
+            }
+            if let Some(ref s) = phoenix_writer {
+                let s = s.clone(); let r = record.clone();
+                tokio::spawn(async move { s.send(&r).await; });
             }
         }
     });
@@ -1469,6 +1581,21 @@ fn cmd_export(
                     csv_field(r.error.as_deref().unwrap_or("")),
                     csv_field(r.provider_request_id.as_deref().unwrap_or("")),
                 );
+            }
+        }
+        "langfuse" => {
+            for r in &records {
+                println!("{}", export_formats::to_langfuse_line(r));
+            }
+        }
+        "langsmith" => {
+            for r in &records {
+                println!("{}", export_formats::to_langsmith_line(r));
+            }
+        }
+        "weave" => {
+            for r in &records {
+                println!("{}", export_formats::to_weave_line(r));
             }
         }
         _ => {

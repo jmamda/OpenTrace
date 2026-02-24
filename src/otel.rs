@@ -7,22 +7,29 @@
 //! No external OTel crates are required; only `reqwest` and `serde_json`
 //! (already present in Cargo.toml) are used.
 //!
-//! ## Span mapping
-//! | OTel field              | Source                                    |
-//! |------------------------|-------------------------------------------|
-//! | `name`                 | `"llm.{provider}"`                        |
-//! | `startTimeUnixNano`    | `CallRecord.timestamp` → nanoseconds      |
-//! | `endTimeUnixNano`      | start + `latency_ms` × 10⁶               |
-//! | `llm.model`            | `CallRecord.model`                        |
-//! | `llm.provider`         | `CallRecord.provider`                     |
-//! | `llm.endpoint`         | `CallRecord.endpoint`                     |
-//! | `http.status_code`     | `CallRecord.status_code`                  |
-//! | `llm.input_tokens`     | `CallRecord.input_tokens` (when present)  |
-//! | `llm.output_tokens`    | `CallRecord.output_tokens` (when present) |
-//! | `llm.cost_usd`         | `CallRecord.cost_usd` (when present)      |
-//! | `llm.ttft_ms`          | `CallRecord.ttft_ms` (when present)       |
-//! | `otel.status_code`     | `"ERROR"` on failures, `"OK"` otherwise   |
-//! | `exception.message`    | `CallRecord.error` (when present)         |
+//! ## Span mapping (gen_ai.* semantic conventions)
+//! | OTel field                     | Source                                    |
+//! |-------------------------------|-------------------------------------------|
+//! | `name`                        | `"{operation} {model}"` e.g. `"chat gpt-4o"` |
+//! | `startTimeUnixNano`            | `CallRecord.timestamp` → nanoseconds      |
+//! | `endTimeUnixNano`              | start + `latency_ms` × 10⁶               |
+//! | `gen_ai.system`               | mapped from `CallRecord.provider`         |
+//! | `gen_ai.operation.name`        | `"chat"` or `"embeddings"`               |
+//! | `gen_ai.request.model`         | `CallRecord.model`                        |
+//! | `gen_ai.usage.input_tokens`    | `CallRecord.input_tokens` (when present)  |
+//! | `gen_ai.usage.output_tokens`   | `CallRecord.output_tokens` (when present) |
+//! | `openinference.span.kind`      | `"LLM"`                                  |
+//! | `llm.model_name`              | `CallRecord.model`                        |
+//! | `llm.provider`                | `CallRecord.provider`                     |
+//! | `llm.token_count.prompt`      | `CallRecord.input_tokens` (when present)  |
+//! | `llm.token_count.completion`  | `CallRecord.output_tokens` (when present) |
+//! | `llm.token_count.total`       | sum of tokens (when both present)         |
+//! | `http.status_code`            | `CallRecord.status_code` (backward compat)|
+//! | `llm.cost_usd`                | `CallRecord.cost_usd` (when present)      |
+//! | `llm.ttft_ms`                 | `CallRecord.ttft_ms` (when present)       |
+//! | `error.type`                  | `CallRecord.error` text (when present)    |
+//! | `otel.status_code`            | `"ERROR"` on failures, `"OK"` otherwise  |
+//! | `exception.message`           | `CallRecord.error` (when present)         |
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -55,6 +62,9 @@ impl OtelExporter {
     }
 
     /// Build an OTLP JSON span object from a `CallRecord`.
+    ///
+    /// Uses OTel `gen_ai.*` semantic conventions plus OpenInference attributes
+    /// for compatibility with Arize Phoenix and other OpenInference-aware backends.
     pub fn build_span(r: &CallRecord) -> Value {
         let start_nanos = timestamp_to_nanos(&r.timestamp);
         let end_nanos = start_nanos.saturating_add(r.latency_ms.saturating_mul(1_000_000));
@@ -63,23 +73,41 @@ impl OtelExporter {
         let trace_id = base64_16();
         let span_id = base64_8();
 
+        let operation = derive_operation(&r.endpoint);
+        let span_name = format!("{} {}", operation, r.model);
+
         let mut attrs: Vec<Value> = vec![
-            json!({"key": "llm.model",       "value": {"stringValue": r.model}}),
-            json!({"key": "llm.provider",    "value": {"stringValue": r.provider}}),
-            json!({"key": "llm.endpoint",    "value": {"stringValue": r.endpoint}}),
-            json!({"key": "http.status_code","value": {"intValue": r.status_code as i64}}),
+            // gen_ai.* semantic conventions (OTel standard)
+            json!({"key": "gen_ai.system",         "value": {"stringValue": map_provider(&r.provider)}}),
+            json!({"key": "gen_ai.operation.name", "value": {"stringValue": operation}}),
+            json!({"key": "gen_ai.request.model",  "value": {"stringValue": r.model}}),
+            // backward compat — kept for collectors that filter on status code
+            json!({"key": "http.status_code",      "value": {"intValue": r.status_code as i64}}),
+            // OpenInference attributes for Arize Phoenix compatibility
+            json!({"key": "openinference.span.kind", "value": {"stringValue": "LLM"}}),
+            json!({"key": "llm.model_name",          "value": {"stringValue": r.model}}),
+            json!({"key": "llm.provider",            "value": {"stringValue": r.provider}}),
         ];
+
         if let Some(i) = r.input_tokens {
-            attrs.push(json!({"key": "llm.input_tokens",  "value": {"intValue": i}}));
+            attrs.push(json!({"key": "gen_ai.usage.input_tokens",  "value": {"intValue": i}}));
+            attrs.push(json!({"key": "llm.token_count.prompt",     "value": {"intValue": i}}));
         }
         if let Some(o) = r.output_tokens {
-            attrs.push(json!({"key": "llm.output_tokens", "value": {"intValue": o}}));
+            attrs.push(json!({"key": "gen_ai.usage.output_tokens", "value": {"intValue": o}}));
+            attrs.push(json!({"key": "llm.token_count.completion", "value": {"intValue": o}}));
+        }
+        if let (Some(i), Some(o)) = (r.input_tokens, r.output_tokens) {
+            attrs.push(json!({"key": "llm.token_count.total", "value": {"intValue": i + o}}));
         }
         if let Some(c) = r.cost_usd {
-            attrs.push(json!({"key": "llm.cost_usd",      "value": {"doubleValue": c}}));
+            attrs.push(json!({"key": "llm.cost_usd", "value": {"doubleValue": c}}));
         }
         if let Some(t) = r.ttft_ms {
-            attrs.push(json!({"key": "llm.ttft_ms",       "value": {"intValue": t as i64}}));
+            attrs.push(json!({"key": "llm.ttft_ms", "value": {"intValue": t as i64}}));
+        }
+        if let Some(ref err) = r.error {
+            attrs.push(json!({"key": "error.type", "value": {"stringValue": err}}));
         }
 
         let is_error =
@@ -96,7 +124,7 @@ impl OtelExporter {
         let mut span = json!({
             "traceId":           trace_id,
             "spanId":            span_id,
-            "name":              format!("llm.{}", r.provider),
+            "name":              span_name,
             "kind":              3,   // SPAN_KIND_CLIENT
             "startTimeUnixNano": start_nanos.to_string(),
             "endTimeUnixNano":   end_nanos.to_string(),
@@ -160,8 +188,36 @@ impl OtelExporter {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Derive the gen_ai operation name from the endpoint path.
+fn derive_operation(endpoint: &str) -> &'static str {
+    if endpoint.contains("embedding") {
+        "embeddings"
+    } else {
+        "chat"
+    }
+}
+
+/// Map an internal provider slug to the OTel `gen_ai.system` well-known value.
+fn map_provider(p: &str) -> &str {
+    match p {
+        "openai"      => "openai",
+        "anthropic"   => "anthropic",
+        "bedrock"     => "aws.bedrock",
+        "azure"       => "azure.ai.openai",
+        "google"      => "gcp.vertex_ai",
+        "cohere"      => "cohere",
+        "deepseek"    => "deepseek",
+        "groq"        => "groq",
+        "mistral"     => "mistral_ai",
+        "perplexity"  => "perplexity",
+        "xai"         => "x_ai",
+        "ollama"      => "ollama",
+        other         => other,
+    }
+}
+
 /// Convert an ISO 8601 timestamp string to nanoseconds since Unix epoch.
-fn timestamp_to_nanos(ts: &str) -> u64 {
+pub fn timestamp_to_nanos(ts: &str) -> u64 {
     chrono::DateTime::parse_from_rfc3339(ts)
         .ok()
         .and_then(|dt| dt.timestamp_nanos_opt())
@@ -170,7 +226,7 @@ fn timestamp_to_nanos(ts: &str) -> u64 {
 }
 
 /// Standard Base64 encoder (RFC 4648, no line breaks).
-fn base64_encode(bytes: &[u8]) -> String {
+pub fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity((bytes.len() + 2) / 3 * 4);
@@ -195,12 +251,12 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Generate a random 128-bit (16-byte) trace ID as base64.
-fn base64_16() -> String {
+pub fn base64_16() -> String {
     base64_encode(Uuid::new_v4().as_bytes())
 }
 
 /// Generate a random 64-bit (8-byte) span ID as base64.
-fn base64_8() -> String {
+pub fn base64_8() -> String {
     base64_encode(&Uuid::new_v4().as_bytes()[..8])
 }
 
@@ -241,7 +297,8 @@ mod tests {
         let r = make_record(200, 350, None);
         let span = OtelExporter::build_span(&r);
 
-        assert_eq!(span["name"].as_str().unwrap(), "llm.openai");
+        // Span name now uses gen_ai convention: "{operation} {model}"
+        assert_eq!(span["name"].as_str().unwrap(), "chat gpt-4o");
         assert_eq!(span["kind"].as_u64().unwrap(), 3); // CLIENT
 
         // Attributes must include all expected keys.
@@ -250,12 +307,13 @@ mod tests {
             attrs.iter().find(|a| a["key"].as_str() == Some(key))
         };
 
+        // gen_ai.* semantic convention attributes
         assert_eq!(
-            find("llm.model").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("gen_ai.request.model").unwrap()["value"]["stringValue"].as_str().unwrap(),
             "gpt-4o"
         );
         assert_eq!(
-            find("llm.provider").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            find("gen_ai.system").unwrap()["value"]["stringValue"].as_str().unwrap(),
             "openai"
         );
         assert_eq!(
@@ -263,15 +321,26 @@ mod tests {
             200
         );
         assert_eq!(
-            find("llm.input_tokens").unwrap()["value"]["intValue"].as_i64().unwrap(),
+            find("gen_ai.usage.input_tokens").unwrap()["value"]["intValue"].as_i64().unwrap(),
             100
         );
         assert_eq!(
-            find("llm.output_tokens").unwrap()["value"]["intValue"].as_i64().unwrap(),
+            find("gen_ai.usage.output_tokens").unwrap()["value"]["intValue"].as_i64().unwrap(),
             50
         );
         assert!(find("llm.cost_usd").is_some(), "cost_usd attr should be present");
         assert!(find("llm.ttft_ms").is_some(), "ttft_ms attr should be present");
+
+        // OpenInference attributes
+        assert_eq!(
+            find("openinference.span.kind").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            "LLM"
+        );
+        assert_eq!(
+            find("llm.model_name").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            "gpt-4o"
+        );
+        assert!(find("llm.token_count.total").is_some(), "token total should be present");
     }
 
     #[test]
@@ -323,6 +392,32 @@ mod tests {
         r.cost_usd = None;
         let span = OtelExporter::build_span(&r);
         assert_eq!(span["status"]["code"].as_u64().unwrap(), 2, "status_code=0 must be ERROR");
+    }
+
+    #[test]
+    fn otel_span_embeddings_operation() {
+        let mut r = make_record(200, 100, None);
+        r.endpoint = "/v1/embeddings".to_string();
+        let span = OtelExporter::build_span(&r);
+        assert_eq!(span["name"].as_str().unwrap(), "embeddings gpt-4o");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |key: &str| -> Option<&Value> {
+            attrs.iter().find(|a| a["key"].as_str() == Some(key))
+        };
+        assert_eq!(
+            find("gen_ai.operation.name").unwrap()["value"]["stringValue"].as_str().unwrap(),
+            "embeddings"
+        );
+    }
+
+    #[test]
+    fn otel_provider_mapping() {
+        assert_eq!(map_provider("bedrock"), "aws.bedrock");
+        assert_eq!(map_provider("azure"), "azure.ai.openai");
+        assert_eq!(map_provider("google"), "gcp.vertex_ai");
+        assert_eq!(map_provider("xai"), "x_ai");
+        assert_eq!(map_provider("mistral"), "mistral_ai");
+        assert_eq!(map_provider("unknown_provider"), "unknown_provider");
     }
 
     #[test]

@@ -65,6 +65,13 @@ details#model-breakdown summary:hover{color:#888}
 #f-model{width:140px}
 #f-provider{width:130px}
 .filters label{color:#888;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:.25rem}
+.export-wrap{position:relative;margin-left:auto}
+.export-btn{background:#1a1a1a;border:1px solid #333;color:#4fc3f7;padding:.3rem .6rem;border-radius:3px;font-family:monospace;font-size:.82rem;cursor:pointer}
+.export-btn:hover{border-color:#4fc3f7}
+.export-menu{display:none;position:absolute;right:0;top:110%;background:#1e1e1e;border:1px solid #333;border-radius:3px;z-index:200;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,.5)}
+.export-menu a{display:block;padding:.35rem .7rem;color:#ccc;font-size:.8rem;cursor:pointer;text-decoration:none;font-family:monospace}
+.export-menu a:hover{background:#2a2a2a;color:#4fc3f7}
+.export-wrap:hover .export-menu{display:block}
 table{width:100%;border-collapse:collapse;font-size:.78rem}
 th{background:#151515;color:#666;text-align:right;padding:.35rem .5rem;border-bottom:1px solid #2a2a2a;position:sticky;top:0;white-space:nowrap}
 th:first-child,th:nth-child(3),th:nth-child(4){text-align:left}
@@ -150,6 +157,16 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
   <input type="text" id="f-model" placeholder="Filter model..." oninput="saveFilters();refresh()">
   <input type="text" id="f-provider" placeholder="Filter provider..." oninput="saveFilters();refresh()">
   <label><input type="checkbox" id="f-errors" onchange="refresh()"> Errors only</label>
+  <div class="export-wrap">
+    <button class="export-btn">Export ▾</button>
+    <div class="export-menu">
+      <a onclick="downloadExport('jsonl')">JSONL</a>
+      <a onclick="downloadExport('csv')">CSV</a>
+      <a onclick="downloadExport('langfuse')">Langfuse</a>
+      <a onclick="downloadExport('langsmith')">LangSmith</a>
+      <a onclick="downloadExport('weave')">W&amp;B Weave</a>
+    </div>
+  </div>
 </div>
 
 <!-- Call log table -->
@@ -459,6 +476,67 @@ function renderHeatmapLegend(){
     var lbl=document.createElement('span');lbl.textContent=item.label;
     span.appendChild(sq);span.appendChild(lbl);wrap.appendChild(span);
   });
+}
+
+// ---- Export helpers ----
+function uuidv4(){return([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16));}
+function addMs(ts,ms){try{var d=new Date(ts);d.setMilliseconds(d.getMilliseconds()+ms);return d.toISOString();}catch(e){return ts;}}
+function toMs(ts){try{return new Date(ts).getTime();}catch(e){return 0;}}
+
+function fmtRecord(r,fmt){
+  if(fmt==='csv') return null; // handled separately
+  if(fmt==='langfuse'){
+    return JSON.stringify({batch:[{id:uuidv4(),type:'generation-create',body:{
+      id:r.id,traceId:r.id,name:'llm-call',startTime:r.timestamp,endTime:addMs(r.timestamp,r.latency_ms||0),
+      model:r.model,input:{messages:null},output:null,
+      usage:{input:r.input_tokens||null,output:r.output_tokens||null,total:(r.input_tokens&&r.output_tokens)?r.input_tokens+r.output_tokens:null},
+      metadata:{provider:r.provider,endpoint:r.endpoint,status_code:r.status_code,cost_usd:r.cost_usd||null,latency_ms:r.latency_ms},
+      level:r.error?'ERROR':'DEFAULT'
+    }}]});
+  }
+  if(fmt==='langsmith'){
+    var sm=toMs(r.timestamp);
+    return JSON.stringify({id:r.id,name:'llm-call',run_type:'llm',
+      inputs:{messages:null},outputs:{output:null},
+      start_time:sm,end_time:sm+(r.latency_ms||0),
+      extra:{model:r.model,provider:r.provider,input_tokens:r.input_tokens||null,output_tokens:r.output_tokens||null,cost_usd:r.cost_usd||null,status_code:r.status_code},
+      error:r.error||null,session_name:'opentrace',tags:['opentrace',r.provider]
+    });
+  }
+  if(fmt==='weave'){
+    var pt=r.input_tokens||0,ct=r.output_tokens||0;
+    var usage={};usage[r.model]={prompt_tokens:pt,completion_tokens:ct,total_tokens:pt+ct,requests:1};
+    return JSON.stringify({calls:[{id:r.id,op_name:'llm_call',started_at:r.timestamp,ended_at:addMs(r.timestamp,r.latency_ms||0),
+      inputs:{model:r.model,messages:null},output:null,
+      summary:{usage:usage},
+      attributes:{provider:r.provider,endpoint:r.endpoint,status_code:r.status_code,cost_usd:r.cost_usd||null,latency_ms:r.latency_ms}
+    }]});
+  }
+  // jsonl (default)
+  return JSON.stringify(r);
+}
+
+async function downloadExport(fmt){
+  var model=document.getElementById('f-model').value.trim();
+  var provider=document.getElementById('f-provider').value.trim();
+  var errors=document.getElementById('f-errors').checked;
+  var url='/api/calls?limit=10000'+(model?'&model='+encodeURIComponent(model):'')+(provider?'&provider='+encodeURIComponent(provider):'')+(errors?'&errors=true':'');
+  var data=await fetch(url).then(function(r){return r.json();});
+  var rows=Array.isArray(data)?data:(data.calls||[]);
+  var lines=[];
+  if(fmt==='csv'){
+    lines.push('id,timestamp,provider,model,endpoint,status_code,latency_ms,ttft_ms,input_tokens,output_tokens,cost_usd,error');
+    rows.forEach(function(r){
+      lines.push([r.id,r.timestamp,r.provider,r.model,r.endpoint,r.status_code,r.latency_ms,r.ttft_ms||'',r.input_tokens||'',r.output_tokens||'',r.cost_usd||'',r.error||''].map(function(v){return'"'+String(v).replace(/"/g,'""')+'"';}).join(','));
+    });
+  } else {
+    rows.forEach(function(r){var l=fmtRecord(r,fmt);if(l)lines.push(l);});
+  }
+  var blob=new Blob([lines.join('\n')],{type:'text/plain'});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='opentrace-export-'+fmt+'-'+new Date().toISOString().slice(0,10)+(fmt==='csv'?'.csv':'.jsonl');
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
 }
 
 document.addEventListener('keydown',function(e){

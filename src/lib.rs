@@ -1,7 +1,9 @@
 pub mod capture;
 pub mod config;
+pub mod export_formats;
 pub mod metrics;
 pub mod otel;
 pub mod proxy;
 pub mod serve;
+pub mod sink;
 pub mod store;
