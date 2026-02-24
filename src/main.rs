@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.3.3",
+    version = "0.3.4",
     long_about = None,
 )]
 struct Cli {

@@ -1,6 +1,6 @@
 {
   "name": "@opentraceai/trace-linux-x64",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Linux x64 binary for @opentraceai/trace",
   "license": "MIT",
   "repository": {

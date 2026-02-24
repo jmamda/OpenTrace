@@ -21,7 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use crate::store::{CallRecord, DailyStat, ModelStats, QueryFilter, SearchResult, Stats, Store};
+use crate::store::{CallRecord, DailyStat, ModelStats, ProviderStats, QueryFilter, SearchResult, Stats, Store};
 
 // ---------------------------------------------------------------------------
 // Dashboard HTML
@@ -42,42 +42,63 @@ h1{color:#4fc3f7;font-size:1.1rem;letter-spacing:.05em}
 .nav-link{color:#4fc3f7;text-decoration:none;font-size:.85rem}
 .nav-link:hover{text-decoration:underline}
 #dark-toggle{background:none;border:1px solid #333;color:#888;padding:.2rem .5rem;border-radius:3px;cursor:pointer;font-size:.8rem}
-.cards{display:flex;gap:.75rem;margin-bottom:.75rem;flex-wrap:wrap}
-.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:4px;padding:.75rem 1rem;min-width:150px}
+.cards-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;margin-bottom:.5rem}
+.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:4px;padding:.75rem 1rem}
 .card-label{color:#666;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.25rem}
 .card-value{color:#4fc3f7;font-size:1.3rem;font-weight:bold}
 .section-label{color:#555;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.3rem;margin-top:.25rem}
 #heatmap-wrap{margin-bottom:.75rem;overflow-x:auto}
 #heatmap{display:block}
 .hm-cell{cursor:default}
+#heatmap-legend{display:flex;gap:.75rem;align-items:center;font-size:.7rem;color:#666;margin-top:.3rem;flex-wrap:wrap}
+details#model-breakdown{margin-bottom:.75rem}
+details#model-breakdown summary{color:#555;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;user-select:none;padding:.2rem 0}
+details#model-breakdown summary:hover{color:#888}
+#breakdown-table{margin-top:.5rem;width:100%;border-collapse:collapse;font-size:.75rem}
+#breakdown-table th{background:#151515;color:#666;text-align:right;padding:.3rem .5rem;border-bottom:1px solid #2a2a2a}
+#breakdown-table th:first-child{text-align:left}
+#breakdown-table td{padding:.25rem .5rem;border-bottom:1px solid #1a1a1a;text-align:right}
+#breakdown-table td:first-child{text-align:left}
 .filters{display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem;flex-wrap:wrap}
 .filters input[type=text]{background:#1a1a1a;border:1px solid #333;color:#e0e0e0;padding:.3rem .5rem;border-radius:3px;font-family:monospace;font-size:.85rem}
-#f-search{width:260px}
-#f-model{width:160px}
+#f-search{width:240px}
+#f-model{width:140px}
+#f-provider{width:130px}
 .filters label{color:#888;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:.25rem}
 table{width:100%;border-collapse:collapse;font-size:.78rem}
 th{background:#151515;color:#666;text-align:right;padding:.35rem .5rem;border-bottom:1px solid #2a2a2a;position:sticky;top:0;white-space:nowrap}
-th:first-child,th:nth-child(3){text-align:left}
+th:first-child,th:nth-child(3),th:nth-child(4){text-align:left}
 td{padding:.3rem .5rem;border-bottom:1px solid #1a1a1a;text-align:right;white-space:nowrap}
-td:first-child,td:nth-child(3){text-align:left}
+td:first-child,td:nth-child(3),td:nth-child(4){text-align:left}
 tr:hover td{background:#1c1c1c}
 .ok{color:#66bb6a}.err{color:#ef5350}.dim{color:#555}
 #status{color:#444;font-size:.7rem;margin-top:.5rem}
+#detail-panel{display:none;position:fixed;top:0;right:0;width:420px;height:100vh;background:#111;border-left:1px solid #2a2a2a;overflow-y:auto;padding:1rem;z-index:100;font-size:.78rem}
+.detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem}
+.detail-title{color:#4fc3f7;font-weight:bold}
+.detail-close{background:none;border:none;color:#888;cursor:pointer;font-size:1rem;line-height:1}
+.section-hdr{color:#4fc3f7;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin:.75rem 0 .3rem;border-bottom:1px solid #2a2a2a;padding-bottom:.2rem}
+.section-hdr:first-child{margin-top:0}
 body.light{background:#f5f5f5;color:#222}
 body.light .card{background:#fff;border-color:#ddd}
 body.light .card-label{color:#999}
 body.light .card-value{color:#0077b6}
 body.light th{background:#eee;color:#888}
+body.light #breakdown-table th{background:#eee;color:#888}
 body.light td{border-color:#eee}
+body.light #breakdown-table td{border-color:#eee}
 body.light tr:hover td{background:#fafafa}
 body.light .filters input[type=text]{background:#fff;border-color:#ccc;color:#222}
 body.light #dark-toggle{border-color:#ccc;color:#666}
 body.light #status{color:#aaa}
+body.light #detail-panel{background:#fafafa;border-color:#ddd}
+body.light .section-hdr{border-color:#ddd;color:#0077b6}
 @media(max-width:600px){
-  .cards{flex-direction:column}
+  .cards-grid{grid-template-columns:1fr}
   table{display:block;overflow-x:auto}
   .header{flex-direction:column;align-items:flex-start}
   #f-search{width:100%}
+  #detail-panel{width:100%;left:0}
 }
 </style>
 </head>
@@ -85,43 +106,73 @@ body.light #status{color:#aaa}
 <div class="header">
   <h1>[ OpenTrace ]</h1>
   <div class="nav">
-    <a href="/playground" class="nav-link">Playground →</a>
-    <button id="dark-toggle" onclick="toggleDark()">☀</button>
+    <a href="/playground" class="nav-link">Playground &rarr;</a>
+    <button id="dark-toggle" onclick="toggleDark()">&#9728;</button>
   </div>
 </div>
-<div class="cards">
+
+<!-- Stat cards row 1 -->
+<div class="cards-grid">
   <div class="card"><div class="card-label">Total calls</div><div class="card-value" id="s-calls">-</div></div>
   <div class="card"><div class="card-label">Total cost</div><div class="card-value" id="s-cost">-</div></div>
   <div class="card"><div class="card-label">Avg latency</div><div class="card-value" id="s-lat">-</div></div>
+</div>
+<!-- Stat cards row 2 -->
+<div class="cards-grid" style="margin-bottom:.75rem">
+  <div class="card"><div class="card-label">Errors</div><div class="card-value" id="s-errors">-</div></div>
+  <div class="card"><div class="card-label">p99 latency</div><div class="card-value" id="s-p99">-</div></div>
   <div class="card"><div class="card-label">Calls (1h)</div><div class="card-value" id="s-hour">-</div></div>
 </div>
+
+<!-- Heatmap -->
 <div id="heatmap-wrap">
-  <div class="section-label">DAILY COST — 90 days</div>
+  <div class="section-label">DAILY COST &mdash; 90 days</div>
   <svg id="heatmap" height="88"></svg>
+  <div id="heatmap-legend"></div>
 </div>
+
+<!-- Model breakdown collapsible -->
+<details id="model-breakdown">
+  <summary>by model &#9658;</summary>
+  <table id="breakdown-table">
+    <thead><tr>
+      <th>model</th><th>calls</th><th>cost</th><th>avg ms</th><th>errors</th>
+    </tr></thead>
+    <tbody id="breakdown-tbody"></tbody>
+  </table>
+</details>
+
+<!-- Filters -->
 <div class="filters">
   <input type="text" id="f-search" placeholder="Search prompts, responses, models..." oninput="debouncedSearch()">
   <input type="text" id="f-model" placeholder="Filter model..." oninput="refresh()">
+  <input type="text" id="f-provider" placeholder="Filter provider..." oninput="refresh()">
   <label><input type="checkbox" id="f-errors" onchange="refresh()"> Errors only</label>
 </div>
+
+<!-- Call log table -->
 <table>
   <thead><tr>
-    <th>id</th><th>timestamp</th><th>model</th><th>status</th>
+    <th>id</th><th>timestamp</th><th>model</th><th>provider</th><th>status</th>
     <th>latency</th><th>ttft</th><th>in</th><th>out</th><th>cost</th>
   </tr></thead>
   <tbody id="tbody"></tbody>
 </table>
 <div id="status">Loading...</div>
-<div id="detail-panel" style="display:none;position:fixed;top:0;right:0;width:420px;height:100vh;background:#111;border-left:1px solid #2a2a2a;overflow-y:auto;padding:1rem;z-index:100;font-size:.78rem">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
-    <span style="color:#4fc3f7;font-weight:bold">Call Detail</span>
-    <button onclick="closeDetail()" style="background:none;border:none;color:#888;cursor:pointer;font-size:1rem">X</button>
+
+<!-- Detail panel -->
+<div id="detail-panel">
+  <div class="detail-header">
+    <span class="detail-title">Call Detail</span>
+    <button class="detail-close" onclick="closeDetail()">&#10005;</button>
   </div>
   <div id="detail-content"></div>
 </div>
+
 <script>
 function fmtMs(v){return v==null?'-':v+'ms'}
 function fmtCost(c){return c==null?'-':'$'+Number(c).toFixed(4)}
+function clearEl(el){while(el.firstChild)el.removeChild(el.firstChild);}
 function makeCell(text,cls){var td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;return td;}
 function makeTr(label,val){
   var tr=document.createElement('tr');
@@ -135,12 +186,12 @@ function toggleDark(){
   document.body.classList.toggle('light');
   var light=document.body.classList.contains('light');
   localStorage.setItem('ot-theme',light?'light':'dark');
-  document.getElementById('dark-toggle').textContent=light?'☾':'☀';
+  document.getElementById('dark-toggle').textContent=light?'\u263e':'\u2600';
 }
 (function(){
   if(localStorage.getItem('ot-theme')==='light'){
     document.body.classList.add('light');
-    document.getElementById('dark-toggle').textContent='☾';
+    document.getElementById('dark-toggle').textContent='\u263e';
   }
 })();
 
@@ -155,20 +206,78 @@ async function showDetail(id){
     var res=await fetch('/api/detail/'+id);
     if(!res.ok){content.textContent='Error: '+res.status;return;}
     var r=await res.json();
-    content.textContent='';
-    var tbl=document.createElement('table');tbl.style.width='100%';tbl.style.borderCollapse='collapse';
-    var rows=[['id',r.id],['timestamp',r.timestamp],['provider',r.provider],['model',r.model],['endpoint',r.endpoint],['status',r.status_code],['latency',fmtMs(r.latency_ms)],['ttft',fmtMs(r.ttft_ms)],['input tokens',r.input_tokens],['output tokens',r.output_tokens],['cost',fmtCost(r.cost_usd)],['error',r.error||null]];
-    rows.forEach(function(row){if(row[1]!=null){tbl.appendChild(makeTr(row[0],row[1]));}});
-    content.appendChild(tbl);
-    if(r.request_body){var lbl=document.createElement('div');lbl.style.color='#666';lbl.style.marginTop='.75rem';lbl.style.marginBottom='.25rem';lbl.textContent='request';content.appendChild(lbl);var pre=document.createElement('pre');pre.style.background='#1a1a1a';pre.style.padding='.5rem';pre.style.borderRadius='3px';pre.style.fontSize='.72rem';pre.style.overflowX='auto';pre.style.whiteSpace='pre-wrap';pre.textContent=r.request_body;content.appendChild(pre);}
-    if(r.response_body){var lbl2=document.createElement('div');lbl2.style.color='#666';lbl2.style.marginTop='.75rem';lbl2.style.marginBottom='.25rem';lbl2.textContent='response';content.appendChild(lbl2);var pre2=document.createElement('pre');pre2.style.background='#1a1a1a';pre2.style.padding='.5rem';pre2.style.borderRadius='3px';pre2.style.fontSize='.72rem';pre2.style.overflowX='auto';pre2.style.whiteSpace='pre-wrap';pre2.textContent=r.response_body;content.appendChild(pre2);}
+    clearEl(content);
+
+    function addSectionHdr(title){
+      var hdr=document.createElement('div');
+      hdr.className='section-hdr';
+      hdr.textContent='[ '+title+' ]';
+      content.appendChild(hdr);
+    }
+    function addTable(rows){
+      var tbl=document.createElement('table');
+      tbl.style.width='100%';tbl.style.borderCollapse='collapse';
+      rows.forEach(function(row){
+        if(row[1]==null||row[1]===undefined||String(row[1])==='null')return;
+        tbl.appendChild(makeTr(row[0],row[1]));
+      });
+      content.appendChild(tbl);
+    }
+
+    addSectionHdr('metadata');
+    addTable([
+      ['id',r.id],
+      ['timestamp',r.timestamp],
+      ['provider',r.provider],
+      ['model',r.model],
+      ['endpoint',r.endpoint],
+      ['status',r.status_code],
+      ['provider_request_id',r.provider_request_id||null],
+    ]);
+
+    addSectionHdr('timing');
+    addTable([
+      ['latency_ms',fmtMs(r.latency_ms)],
+      ['ttft_ms',fmtMs(r.ttft_ms)],
+    ]);
+
+    addSectionHdr('cost');
+    addTable([
+      ['input_tokens',r.input_tokens!=null?String(r.input_tokens):null],
+      ['output_tokens',r.output_tokens!=null?String(r.output_tokens):null],
+      ['cost_usd',fmtCost(r.cost_usd)],
+    ]);
+
+    if(r.request_body){
+      addSectionHdr('request');
+      var pre=document.createElement('pre');
+      pre.style.background='#1a1a1a';pre.style.padding='.5rem';pre.style.borderRadius='3px';
+      pre.style.fontSize='.72rem';pre.style.overflowX='auto';pre.style.whiteSpace='pre-wrap';
+      pre.textContent=r.request_body;
+      content.appendChild(pre);
+    }
+    if(r.response_body){
+      addSectionHdr('response');
+      var pre2=document.createElement('pre');
+      pre2.style.background='#1a1a1a';pre2.style.padding='.5rem';pre2.style.borderRadius='3px';
+      pre2.style.fontSize='.72rem';pre2.style.overflowX='auto';pre2.style.whiteSpace='pre-wrap';
+      pre2.textContent=r.response_body;
+      content.appendChild(pre2);
+    }
+    if(r.error){
+      addSectionHdr('error');
+      var errDiv=document.createElement('div');
+      errDiv.style.color='#ef5350';errDiv.style.padding='.3rem .4rem';errDiv.style.fontSize='.78rem';
+      errDiv.textContent=r.error;
+      content.appendChild(errDiv);
+    }
   }catch(e){content.textContent='Error: '+e.message;}
 }
 
 // row rendering (shared by refresh and search)
 function renderRows(calls){
   var tbody=document.getElementById('tbody');
-  while(tbody.firstChild)tbody.removeChild(tbody.firstChild);
+  clearEl(tbody);
   for(var i=0;i<calls.length;i++){
     var r=calls[i];
     var ok=r.status_code>=200&&r.status_code<400&&!r.error;
@@ -178,6 +287,7 @@ function renderRows(calls){
     tr.appendChild(makeCell((r.id||'').slice(0,8),'dim'));
     tr.appendChild(makeCell((r.timestamp||'').slice(0,19),'dim'));
     tr.appendChild(makeCell(r.model||'-',null));
+    tr.appendChild(makeCell(r.provider||'-','dim'));
     tr.appendChild(makeCell(String(r.status_code),ok?'ok':'err'));
     tr.appendChild(makeCell(fmtMs(r.latency_ms),null));
     tr.appendChild(makeCell(fmtMs(r.ttft_ms),'dim'));
@@ -207,9 +317,11 @@ async function runSearch(){
 async function refresh(){
   if(document.getElementById('f-search').value.trim()){return;}
   var model=document.getElementById('f-model').value;
+  var provider=document.getElementById('f-provider').value;
   var errors=document.getElementById('f-errors').checked;
   var url='/api/calls?limit=100';
   if(model)url+='&model='+encodeURIComponent(model);
+  if(provider)url+='&provider='+encodeURIComponent(provider);
   if(errors)url+='&errors=true';
   try{
     var [r1,r2]=await Promise.all([fetch(url),fetch('/api/stats')]);
@@ -219,9 +331,26 @@ async function refresh(){
     document.getElementById('s-calls').textContent=String(s.total_calls);
     document.getElementById('s-cost').textContent='$'+Number(s.total_cost_usd).toFixed(4);
     document.getElementById('s-lat').textContent=Math.round(s.avg_latency_ms)+'ms';
+    document.getElementById('s-errors').textContent=String(s.error_count);
+    document.getElementById('s-p99').textContent=Math.round(data.p99_latency_ms||0)+'ms';
     document.getElementById('s-hour').textContent=String(s.calls_last_hour);
     renderRows(calls);
-    document.getElementById('status').textContent='Updated '+new Date().toLocaleTimeString()+' — '+calls.length+' calls';
+    // populate model breakdown
+    var btbody=document.getElementById('breakdown-tbody');
+    clearEl(btbody);
+    (data.models||[]).forEach(function(m){
+      var tr=document.createElement('tr');
+      [m.model,m.calls,'$'+Number(m.total_cost_usd).toFixed(4),Math.round(m.avg_latency_ms)+'ms',m.error_count].forEach(function(v,i){
+        var td=document.createElement('td');
+        td.textContent=String(v);
+        td.style.padding='.25rem .5rem';
+        td.style.borderBottom='1px solid #1a1a1a';
+        if(i>0)td.style.textAlign='right';
+        tr.appendChild(td);
+      });
+      btbody.appendChild(tr);
+    });
+    document.getElementById('status').textContent='Updated '+new Date().toLocaleTimeString()+' \u2014 '+calls.length+' calls';
   }catch(e){document.getElementById('status').textContent='Error: '+e.message;}
 }
 
@@ -231,11 +360,12 @@ async function loadHeatmap(){
     var res=await fetch('/api/heatmap?days=90');
     if(!res.ok)return;
     renderHeatmap((await res.json()).days);
+    renderHeatmapLegend();
   }catch(e){}
 }
 function renderHeatmap(days){
   var svg=document.getElementById('heatmap');
-  while(svg.firstChild)svg.removeChild(svg.firstChild);
+  clearEl(svg);
   if(!days||!days.length)return;
   var map={},maxCost=0;
   days.forEach(function(d){map[d.date]=d;if(d.cost_usd>maxCost)maxCost=d.cost_usd;});
@@ -279,6 +409,25 @@ function renderHeatmap(days){
       txt.textContent=cell.date.slice(5,7)+'/'+cell.date.slice(2,4);
       svg.appendChild(txt);
     }
+  });
+}
+function renderHeatmapLegend(){
+  var wrap=document.getElementById('heatmap-legend');
+  clearEl(wrap);
+  var items=[
+    {label:'empty',fill:'#1e1e1e'},
+    {label:'low',fill:'hsl(200,60%,22%)'},
+    {label:'mid',fill:'hsl(200,60%,38%)'},
+    {label:'high',fill:'hsl(200,60%,55%)'},
+  ];
+  items.forEach(function(item){
+    var span=document.createElement('span');
+    span.style.display='flex';span.style.alignItems='center';span.style.gap='.25rem';
+    var sq=document.createElement('span');
+    sq.style.display='inline-block';sq.style.width='10px';sq.style.height='10px';
+    sq.style.background=item.fill;sq.style.borderRadius='2px';sq.style.border='1px solid #333';
+    var lbl=document.createElement('span');lbl.textContent=item.label;
+    span.appendChild(sq);span.appendChild(lbl);wrap.appendChild(span);
   });
 }
 
@@ -453,6 +602,7 @@ struct ServeState {
 struct CallsQuery {
     limit: Option<usize>,
     model: Option<String>,
+    provider: Option<String>,
     errors: Option<bool>,
     since: Option<String>,
     until: Option<String>,
@@ -462,6 +612,8 @@ struct CallsQuery {
 struct StatsResponse {
     stats: Stats,
     models: Vec<ModelStats>,
+    p99_latency_ms: f64,
+    providers: Vec<ProviderStats>,
 }
 
 #[derive(Deserialize)]
@@ -518,6 +670,7 @@ async fn api_calls_handler(
     let filter = QueryFilter {
         errors_only: params.errors.unwrap_or(false),
         model: params.model,
+        provider: params.provider,
         since: params.since,
         until: params.until,
         ..Default::default()
@@ -539,7 +692,9 @@ async fn api_stats_handler(State(state): State<ServeState>) -> Json<StatsRespons
         calls_last_hour: 0,
     });
     let models = store.stats_by_model().unwrap_or_default();
-    Json(StatsResponse { stats, models })
+    let (_, _, p99) = store.latency_percentiles(&QueryFilter::default()).unwrap_or((0.0, 0.0, 0.0));
+    let providers = store.stats_by_provider().unwrap_or_default();
+    Json(StatsResponse { stats, models, p99_latency_ms: p99, providers })
 }
 
 async fn api_search_handler(
