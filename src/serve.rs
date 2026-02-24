@@ -71,6 +71,8 @@ th:first-child,th:nth-child(3),th:nth-child(4){text-align:left}
 td{padding:.3rem .5rem;border-bottom:1px solid #1a1a1a;text-align:right;white-space:nowrap}
 td:first-child,td:nth-child(3),td:nth-child(4){text-align:left}
 tr:hover td{background:#1c1c1c}
+tr.row-err td{color:#ef5350}
+tr.row-err:hover td{background:#1c1c1c}
 .ok{color:#66bb6a}.err{color:#ef5350}.dim{color:#555}
 #status{color:#444;font-size:.7rem;margin-top:.5rem}
 #detail-panel{display:none;position:fixed;top:0;right:0;width:420px;height:100vh;background:#111;border-left:1px solid #2a2a2a;overflow-y:auto;padding:1rem;z-index:100;font-size:.78rem}
@@ -145,8 +147,8 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
 <!-- Filters -->
 <div class="filters">
   <input type="text" id="f-search" placeholder="Search prompts, responses, models..." oninput="debouncedSearch()">
-  <input type="text" id="f-model" placeholder="Filter model..." oninput="refresh()">
-  <input type="text" id="f-provider" placeholder="Filter provider..." oninput="refresh()">
+  <input type="text" id="f-model" placeholder="Filter model..." oninput="saveFilters();refresh()">
+  <input type="text" id="f-provider" placeholder="Filter provider..." oninput="saveFilters();refresh()">
   <label><input type="checkbox" id="f-errors" onchange="refresh()"> Errors only</label>
 </div>
 
@@ -179,6 +181,18 @@ function makeTr(label,val){
   var td1=document.createElement('td');td1.style.color='#666';td1.style.padding='.2rem .4rem';td1.style.whiteSpace='nowrap';td1.style.verticalAlign='top';td1.textContent=label;
   var td2=document.createElement('td');td2.style.color='#e0e0e0';td2.style.padding='.2rem .4rem';td2.style.wordBreak='break-all';td2.textContent=String(val);
   tr.appendChild(td1);tr.appendChild(td2);return tr;
+}
+
+// sticky filters
+(function(){
+  var m=localStorage.getItem('ot-filter-model');
+  var p=localStorage.getItem('ot-filter-provider');
+  if(m)document.getElementById('f-model').value=m;
+  if(p)document.getElementById('f-provider').value=p;
+})();
+function saveFilters(){
+  localStorage.setItem('ot-filter-model',document.getElementById('f-model').value);
+  localStorage.setItem('ot-filter-provider',document.getElementById('f-provider').value);
 }
 
 // dark mode
@@ -283,8 +297,24 @@ function renderRows(calls){
     var ok=r.status_code>=200&&r.status_code<400&&!r.error;
     var tr=document.createElement('tr');
     tr.style.cursor='pointer';
-    (function(id){tr.addEventListener('click',function(){showDetail(id);});})(r.id);
-    tr.appendChild(makeCell((r.id||'').slice(0,8),'dim'));
+    if(!ok)tr.className='row-err';
+    (function(rid){
+      tr.addEventListener('click',function(){showDetail(rid);});
+    })(r.id);
+    var idCell=makeCell((r.id||'').slice(0,8),'dim');
+    idCell.title='Click to copy full ID';
+    idCell.style.cursor='copy';
+    (function(rid){
+      idCell.addEventListener('click',function(e){
+        e.stopPropagation();
+        navigator.clipboard&&navigator.clipboard.writeText(rid).then(function(){
+          var orig=idCell.textContent;
+          idCell.textContent='copied!';
+          setTimeout(function(){idCell.textContent=orig;},800);
+        });
+      });
+    })(r.id);
+    tr.appendChild(idCell);
     tr.appendChild(makeCell((r.timestamp||'').slice(0,19),'dim'));
     tr.appendChild(makeCell(r.model||'-',null));
     tr.appendChild(makeCell(r.provider||'-','dim'));
@@ -431,6 +461,9 @@ function renderHeatmapLegend(){
   });
 }
 
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape')closeDetail();
+});
 refresh();
 loadHeatmap();
 setInterval(refresh,2000);

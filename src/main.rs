@@ -986,8 +986,14 @@ fn cmd_query(
         }
     }
 
+    let total_cost: f64 = calls.iter().filter_map(|c| c.cost_usd).sum();
     println!();
-    println!("{} calls shown. Run {} for totals.", calls.len(), "trace stats".yellow());
+    if total_cost > 0.0 {
+        println!("{} calls shown  •  total cost ${:.4}  •  run {} for full breakdown.",
+            calls.len(), total_cost, "trace stats".yellow());
+    } else {
+        println!("{} calls shown. Run {} for totals.", calls.len(), "trace stats".yellow());
+    }
     Ok(())
 }
 
@@ -1037,7 +1043,8 @@ async fn cmd_watch(
         print_budget_line(budget_spent, limit, &budget_period);
     }
 
-    print_query_header();
+    let mut cumulative_cost: f64 = 0.0;
+    print_watch_header(cumulative_cost);
     let mut rows_since_header: usize = 0;
 
     loop {
@@ -1060,11 +1067,12 @@ async fn cmd_watch(
 
         let new_records = store.query_after(&last_ts, &filter, 100)?;
         for record in &new_records {
+            cumulative_cost += record.cost_usd.unwrap_or(0.0);
             print_call_row(record);
             last_ts = record.timestamp.clone();
             rows_since_header += 1;
             if rows_since_header >= 20 {
-                print_query_header();
+                print_watch_header(cumulative_cost);
                 rows_since_header = 0;
             }
         }
@@ -1196,7 +1204,12 @@ fn cmd_stats(
     println!("  total calls       {}", s.total_calls.to_string().cyan());
     println!("  calls last hour   {}", s.calls_last_hour.to_string().cyan());
     println!("  errors            {}", if s.error_count > 0 {
-        s.error_count.to_string().red().to_string()
+        let rate = if s.total_calls > 0 {
+            format!(" ({:.1}%)", s.error_count as f64 / s.total_calls as f64 * 100.0)
+        } else {
+            String::new()
+        };
+        format!("{}{}", s.error_count.to_string().red(), rate.dimmed())
     } else {
         "0".green().to_string()
     });
@@ -1712,6 +1725,18 @@ fn print_query_header() {
         "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
         "id", "timestamp", "model", "status", "latency", "ttft", "in", "out", "cost"
     ).bold().underline());
+}
+
+fn print_watch_header(cumulative_cost: f64) {
+    let cost_str = if cumulative_cost > 0.0 {
+        format!("  session cost ${:.4}", cumulative_cost)
+    } else {
+        String::new()
+    };
+    println!("{}{}", format!(
+        "{:<8}  {:<19}  {:<22}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
+        "id", "timestamp", "model", "status", "latency", "ttft", "in", "out", "cost"
+    ).bold().underline(), cost_str.dimmed());
 }
 
 fn print_call_row(call: &store::CallRecord) {
