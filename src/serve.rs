@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Html,
     routing::get,
@@ -112,10 +112,23 @@ body.light #status{color:#aaa}
   <tbody id="tbody"></tbody>
 </table>
 <div id="status">Loading...</div>
+<div id="detail-panel" style="display:none;position:fixed;top:0;right:0;width:420px;height:100vh;background:#111;border-left:1px solid #2a2a2a;overflow-y:auto;padding:1rem;z-index:100;font-size:.78rem">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+    <span style="color:#4fc3f7;font-weight:bold">Call Detail</span>
+    <button onclick="closeDetail()" style="background:none;border:none;color:#888;cursor:pointer;font-size:1rem">X</button>
+  </div>
+  <div id="detail-content"></div>
+</div>
 <script>
 function fmtMs(v){return v==null?'-':v+'ms'}
 function fmtCost(c){return c==null?'-':'$'+Number(c).toFixed(4)}
 function makeCell(text,cls){var td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;return td;}
+function makeTr(label,val){
+  var tr=document.createElement('tr');
+  var td1=document.createElement('td');td1.style.color='#666';td1.style.padding='.2rem .4rem';td1.style.whiteSpace='nowrap';td1.style.verticalAlign='top';td1.textContent=label;
+  var td2=document.createElement('td');td2.style.color='#e0e0e0';td2.style.padding='.2rem .4rem';td2.style.wordBreak='break-all';td2.textContent=String(val);
+  tr.appendChild(td1);tr.appendChild(td2);return tr;
+}
 
 // dark mode
 function toggleDark(){
@@ -131,6 +144,27 @@ function toggleDark(){
   }
 })();
 
+// detail panel
+function closeDetail(){document.getElementById('detail-panel').style.display='none';}
+async function showDetail(id){
+  var panel=document.getElementById('detail-panel');
+  var content=document.getElementById('detail-content');
+  content.textContent='Loading...';
+  panel.style.display='block';
+  try{
+    var res=await fetch('/api/detail/'+id);
+    if(!res.ok){content.textContent='Error: '+res.status;return;}
+    var r=await res.json();
+    content.textContent='';
+    var tbl=document.createElement('table');tbl.style.width='100%';tbl.style.borderCollapse='collapse';
+    var rows=[['id',r.id],['timestamp',r.timestamp],['provider',r.provider],['model',r.model],['endpoint',r.endpoint],['status',r.status_code],['latency',fmtMs(r.latency_ms)],['ttft',fmtMs(r.ttft_ms)],['input tokens',r.input_tokens],['output tokens',r.output_tokens],['cost',fmtCost(r.cost_usd)],['error',r.error||null]];
+    rows.forEach(function(row){if(row[1]!=null){tbl.appendChild(makeTr(row[0],row[1]));}});
+    content.appendChild(tbl);
+    if(r.request_body){var lbl=document.createElement('div');lbl.style.color='#666';lbl.style.marginTop='.75rem';lbl.style.marginBottom='.25rem';lbl.textContent='request';content.appendChild(lbl);var pre=document.createElement('pre');pre.style.background='#1a1a1a';pre.style.padding='.5rem';pre.style.borderRadius='3px';pre.style.fontSize='.72rem';pre.style.overflowX='auto';pre.style.whiteSpace='pre-wrap';pre.textContent=r.request_body;content.appendChild(pre);}
+    if(r.response_body){var lbl2=document.createElement('div');lbl2.style.color='#666';lbl2.style.marginTop='.75rem';lbl2.style.marginBottom='.25rem';lbl2.textContent='response';content.appendChild(lbl2);var pre2=document.createElement('pre');pre2.style.background='#1a1a1a';pre2.style.padding='.5rem';pre2.style.borderRadius='3px';pre2.style.fontSize='.72rem';pre2.style.overflowX='auto';pre2.style.whiteSpace='pre-wrap';pre2.textContent=r.response_body;content.appendChild(pre2);}
+  }catch(e){content.textContent='Error: '+e.message;}
+}
+
 // row rendering (shared by refresh and search)
 function renderRows(calls){
   var tbody=document.getElementById('tbody');
@@ -139,6 +173,8 @@ function renderRows(calls){
     var r=calls[i];
     var ok=r.status_code>=200&&r.status_code<400&&!r.error;
     var tr=document.createElement('tr');
+    tr.style.cursor='pointer';
+    (function(id){tr.addEventListener('click',function(){showDetail(id);});})(r.id);
     tr.appendChild(makeCell((r.id||'').slice(0,8),'dim'));
     tr.appendChild(makeCell((r.timestamp||'').slice(0,19),'dim'));
     tr.appendChild(makeCell(r.model||'-',null));
@@ -461,6 +497,7 @@ fn router(state: ServeState) -> Router {
         .route("/api/stats", get(api_stats_handler))
         .route("/api/search", get(api_search_handler))
         .route("/api/heatmap", get(api_heatmap_handler))
+        .route("/api/detail/:id", get(api_detail_handler))
         .route("/playground", get(playground_handler))
         .with_state(state)
 }
@@ -536,6 +573,18 @@ async fn api_heatmap_handler(
     let store = state.store.lock().unwrap();
     let day_stats = store.daily_stats(days).unwrap_or_default();
     Json(HeatmapResponse { days: day_stats })
+}
+
+async fn api_detail_handler(
+    State(state): State<ServeState>,
+    Path(id): Path<String>,
+) -> Result<Json<CallRecord>, (StatusCode, String)> {
+    let store = state.store.lock().unwrap();
+    match store.get_by_id(&id) {
+        Ok(Some(record)) => Ok(Json(record)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, format!("No call found with id prefix: {id}"))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,5 +732,31 @@ mod tests {
             axum::http::Request::builder().uri("/playground").body(axum::body::Body::empty()).unwrap(),
         ).await.unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn serve_api_detail_returns_record() {
+        let (app, store) = test_app();
+        store.lock().unwrap().insert(&make_record("detail-test-id-1234", "gpt-4o", 200)).unwrap();
+        let resp = app.oneshot(
+            axum::http::Request::builder()
+                .uri("/api/detail/detail-test-id-1234")
+                .body(axum::body::Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(record["model"].as_str().unwrap(), "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn serve_api_detail_returns_404_for_unknown_id() {
+        let (app, _) = test_app();
+        let resp = app.oneshot(
+            axum::http::Request::builder()
+                .uri("/api/detail/nonexistent-id")
+                .body(axum::body::Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), 404);
     }
 }

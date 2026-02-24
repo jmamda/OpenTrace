@@ -406,6 +406,125 @@ pub fn estimate_cost(model: &str, input_tokens: i64, output_tokens: i64) -> f64 
     (input_tokens as f64 * input_price + output_tokens as f64 * output_price) / 1_000_000.0
 }
 
+/// Estimate cost from a non-streaming response body, adjusting for prompt-cache discounts.
+///
+/// Anthropic prompt cache pricing:
+/// - Cache write (`cache_creation_input_tokens`): 1.25× normal input price
+/// - Cache read  (`cache_read_input_tokens`):      0.10× normal input price
+///
+/// OpenAI prompt cache pricing:
+/// - Cached reads (`prompt_tokens_details.cached_tokens`): 0.50× normal input price
+///
+/// Falls back to `estimate_cost()` when no cache tokens are found.
+pub fn estimate_cost_from_body(
+    model: &str,
+    body: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> f64 {
+    if input_tokens < 0 || output_tokens < 0 {
+        return 0.0;
+    }
+    let (input_price, output_price) = model_prices(model);
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(usage) = v.get("usage") {
+            // Anthropic prompt cache
+            let write = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+            let read  = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+            if write > 0 || read > 0 {
+                let regular = (input_tokens - write - read).max(0);
+                return (regular as f64 * input_price
+                    + write as f64 * input_price * 1.25
+                    + read  as f64 * input_price * 0.10
+                    + output_tokens as f64 * output_price)
+                    / 1_000_000.0;
+            }
+            // OpenAI prompt cache
+            let cached = usage["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
+            if cached > 0 {
+                let regular = (input_tokens - cached).max(0);
+                return (regular as f64 * input_price
+                    + cached as f64 * input_price * 0.50
+                    + output_tokens as f64 * output_price)
+                    / 1_000_000.0;
+            }
+        }
+    }
+    estimate_cost(model, input_tokens, output_tokens)
+}
+
+/// Estimate cost from streaming SSE chunks, adjusting for prompt-cache discounts.
+///
+/// Parses the accumulated chunk stream for Anthropic and OpenAI cache token fields
+/// using the same discount rates as `estimate_cost_from_body`.
+/// Falls back to `estimate_cost()` when cache tokens are absent.
+pub fn estimate_cost_from_chunks(
+    model: &str,
+    chunks: &[Bytes],
+    input_tokens: i64,
+    output_tokens: i64,
+) -> f64 {
+    if input_tokens < 0 || output_tokens < 0 {
+        return 0.0;
+    }
+    let (input_price, output_price) = model_prices(model);
+
+    // Collect cache token counts across all SSE events.
+    let mut ant_write: i64 = 0;
+    let mut ant_read:  i64 = 0;
+    let mut oai_cached: i64 = 0;
+
+    let mut full_text = String::new();
+    for chunk in chunks {
+        if let Ok(s) = std::str::from_utf8(chunk) {
+            full_text.push_str(s);
+        }
+    }
+
+    for line in full_text.lines() {
+        let data = match line.strip_prefix("data: ") {
+            Some(d) if d.trim() != "[DONE]" => d,
+            _ => continue,
+        };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            // Anthropic: usage in message_start (nested under message.usage)
+            if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                let w = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                let r = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+                if w > 0 { ant_write = w; }
+                if r > 0 { ant_read  = r; }
+            }
+            // Anthropic: usage in message_delta; OpenAI: top-level usage
+            if let Some(usage) = v.get("usage") {
+                let w = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                let r = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+                if w > 0 { ant_write = w; }
+                if r > 0 { ant_read  = r; }
+                let c = usage["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
+                if c > 0 { oai_cached = c; }
+            }
+        }
+    }
+
+    if ant_write > 0 || ant_read > 0 {
+        let regular = (input_tokens - ant_write - ant_read).max(0);
+        return (regular as f64 * input_price
+            + ant_write as f64 * input_price * 1.25
+            + ant_read  as f64 * input_price * 0.10
+            + output_tokens as f64 * output_price)
+            / 1_000_000.0;
+    }
+    if oai_cached > 0 {
+        let regular = (input_tokens - oai_cached).max(0);
+        return (regular as f64 * input_price
+            + oai_cached as f64 * input_price * 0.50
+            + output_tokens as f64 * output_price)
+            / 1_000_000.0;
+    }
+    estimate_cost(model, input_tokens, output_tokens)
+}
+
 pub fn model_prices(model: &str) -> (f64, f64) {
     // Prices per 1M tokens (input, output) — USD.
     // ORDERING RULE: more-specific patterns (longer substrings) MUST appear
@@ -1117,6 +1236,54 @@ mod tests {
         let cost = estimate_cost("text-embedding-3-large", 1_000, 0);
         let expected = 1_000.0 * 0.13 / 1_000_000.0;
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    // -------------------------------------------------------------------------
+    // estimate_cost_from_body — cache-aware pricing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn estimate_cost_from_body_anthropic_cache_read_is_cheaper() {
+        // claude-3-5-sonnet: $3.00/M input, $15.00/M output.
+        // Cache read = 10% of input price = $0.30/M.
+        // 1000 input (900 cached read, 100 regular), 200 output.
+        let body = r#"{"usage":{"input_tokens":1000,"cache_read_input_tokens":900,"output_tokens":200}}"#;
+        let with_cache = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 200);
+        let without_cache = estimate_cost("claude-3-5-sonnet-20241022", 1000, 200);
+        assert!(with_cache < without_cache, "cache read should be cheaper: {with_cache} < {without_cache}");
+
+        // Expected: 100 regular * $3/M + 900 cached * $0.30/M + 200 * $15/M
+        let expected = (100.0 * 3.00 + 900.0 * 0.30 + 200.0 * 15.00) / 1_000_000.0;
+        assert!((with_cache - expected).abs() < 1e-9, "with_cache={with_cache} expected={expected}");
+    }
+
+    #[test]
+    fn estimate_cost_from_body_anthropic_cache_write_is_pricier() {
+        // Cache write = 1.25x normal input price.
+        let body = r#"{"usage":{"input_tokens":1000,"cache_creation_input_tokens":800,"output_tokens":0}}"#;
+        let with_write = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 0);
+        // Expected: 200 regular * $3/M + 800 write * $3.75/M
+        let expected = (200.0 * 3.00 + 800.0 * 3.75) / 1_000_000.0;
+        assert!((with_write - expected).abs() < 1e-9, "with_write={with_write} expected={expected}");
+    }
+
+    #[test]
+    fn estimate_cost_from_body_openai_cached_tokens_50pct_discount() {
+        // gpt-4o: $2.50/M input. Cached reads are 50% = $1.25/M.
+        // 1000 input (800 cached), 0 output.
+        let body = r#"{"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800},"completion_tokens":0}}"#;
+        let with_cache = estimate_cost_from_body("gpt-4o", body, 1000, 0);
+        // Expected: 200 regular * $2.50/M + 800 cached * $1.25/M
+        let expected = (200.0 * 2.50 + 800.0 * 1.25) / 1_000_000.0;
+        assert!((with_cache - expected).abs() < 1e-9, "with_cache={with_cache} expected={expected}");
+    }
+
+    #[test]
+    fn estimate_cost_from_body_no_cache_falls_back_to_normal() {
+        let body = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":200}}"#;
+        let from_body = estimate_cost_from_body("gpt-4o", body, 1000, 200);
+        let normal = estimate_cost("gpt-4o", 1000, 200);
+        assert!((from_body - normal).abs() < 1e-9);
     }
 
     // -------------------------------------------------------------------------

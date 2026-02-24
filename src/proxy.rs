@@ -385,7 +385,7 @@ async fn handle(
                 .unwrap_or((None, None));
 
             let cost_usd = match (input_tokens, output_tokens) {
-                (Some(i), Some(o)) => Some(capture::estimate_cost(&model, i, o)),
+                (Some(i), Some(o)) => Some(capture::estimate_cost_from_chunks(&model, &accumulated, i, o)),
                 _ => None,
             };
 
@@ -473,7 +473,9 @@ async fn handle(
             .unwrap_or((None, None));
 
         let cost_usd = match (input_tokens, output_tokens) {
-            (Some(i), Some(o)) => Some(capture::estimate_cost(&model, i, o)),
+            (Some(i), Some(o)) => Some(capture::estimate_cost_from_body(
+                &model, resp_str.as_deref().unwrap_or(""), i, o,
+            )),
             _ => None,
         };
 

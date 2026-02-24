@@ -60,7 +60,7 @@ trace start
 Output at startup:
 
 ```
-trace v0.25.0
+trace v0.3.3
   listening  http://127.0.0.1:4000
   upstream   https://api.openai.com
   storage    /home/user/.trace/trace.db
@@ -153,7 +153,7 @@ trace start --port 4000 \
   --route "/v1/messages=https://api.anthropic.com" \
   --upstream https://api.openai.com
 
-trace v0.25.0
+trace v0.3.3
   listening  http://127.0.0.1:4000
   upstream   https://api.openai.com
   routes     1 rule(s):
@@ -199,6 +199,7 @@ trace serve --port 3000  # custom port
 The dashboard auto-refreshes every 2 seconds and shows:
 - Stat cards: total calls, total cost, avg latency, calls last hour
 - Live call log with model filter and errors-only checkbox
+- **Click any row** to open a detail panel with full call metadata (latency, tokens, cost, provider request ID, request/response bodies)
 - Fully offline — zero CDN dependencies
 
 | Flag | Env var | Default | Description |
@@ -217,6 +218,7 @@ Print a summary of costs for captured calls. Designed for CI pipelines.
 trace report                              # text table, all time
 trace report --since 2026-02-01           # from a date
 trace report --model gpt-4o              # filter by model
+trace report --provider anthropic         # filter by provider
 trace report --format json               # JSON output
 trace report --format github             # GitHub Actions job summary markdown
 trace report --fail-over-usd 5.00        # exit 1 if total cost > $5.00
@@ -227,6 +229,7 @@ trace report --fail-over-usd 5.00        # exit 1 if total cost > $5.00
 | `--since TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
 | `--until TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
 | `-m`, `--model SUBSTR` | — | Filter by model name (substring match) |
+| `-p`, `--provider SUBSTR` | — | Filter by provider name (substring match) |
 | `--format text\|json\|github` | `text` | Output format |
 | `--fail-over-usd AMOUNT` | — | Exit with code 1 if total cost exceeds this value |
 
@@ -296,7 +299,10 @@ port = 8080
 trace query                              # last 20 calls
 trace query --last 100                   # last 100 calls
 trace query --model gpt-4o              # filter by model (substring)
+trace query --provider anthropic         # filter by provider (substring)
 trace query --errors                     # failed calls only (status >= 400 or connection failure)
+trace query --status 429                 # exact HTTP status code
+trace query --status-range 400-499       # HTTP status code range
 trace query --since 2026-02-20          # calls from this date onward
 trace query --since 2026-02-20T10:00:00Z --until 2026-02-20T11:00:00Z
 trace query --json                       # JSON output
@@ -311,7 +317,10 @@ trace query --json --bodies --full       # bodies without truncation
 | `-b`, `--bodies` | off | Include request and response bodies |
 | `--full` | off | Print bodies without truncation (use with `--bodies`) |
 | `-m`, `--model SUBSTR` | — | Filter by model name (substring match) |
+| `-p`, `--provider SUBSTR` | — | Filter by provider name (substring match) |
 | `-e`, `--errors` | off | Show only failed calls |
+| `--status CODE` | — | Exact HTTP status code filter |
+| `--status-range LO-HI` | — | HTTP status code range filter (e.g. `400-499`) |
 | `--since TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
 | `--until TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
 
@@ -326,6 +335,8 @@ f3a4b5c6  2026-02-22T14:01:27  gpt-4o                       0      12ms     -   
   error: connection refused
 ```
 
+Error calls also show auto-classified error tags: `[rate_limit]`, `[auth]`, `[timeout]`, `[upstream_5xx]`, `[connection]`.
+
 ---
 
 ### `trace watch` — live tail
@@ -335,6 +346,7 @@ Stream new calls to the terminal as they arrive. Polls every 250ms. Ctrl-C to st
 ```bash
 trace watch
 trace watch --model claude
+trace watch --provider anthropic
 trace watch --errors
 ```
 
@@ -349,6 +361,7 @@ The line turns red when spend reaches 80% of the limit.
 | Flag | Description |
 |---|---|
 | `-m`, `--model SUBSTR` | Filter by model name |
+| `-p`, `--provider SUBSTR` | Filter by provider name |
 | `-e`, `--errors` | Show only failed calls |
 
 ---
@@ -397,15 +410,25 @@ response:
 ### `trace stats` — aggregate usage and cost
 
 ```bash
-trace stats                   # overall totals + p50/p95/p99 latency
-trace stats --breakdown       # per-model breakdown
-trace stats --endpoint        # per-endpoint breakdown
+trace stats                              # overall totals + p50/p95/p99 latency
+trace stats --breakdown                  # per-model breakdown
+trace stats --endpoint                   # per-endpoint breakdown
+trace stats --provider-breakdown         # per-provider breakdown (cost, calls, errors)
+trace stats --since 2026-02-20           # filter to date range
+trace stats --until 2026-02-22
+trace stats --model gpt-4o               # filter by model
+trace stats --provider anthropic         # filter by provider
 ```
 
 | Flag | Description |
 |---|---|
 | `-b`, `--breakdown` | Cost, tokens, and p99 latency per model |
 | `--endpoint` | Cost, tokens, and avg latency per endpoint |
+| `--provider-breakdown` | Calls, cost, avg latency, and error count per provider |
+| `--since TIMESTAMP` | Filter stats to calls from this date onward |
+| `--until TIMESTAMP` | Filter stats to calls up to this date |
+| `-m`, `--model SUBSTR` | Filter by model name (substring match) |
+| `-p`, `--provider SUBSTR` | Filter by provider name (substring match) |
 
 Example output:
 
@@ -422,6 +445,9 @@ trace stats
 
   input tokens      4.8M
   output tokens     983.4K
+  token p50         210 in / 44 out
+  token p95         890 in / 312 out
+  token p99        2100 in / 850 out
   estimated cost    $28.4712
 
 by model:
@@ -429,7 +455,31 @@ by model:
   gpt-4o                            821     2.4M    512.0K   $18.1200      712ms   2900ms
   gpt-4o-mini                       614   891.2K    201.3K    $0.2546      198ms    430ms
   claude-3-5-sonnet-20241022        412     1.5M    270.1K   $10.0953      934ms   3100ms
+
+by provider:
+  provider      calls       cost    avg ms   errors
+  openai         1435    $18.37      455ms        1
+  anthropic       412    $10.10      934ms        1
 ```
+
+---
+
+### `trace search` — full-text search across calls
+
+Search request and response bodies using SQLite FTS5 full-text search.
+
+```bash
+trace search "database connection"          # search all bodies
+trace search "rate limit" --limit 50        # up to 50 results (default: 20, max: 200)
+trace search "timeout" --json               # JSON output
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-l`, `--limit N` | `20` | Max results to return (capped at 200) |
+| `-j`, `--json` | off | Output as JSON array |
+
+Results show id, timestamp, model, and a matched text snippet.
 
 ---
 
@@ -441,14 +491,53 @@ Export all captured calls to stdout. Pipe to a file.
 trace export > calls.jsonl
 trace export --format csv > calls.csv
 trace export --since 2026-02-01 --model gpt-4o > filtered.jsonl
+trace export --provider anthropic > anthropic_calls.jsonl
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--format jsonl\|csv` | `jsonl` | Output format |
 | `-m`, `--model SUBSTR` | — | Filter by model name |
+| `-p`, `--provider SUBSTR` | — | Filter by provider name |
 | `--since TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
 | `--until TIMESTAMP` | — | ISO 8601 or `YYYY-MM-DD` |
+
+---
+
+### `trace eval` — quality rule checks
+
+Run rule-based checks against recent calls. Useful for CI quality gates.
+
+```bash
+trace eval                                        # check all default rules
+trace eval --since 2026-02-20                     # limit to date range
+trace eval --model gpt-4o --provider openai       # filter scope
+```
+
+Rules check latency SLOs, error rates, and cost thresholds. Exit code is non-zero when any rule fails.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--since TIMESTAMP` | — | Limit rule evaluation to calls from this date |
+| `--until TIMESTAMP` | — | Limit rule evaluation to calls up to this date |
+| `-m`, `--model SUBSTR` | — | Filter by model name |
+| `-p`, `--provider SUBSTR` | — | Filter by provider name |
+
+---
+
+### `trace vacuum` — compact the database
+
+Runs a WAL checkpoint and `VACUUM` to shrink the SQLite file on disk. Prints size before and after.
+
+```bash
+trace vacuum
+# DB before: 48.2 MB
+# DB after:  12.1 MB
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--db PATH` | `~/.trace/trace.db` | Path to database file |
 
 ---
 
@@ -560,9 +649,12 @@ Every call is one row in SQLite at `~/.trace/trace.db` (or `$XDG_DATA_HOME/trace
 | `ttft_ms` | `INTEGER` | Time to first token in ms (streaming only; equals `latency_ms` for non-streaming) |
 | `input_tokens` | `INTEGER` | Prompt tokens from upstream `usage` field |
 | `output_tokens` | `INTEGER` | Completion tokens from upstream `usage` field |
-| `cost_usd` | `REAL` | Estimated cost in USD, from built-in pricing table |
+| `cost_usd` | `REAL` | Estimated cost in USD; cache-aware: Anthropic cache reads at 10% of input price, cache writes at 125%; OpenAI cached prompt tokens at 50% |
 | `request_body` | `TEXT` | Full JSON request body (up to 16MB); `NULL` when `--no-request-bodies` is set; sensitive fields replaced when `--redact-fields` is set |
 | `response_body` | `TEXT` | For non-streaming: full response JSON (up to 10MB). For streaming: extracted text content (up to 256KB). Tool calls are captured as a compact JSON summary. |
+| `trace_id` | `TEXT` | Propagated `x-trace-id` header for grouping related calls |
+| `parent_id` | `TEXT` | Propagated `x-parent-id` header for building call trees |
+| `prompt_hash` | `TEXT` | FNV-1a hash of the request body for deduplication and prompt analysis |
 | `provider_request_id` | `TEXT` | Value of `x-request-id` response header — useful for provider support tickets |
 | `error` | `TEXT` | Upstream connection error message, if any |
 
@@ -643,9 +735,11 @@ Unknown models fall back to $1.00/$3.00 per million tokens input/output.
 | Streaming body capture | **yes (256KB cap)** | partial | partial | partial |
 | TTFT metric | **yes** | no | no | no |
 | Cost tracking | yes | yes | yes | yes |
+| Cache-aware cost | **yes** | partial | no | no |
 | Field-level redaction | **yes** | no | no | partial |
 | Budget alerting | **yes** | paid | paid | paid |
 | Web dashboard | **yes (local)** | cloud | cloud | cloud |
+| Full-text search | **yes** | no | partial | partial |
 | CI cost gate | **yes** | no | no | no |
 | Prometheus / OTel | **yes** | no | partial | partial |
 | Setup time | **~30s** | ~5 min | ~5 min | ~30 min |
@@ -672,7 +766,7 @@ Langfuse self-hosted requires ClickHouse + Postgres + Redis + a background worke
 Bug reports and pull requests are welcome.
 
 ```bash
-cargo test   # 514 tests, no external dependencies required
+cargo test   # 635 tests, no external dependencies required
 ```
 
 ## License

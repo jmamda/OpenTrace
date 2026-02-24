@@ -107,10 +107,21 @@ pub struct TokenPercentiles {
 pub struct QueryFilter {
     pub errors_only: bool,
     pub model: Option<String>,
+    /// Filter by provider name (substring match, e.g. "openai", "anthropic").
+    pub provider: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
     pub status: Option<u16>,
     pub status_range: Option<(u16, u16)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProviderStats {
+    pub provider: String,
+    pub calls: i64,
+    pub total_cost_usd: f64,
+    pub avg_latency_ms: f64,
+    pub error_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -291,6 +302,7 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
             CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(model);
+            CREATE INDEX IF NOT EXISTS idx_calls_provider ON calls(provider);
             CREATE INDEX IF NOT EXISTS idx_calls_trace_id ON calls(trace_id);
             CREATE INDEX IF NOT EXISTS idx_calls_prompt_hash ON calls(prompt_hash);
 
@@ -401,6 +413,8 @@ impl Store {
         // "gpt_4" literally rather than "gpt-4" or "gpt14" etc.
         let model_filter: Option<String> = filter.model.as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let provider_filter: Option<String> = filter.provider.as_deref()
+            .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
@@ -413,13 +427,50 @@ impl Store {
               AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
               AND (?3 IS NULL OR timestamp >= ?3)
               AND (?4 IS NULL OR timestamp <= ?4)
+              AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
               {status_clause}
             ORDER BY timestamp DESC
-            LIMIT ?5");
+            LIMIT ?6");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![errors_only_flag, model_filter, since, until, limit_i64],
+            params![errors_only_flag, model_filter, since, until, provider_filter, limit_i64],
+            row_to_record,
+        )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Query without a row limit — returns all matching records ordered oldest first.
+    /// Intended for `trace export` where the caller streams results to stdout.
+    pub fn query_all_filtered(&self, filter: &QueryFilter) -> Result<Vec<CallRecord>> {
+        let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
+        let model_filter: Option<String> = filter.model.as_deref()
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let provider_filter: Option<String> = filter.provider.as_deref()
+            .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+        let since: Option<String> = filter.since.clone();
+        let until: Option<String> = filter.until.clone();
+        let status_clause = build_status_clause(&filter.status, &filter.status_range);
+
+        let sql = format!("
+            SELECT {SELECT_COLS}
+            FROM calls
+            WHERE (?1 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
+              AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
+              AND (?3 IS NULL OR timestamp >= ?3)
+              AND (?4 IS NULL OR timestamp <= ?4)
+              AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
+              {status_clause}
+            ORDER BY timestamp ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![errors_only_flag, model_filter, since, until, provider_filter],
             row_to_record,
         )?;
 
@@ -463,39 +514,6 @@ impl Store {
         let mut results = Vec::new();
         for row in rows {
             results.push(row.map_err(anyhow::Error::from)?);
-        }
-        Ok(results)
-    }
-
-    /// Query without a row limit — returns all matching records ordered oldest first.
-    /// Intended for `trace export` where the caller streams results to stdout.
-    pub fn query_all_filtered(&self, filter: &QueryFilter) -> Result<Vec<CallRecord>> {
-        let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
-        let model_filter: Option<String> = filter.model.as_deref()
-            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
-        let since: Option<String> = filter.since.clone();
-        let until: Option<String> = filter.until.clone();
-        let status_clause = build_status_clause(&filter.status, &filter.status_range);
-
-        let sql = format!("
-            SELECT {SELECT_COLS}
-            FROM calls
-            WHERE (?1 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
-              AND (?2 IS NULL OR model LIKE '%' || ?2 || '%' ESCAPE '\\')
-              AND (?3 IS NULL OR timestamp >= ?3)
-              AND (?4 IS NULL OR timestamp <= ?4)
-              {status_clause}
-            ORDER BY timestamp ASC");
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            params![errors_only_flag, model_filter, since, until],
-            row_to_record,
-        )?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
         }
         Ok(results)
     }
@@ -593,6 +611,8 @@ impl Store {
         let errors_only_flag: i64 = if filter.errors_only { 1 } else { 0 };
         let model_filter: Option<String> = filter.model.as_deref()
             .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let provider_filter: Option<String> = filter.provider.as_deref()
+            .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         let sql = format!("
@@ -601,13 +621,14 @@ impl Store {
             WHERE timestamp > ?1
               AND (?2 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
               AND (?3 IS NULL OR model LIKE '%' || ?3 || '%' ESCAPE '\\')
+              AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\')
               {status_clause}
             ORDER BY timestamp ASC
-            LIMIT ?4");
+            LIMIT ?5");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![after_ts, errors_only_flag, model_filter, limit_i64],
+            params![after_ts, errors_only_flag, model_filter, provider_filter, limit_i64],
             row_to_record,
         )?;
 
@@ -735,6 +756,36 @@ impl Store {
                 total_cost_usd: row.get(4)?,
                 avg_latency_ms: row.get(5)?,
                 error_count: row.get(6)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Per-provider cost and usage breakdown, ordered by total cost descending.
+    pub fn stats_by_provider(&self) -> Result<Vec<ProviderStats>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider,
+                    COUNT(*) as calls,
+                    COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(AVG(latency_ms), 0.0),
+                    COUNT(CASE WHEN error IS NOT NULL OR status_code >= 400 OR status_code = 0 THEN 1 END)
+             FROM calls
+             GROUP BY provider
+             ORDER BY SUM(cost_usd) DESC NULLS LAST",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(ProviderStats {
+                provider: row.get(0)?,
+                calls: row.get(1)?,
+                total_cost_usd: row.get(2)?,
+                avg_latency_ms: row.get(3)?,
+                error_count: row.get(4)?,
             })
         })?;
 
@@ -874,10 +925,14 @@ impl Store {
         // build_status_clause produces only u16 integer literals — no injection risk.
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
+        let provider_filter: Option<String> = filter.provider.as_deref()
+            .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+
         // Aggregate query for counts and avg cost.
         // ?1 = model filter (NULL = all models, LIKE match)
         // ?2 = since timestamp (NULL = no lower bound)
         // ?3 = until timestamp (NULL = no upper bound)
+        // ?4 = provider filter (NULL = all providers, LIKE match)
         let agg_sql = format!(
             "SELECT COUNT(*), \
                     COALESCE(SUM(CASE WHEN error IS NOT NULL OR status_code >= 400 THEN 1 ELSE 0 END), 0), \
@@ -886,10 +941,11 @@ impl Store {
              WHERE (?1 IS NULL OR model LIKE '%' || ?1 || '%' ESCAPE '\\') \
                AND (?2 IS NULL OR timestamp >= ?2) \
                AND (?3 IS NULL OR timestamp <= ?3) \
+               AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\') \
                {status_clause}"
         );
         let (total_calls, error_count, avg_cost_usd): (i64, i64, f64) =
-            self.conn.query_row(&agg_sql, params![model_filter, since, until], |row| {
+            self.conn.query_row(&agg_sql, params![model_filter, since, until, provider_filter], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?;
 
@@ -905,11 +961,12 @@ impl Store {
              WHERE (?1 IS NULL OR model LIKE '%' || ?1 || '%' ESCAPE '\\') \
                AND (?2 IS NULL OR timestamp >= ?2) \
                AND (?3 IS NULL OR timestamp <= ?3) \
+               AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\') \
                {status_clause}"
         );
         let mut stmt = self.conn.prepare(&lat_sql)?;
         let mut latencies: Vec<u64> = stmt
-            .query_map(params![model_filter, since, until], |row| row.get::<_, i64>(0))?
+            .query_map(params![model_filter, since, until, provider_filter], |row| row.get::<_, i64>(0))?
             .filter_map(|r| r.ok())
             .map(|v| v as u64)
             .collect();
@@ -1201,9 +1258,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // idx_calls_timestamp + idx_calls_model + idx_calls_trace_id + idx_calls_prompt_hash = 4
+        // idx_calls_timestamp + idx_calls_model + idx_calls_trace_id + idx_calls_prompt_hash + idx_calls_provider = 5
         // (Excludes SQLite auto-generated indexes such as the PRIMARY KEY index.)
-        assert_eq!(idx_count, 4, "all four indexes should exist after init");
+        assert_eq!(idx_count, 5, "all five indexes should exist after init");
     }
 
     // -------------------------------------------------------------------------
@@ -2266,5 +2323,56 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let stats = store.daily_stats(90).unwrap();
         assert!(stats.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // provider filter (v0.3.3)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn provider_filter_returns_only_matching_provider() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("p1", "gpt-4o", 200);
+        r1.provider = "openai".to_string();
+        let mut r2 = make_record("p2", "claude-3-5-sonnet", 200);
+        r2.provider = "anthropic".to_string();
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+
+        let filter = QueryFilter { provider: Some("anthropic".to_string()), ..Default::default() };
+        let results = store.query_filtered(10, &filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "anthropic");
+    }
+
+    #[test]
+    fn provider_filter_substring_match() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("pm1", "gpt-4o", 200);
+        r1.provider = "azure-openai".to_string();
+        store.insert(&r1).unwrap();
+
+        let filter = QueryFilter { provider: Some("openai".to_string()), ..Default::default() };
+        let results = store.query_filtered(10, &filter).unwrap();
+        assert_eq!(results.len(), 1, "substring match should find azure-openai");
+    }
+
+    #[test]
+    fn stats_by_provider_returns_aggregates() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("sp1", "gpt-4o", 200);
+        r1.provider = "openai".to_string();
+        let mut r2 = make_record("sp2", "gpt-4o", 200);
+        r2.provider = "openai".to_string();
+        let mut r3 = make_record("sp3", "claude-3", 200);
+        r3.provider = "anthropic".to_string();
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+        store.insert(&r3).unwrap();
+
+        let stats = store.stats_by_provider().unwrap();
+        assert!(stats.len() >= 2, "should have at least openai and anthropic");
+        let openai = stats.iter().find(|p| p.provider == "openai").unwrap();
+        assert_eq!(openai.calls, 2);
     }
 }

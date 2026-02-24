@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.3.0",
+    version = "0.3.3",
     long_about = None,
 )]
 struct Cli {
@@ -106,6 +106,10 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
+        /// Filter by provider name (substring match, e.g. openai, anthropic)
+        #[arg(long)]
+        provider: Option<String>,
+
         /// Show only failed calls (status >= 400, status = 0, or upstream error)
         #[arg(short, long)]
         errors: bool,
@@ -132,6 +136,10 @@ enum Commands {
         /// Filter by model name (substring match)
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Filter by provider name (substring match, e.g. openai, anthropic)
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Show only failed calls
         #[arg(short, long)]
@@ -167,6 +175,22 @@ enum Commands {
         /// Break down by endpoint
         #[arg(long)]
         endpoint: bool,
+
+        /// Break down by provider (cost, calls, latency per provider)
+        #[arg(long)]
+        provider_breakdown: bool,
+
+        /// Only include calls at or after this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Only include calls at or before this timestamp (ISO 8601 or YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Only include calls for this provider (substring match, e.g. openai)
+        #[arg(long)]
+        provider: Option<String>,
     },
 
     /// Show DB path and size
@@ -188,6 +212,10 @@ enum Commands {
         /// Filter by model name (substring match, e.g. gpt-4o)
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Filter by provider name (substring match, e.g. openai, anthropic)
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Export calls at or after this timestamp (ISO 8601 or YYYY-MM-DD)
         #[arg(long)]
@@ -226,6 +254,10 @@ enum Commands {
         /// Filter by model name (substring match)
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Filter by provider name (substring match, e.g. openai, anthropic)
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Output format: text (default) | json | github
         #[arg(long, default_value = "text")]
@@ -269,6 +301,24 @@ enum Commands {
         /// Only evaluate calls for this model (substring match)
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Only evaluate calls for this provider (substring match, e.g. openai)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+
+    /// Full-text search across prompts, responses, models, and errors
+    Search {
+        /// Search query (e.g. "gpt-4o", "rate limit", "function calling")
+        query: String,
+
+        /// Maximum number of results to return [default: 20]
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Output as JSON
+        #[arg(short, long)]
+        json: bool,
     },
 
     /// Compare two models on cost, latency, and error rate
@@ -355,7 +405,10 @@ async fn main() -> Result<()> {
     let cfg = config::load_config();
     let cfg_path = config::config_path();
 
-    match cli.command.unwrap_or(Commands::Stats { breakdown: false, endpoint: false }) {
+    match cli.command.unwrap_or(Commands::Stats {
+        breakdown: false, endpoint: false, provider_breakdown: false,
+        since: None, until: None, provider: None,
+    }) {
         Commands::Start {
             port, upstream, bind, verbose, upstream_timeout, retention_days,
             no_request_bodies, metrics_port, otel_endpoint,
@@ -368,17 +421,17 @@ async fn main() -> Result<()> {
                 &cfg,
             ).await
         }
-        Commands::Query { last, json, bodies, full, model, errors, since, until, status, status_range } => {
-            cmd_query(last, json, bodies, full, model, errors, since, until, status, status_range)
+        Commands::Query { last, json, bodies, full, model, provider, errors, since, until, status, status_range } => {
+            cmd_query(last, json, bodies, full, model, provider, errors, since, until, status, status_range)
         }
-        Commands::Watch { model, errors, status, status_range } => {
-            cmd_watch(model, errors, status, status_range).await
+        Commands::Watch { model, provider, errors, status, status_range } => {
+            cmd_watch(model, provider, errors, status, status_range).await
         }
         Commands::Show { id, no_bodies, tree } => {
             cmd_show(id, no_bodies, tree)
         }
-        Commands::Stats { breakdown, endpoint } => {
-            cmd_stats(breakdown, endpoint)
+        Commands::Stats { breakdown, endpoint, provider_breakdown, since, until, provider } => {
+            cmd_stats(breakdown, endpoint, provider_breakdown, since, until, provider)
         }
         Commands::Info => {
             cmd_info()
@@ -386,8 +439,8 @@ async fn main() -> Result<()> {
         Commands::Clear { yes } => {
             cmd_clear(yes)
         }
-        Commands::Export { format, model, since, until, status, status_range } => {
-            cmd_export(format, model, since, until, status, status_range)
+        Commands::Export { format, model, provider, since, until, status, status_range } => {
+            cmd_export(format, model, provider, since, until, status, status_range)
         }
         Commands::Serve { port } => {
             let serve_cfg = cfg.serve.as_ref();
@@ -396,8 +449,8 @@ async fn main() -> Result<()> {
                 .unwrap_or(8080);
             serve::cmd_serve(resolved_port).await
         }
-        Commands::Report { since, until, model, format, fail_over_usd } => {
-            cmd_report(since, until, model, format, fail_over_usd)
+        Commands::Report { since, until, model, provider, format, fail_over_usd } => {
+            cmd_report(since, until, model, provider, format, fail_over_usd)
         }
         Commands::Config { action } => {
             cmd_config(action, &cfg, cfg_path.as_deref())
@@ -405,8 +458,11 @@ async fn main() -> Result<()> {
         Commands::Vacuum { db } => {
             cmd_vacuum(db)
         }
-        Commands::Eval { rules, since, until, model } => {
-            cmd_eval(rules, since, until, model)
+        Commands::Eval { rules, since, until, model, provider } => {
+            cmd_eval(rules, since, until, model, provider)
+        }
+        Commands::Search { query, limit, json } => {
+            cmd_search(query, limit, json)
         }
         Commands::Compare { model_a, model_b, since, until } => {
             cmd_compare(model_a, model_b, since, until)
@@ -873,6 +929,7 @@ fn cmd_query(
     bodies: bool,
     full: bool,
     model: Option<String>,
+    provider: Option<String>,
     errors: bool,
     since: Option<String>,
     until: Option<String>,
@@ -883,7 +940,7 @@ fn cmd_query(
     let until = until.map(parse_until_ts).transpose()?;
 
     let store = store::Store::open().context("failed to open trace database")?;
-    let filter = store::QueryFilter { errors_only: errors, model, since, until, status, status_range };
+    let filter = store::QueryFilter { errors_only: errors, model, provider, since, until, status, status_range };
     let mut calls = store.query_filtered(limit, &filter)?;
 
     calls.reverse();
@@ -936,6 +993,7 @@ fn cmd_query(
 
 async fn cmd_watch(
     model: Option<String>,
+    provider: Option<String>,
     errors: bool,
     status: Option<u16>,
     status_range: Option<(u16, u16)>,
@@ -944,6 +1002,7 @@ async fn cmd_watch(
     let filter = store::QueryFilter {
         errors_only: errors,
         model,
+        provider,
         status,
         status_range,
         ..Default::default()
@@ -1116,10 +1175,21 @@ fn cmd_show(id: String, no_bodies: bool, tree: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
+fn cmd_stats(
+    breakdown: bool,
+    endpoint: bool,
+    provider_breakdown: bool,
+    since: Option<String>,
+    until: Option<String>,
+    provider: Option<String>,
+) -> Result<()> {
+    let since = since.map(parse_since_ts).transpose()?;
+    let until = until.map(parse_until_ts).transpose()?;
+    let filter = store::QueryFilter { since: since.clone(), until: until.clone(), provider: provider.clone(), ..Default::default() };
+
     let store = store::Store::open().context("failed to open trace database")?;
     let s = store.stats()?;
-    let (p50, p95, p99) = store.latency_percentiles(&store::QueryFilter::default())?;
+    let (p50, p95, p99) = store.latency_percentiles(&filter)?;
 
     println!("{}", "trace stats".bold());
     println!();
@@ -1259,6 +1329,36 @@ fn cmd_stats(breakdown: bool, endpoint: bool) -> Result<()> {
         }
     }
 
+    if provider_breakdown {
+        println!();
+        println!("{}", "by provider:".bold());
+        let providers = store.stats_by_provider()?;
+        if providers.is_empty() {
+            println!("  {}", "(no data)".dimmed());
+        } else {
+            println!("{}", format!(
+                "  {:<18}  {:>6}  {:>9}  {:>8}  {:>6}",
+                "provider", "calls", "cost", "avg ms", "errors"
+            ).underline());
+            for p in &providers {
+                let cost_str = format!("${:>8.4}", p.total_cost_usd);
+                let err_str = if p.error_count > 0 {
+                    p.error_count.to_string().red().to_string()
+                } else {
+                    "0".to_string()
+                };
+                println!(
+                    "  {:<18}  {:>6}  {}  {:>7.0}ms  {}",
+                    truncate(&p.provider, 18),
+                    p.calls,
+                    cost_str.cyan(),
+                    p.avg_latency_ms,
+                    err_str,
+                );
+            }
+        }
+    }
+
     println!();
     println!("Run {} to see recent calls.", "trace query".yellow());
     Ok(())
@@ -1312,6 +1412,7 @@ fn cmd_clear(yes: bool) -> Result<()> {
 fn cmd_export(
     format: String,
     model: Option<String>,
+    provider: Option<String>,
     since: Option<String>,
     until: Option<String>,
     status: Option<u16>,
@@ -1324,6 +1425,7 @@ fn cmd_export(
     let filter = store::QueryFilter {
         errors_only: false,
         model,
+        provider,
         since,
         until,
         status,
@@ -1382,6 +1484,7 @@ fn cmd_report(
     since: Option<String>,
     until: Option<String>,
     model: Option<String>,
+    provider: Option<String>,
     format: String,
     fail_over_usd: Option<f64>,
 ) -> Result<()> {
@@ -1392,6 +1495,7 @@ fn cmd_report(
     let filter = store::QueryFilter {
         errors_only: false,
         model,
+        provider,
         since: since.clone(),
         until: until.clone(),
         ..Default::default()
@@ -1682,7 +1786,7 @@ fn cmd_vacuum(db: Option<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_eval(rules: Vec<String>, since: Option<String>, until: Option<String>, model: Option<String>) -> Result<()> {
+fn cmd_eval(rules: Vec<String>, since: Option<String>, until: Option<String>, model: Option<String>, provider: Option<String>) -> Result<()> {
     if rules.is_empty() {
         println!("{}", "No rules specified. Use --rule \"latency_p99 < 2000\".".yellow());
         return Ok(());
@@ -1693,6 +1797,7 @@ fn cmd_eval(rules: Vec<String>, since: Option<String>, until: Option<String>, mo
         since,
         until,
         model,
+        provider,
         ..Default::default()
     };
     let stats = store.eval_stats(&filter)?;
@@ -1761,6 +1866,34 @@ fn eval_check_rule(rule: &str, stats: &store::EvalStats) -> std::result::Result<
         other => return Err(format!("unknown operator: {}", other)),
     };
     Ok(result)
+}
+
+fn cmd_search(query: String, limit: Option<usize>, json: bool) -> Result<()> {
+    let store = store::Store::open().context("failed to open trace database")?;
+    let limit = limit.unwrap_or(20).min(200);
+    let results = store.search_calls(&query, limit)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+        return Ok(());
+    }
+
+    if results.is_empty() {
+        println!("{}", format!("No results for {:?}", query).dimmed());
+        return Ok(());
+    }
+
+    println!("{}", format!("trace search — {} result(s) for {:?}", results.len(), query).bold());
+    println!();
+    print_query_header();
+    for sr in &results {
+        print_call_row(&sr.record);
+        if !sr.snippet.is_empty() {
+            println!("    {}", sr.snippet.trim().dimmed());
+        }
+    }
+    println!();
+    Ok(())
 }
 
 fn cmd_compare(
