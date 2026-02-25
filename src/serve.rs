@@ -4,6 +4,7 @@
 //! `~/.trace/trace.db` and exposes:
 //!
 //! - `GET /`              — Static HTML dashboard (inline, zero CDN deps)
+//! - `GET /stream`        — Server-Sent Events stream of new CallRecords (real-time)
 //! - `GET /api/calls`     — `Vec<CallRecord>` JSON (supports filters)
 //! - `GET /api/stats`     — `{ stats: Stats, models: Vec<ModelStats> }` JSON
 //! - `GET /api/search`    — FTS5 full-text search over prompts + responses
@@ -14,12 +15,19 @@ use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Html,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html,
+    },
     routing::get,
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::store::{
     CallRecord, DailyStat, ModelStats, ProviderStats, QueryFilter, SearchResult, Stats, Store,
@@ -307,44 +315,52 @@ async function showDetail(id){
   }catch(e){content.textContent='Error: '+e.message;}
 }
 
+// Build a single table row for a CallRecord (shared by renderRows and prependRow)
+function makeRow(r){
+  var ok=r.status_code>=200&&r.status_code<400&&!r.error;
+  var tr=document.createElement('tr');
+  tr.style.cursor='pointer';
+  if(!ok)tr.className='row-err';
+  (function(rid){
+    tr.addEventListener('click',function(){showDetail(rid);});
+  })(r.id);
+  var idCell=makeCell((r.id||'').slice(0,8),'dim');
+  idCell.title='Click to copy full ID';
+  idCell.style.cursor='copy';
+  (function(rid){
+    idCell.addEventListener('click',function(e){
+      e.stopPropagation();
+      navigator.clipboard&&navigator.clipboard.writeText(rid).then(function(){
+        var orig=idCell.textContent;
+        idCell.textContent='copied!';
+        setTimeout(function(){idCell.textContent=orig;},800);
+      });
+    });
+  })(r.id);
+  tr.appendChild(idCell);
+  tr.appendChild(makeCell((r.timestamp||'').slice(0,19),'dim'));
+  tr.appendChild(makeCell(r.model||'-',null));
+  tr.appendChild(makeCell(r.provider||'-','dim'));
+  tr.appendChild(makeCell(String(r.status_code),ok?'ok':'err'));
+  tr.appendChild(makeCell(fmtMs(r.latency_ms),null));
+  tr.appendChild(makeCell(fmtMs(r.ttft_ms),'dim'));
+  tr.appendChild(makeCell(r.input_tokens!=null?String(r.input_tokens):'-','dim'));
+  tr.appendChild(makeCell(r.output_tokens!=null?String(r.output_tokens):'-','dim'));
+  tr.appendChild(makeCell(fmtCost(r.cost_usd),null));
+  return tr;
+}
 // row rendering (shared by refresh and search)
 function renderRows(calls){
   var tbody=document.getElementById('tbody');
   clearEl(tbody);
-  for(var i=0;i<calls.length;i++){
-    var r=calls[i];
-    var ok=r.status_code>=200&&r.status_code<400&&!r.error;
-    var tr=document.createElement('tr');
-    tr.style.cursor='pointer';
-    if(!ok)tr.className='row-err';
-    (function(rid){
-      tr.addEventListener('click',function(){showDetail(rid);});
-    })(r.id);
-    var idCell=makeCell((r.id||'').slice(0,8),'dim');
-    idCell.title='Click to copy full ID';
-    idCell.style.cursor='copy';
-    (function(rid){
-      idCell.addEventListener('click',function(e){
-        e.stopPropagation();
-        navigator.clipboard&&navigator.clipboard.writeText(rid).then(function(){
-          var orig=idCell.textContent;
-          idCell.textContent='copied!';
-          setTimeout(function(){idCell.textContent=orig;},800);
-        });
-      });
-    })(r.id);
-    tr.appendChild(idCell);
-    tr.appendChild(makeCell((r.timestamp||'').slice(0,19),'dim'));
-    tr.appendChild(makeCell(r.model||'-',null));
-    tr.appendChild(makeCell(r.provider||'-','dim'));
-    tr.appendChild(makeCell(String(r.status_code),ok?'ok':'err'));
-    tr.appendChild(makeCell(fmtMs(r.latency_ms),null));
-    tr.appendChild(makeCell(fmtMs(r.ttft_ms),'dim'));
-    tr.appendChild(makeCell(r.input_tokens!=null?String(r.input_tokens):'-','dim'));
-    tr.appendChild(makeCell(r.output_tokens!=null?String(r.output_tokens):'-','dim'));
-    tr.appendChild(makeCell(fmtCost(r.cost_usd),null));
-    tbody.appendChild(tr);
-  }
+  for(var i=0;i<calls.length;i++){tbody.appendChild(makeRow(calls[i]));}
+}
+// Prepend a single new row from SSE without rebuilding the whole table.
+// Caps at 200 rows to prevent unbounded DOM growth.
+function prependRow(r){
+  var tbody=document.getElementById('tbody');
+  tbody.insertBefore(makeRow(r),tbody.firstChild);
+  while(tbody.rows.length>200)tbody.deleteRow(tbody.rows.length-1);
 }
 
 // search (debounced 300ms)
@@ -546,7 +562,47 @@ document.addEventListener('keydown',function(e){
 });
 refresh();
 loadHeatmap();
-setInterval(refresh,2000);
+// SSE: receive new call records in real time.
+// Falls back to 2-second polling while the SSE connection is down.
+var sseActive=false;
+function connectSSE(){
+  var es=new EventSource('/stream');
+  es.onopen=function(){sseActive=true;};
+  es.onmessage=function(evt){
+    try{
+      var r=JSON.parse(evt.data);
+      if(r.type==='ping')return;
+      // Honour active filters — only prepend if the record matches
+      var mf=document.getElementById('f-model').value.trim().toLowerCase();
+      var pf=document.getElementById('f-provider').value.trim().toLowerCase();
+      var ef=document.getElementById('f-errors').checked;
+      var sf=document.getElementById('f-search').value.trim();
+      if(sf)return; // search active — let the search view handle its own refresh
+      if(mf&&!(r.model||'').toLowerCase().includes(mf))return;
+      if(pf&&!(r.provider||'').toLowerCase().includes(pf))return;
+      if(ef&&!(r.error||(r.status_code>=400||r.status_code===0)))return;
+      prependRow(r);
+    }catch(e){}
+    // Refresh stat cards on every new call (single cheap fetch)
+    fetch('/api/stats').then(function(res){return res.json();}).then(function(data){
+      var s=data.stats;
+      document.getElementById('s-calls').textContent=String(s.total_calls);
+      document.getElementById('s-cost').textContent='$'+Number(s.total_cost_usd).toFixed(4);
+      document.getElementById('s-lat').textContent=Math.round(s.avg_latency_ms)+'ms';
+      document.getElementById('s-errors').textContent=String(s.error_count);
+      document.getElementById('s-p99').textContent=Math.round(data.p99_latency_ms||0)+'ms';
+      document.getElementById('s-hour').textContent=String(s.calls_last_hour);
+    }).catch(function(){});
+  };
+  es.onerror=function(){
+    sseActive=false;
+    es.close();
+    setTimeout(connectSSE,3000); // reconnect after 3 s
+  };
+}
+connectSSE();
+// Polling fallback — fires only when SSE is reconnecting
+setInterval(function(){if(!sseActive)refresh();},2000);
 </script>
 </body>
 </html>
@@ -705,6 +761,9 @@ async function runPlayground(){
 #[derive(Clone)]
 struct ServeState {
     store: Arc<Mutex<Store>>,
+    /// Broadcast sender — background poller pushes new CallRecords here;
+    /// /stream SSE handlers subscribe to receive them.
+    event_tx: broadcast::Sender<CallRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +817,7 @@ struct HeatmapResponse {
 fn router(state: ServeState) -> Router {
     Router::new()
         .route("/", get(dashboard_handler))
+        .route("/stream", get(stream_handler))
         .route("/api/calls", get(api_calls_handler))
         .route("/api/stats", get(api_stats_handler))
         .route("/api/search", get(api_search_handler))
@@ -773,6 +833,32 @@ async fn dashboard_handler() -> Html<&'static str> {
 
 async fn playground_handler() -> Html<&'static str> {
     Html(PLAYGROUND_HTML)
+}
+
+/// `GET /stream` — Server-Sent Events endpoint.
+///
+/// Each new `CallRecord` written to the database is broadcast to all
+/// connected subscribers within ~250 ms.  Slow consumers lag-skip rather
+/// than blocking the broadcaster.  A 30-second keepalive ping prevents
+/// proxies and browsers from closing idle connections.
+async fn stream_handler(
+    State(state): State<ServeState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.event_tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| {
+        futures_util::future::ready(match result {
+            Ok(record) => serde_json::to_string(&record)
+                .ok()
+                .map(|json| Ok(Event::default().data(json))),
+            // Subscriber lagged — skip missed records, keep stream alive.
+            Err(_) => None,
+        })
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(30))
+            .text("ping"),
+    )
 }
 
 async fn api_calls_handler(
@@ -871,8 +957,51 @@ async fn api_detail_handler(
 
 pub async fn cmd_serve(port: u16) -> Result<()> {
     let store = Store::open()?;
+    let store = Arc::new(Mutex::new(store));
+
+    // Capacity 256: buffers ~1s of bursts; slow subscribers lag-skip.
+    let (event_tx, _) = broadcast::channel::<CallRecord>(256);
+
+    // Background poller: detect new DB rows every 250 ms and broadcast them
+    // to all /stream subscribers.  Uses query_after so each poll is cheap
+    // (index scan on timestamp).  Skips DB work entirely when no one is
+    // connected (receiver_count() == 0 is a single atomic load).
+    {
+        let store_poll = Arc::clone(&store);
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            // Anchor to latest existing record so only arrivals after
+            // `trace serve` started are broadcast.
+            let mut last_ts = {
+                let s = store_poll.lock().unwrap();
+                s.query_filtered(1, &crate::store::QueryFilter::default())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .map(|r| r.timestamp)
+                    .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+            };
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if tx.receiver_count() == 0 {
+                    continue;
+                }
+                let records = {
+                    let s = store_poll.lock().unwrap();
+                    s.query_after(&last_ts, &crate::store::QueryFilter::default(), 50)
+                        .unwrap_or_default()
+                };
+                for record in records {
+                    last_ts = record.timestamp.clone();
+                    let _ = tx.send(record); // fire-and-forget
+                }
+            }
+        });
+    }
+
     let state = ServeState {
-        store: Arc::new(Mutex::new(store)),
+        store,
+        event_tx,
     };
 
     let app = router(state);
@@ -921,6 +1050,7 @@ mod tests {
             trace_id: None,
             parent_id: None,
             prompt_hash: None,
+            tags: None,
         }
     }
 
@@ -933,8 +1063,10 @@ mod tests {
     fn test_app() -> (Router, Arc<Mutex<Store>>) {
         let store = Store::open_in_memory().unwrap();
         let store = Arc::new(Mutex::new(store));
+        let (event_tx, _) = broadcast::channel::<CallRecord>(16);
         let state = ServeState {
             store: Arc::clone(&store),
+            event_tx,
         };
         (router(state), store)
     }
@@ -1107,5 +1239,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn serve_stream_returns_event_stream_content_type() {
+        let (app, _) = test_app();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/stream")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/event-stream"),
+            "expected SSE content-type, got: {ct}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_stream_delivers_broadcast_record() {
+        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let (event_tx, _) = broadcast::channel::<CallRecord>(16);
+        let state = ServeState {
+            store: Arc::clone(&store),
+            event_tx: event_tx.clone(),
+        };
+        let app = router(state);
+
+        // Send one record into the channel before the request so it is
+        // buffered and delivered immediately when the stream opens.
+        event_tx
+            .send(make_record("sse-test-1", "gpt-4o", 200))
+            .unwrap();
+        // Drop the extra sender so the BroadcastStream closes after draining.
+        drop(event_tx);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/stream")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("data:"), "expected SSE data line");
+        assert!(body_str.contains("gpt-4o"), "expected model in SSE payload");
     }
 }

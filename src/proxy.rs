@@ -182,6 +182,12 @@ async fn handle(
     let store_tx = state.store_tx.clone();
     let provider = capture::detect_provider(&upstream);
     let (trace_id, parent_id) = extract_trace_ids(&headers);
+    // X-Trace-Tag — call-tagging header; consumed by the proxy, stored in `tags`,
+    // never forwarded upstream.
+    let tags = headers
+        .get("x-trace-tag")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     // Read and buffer request body.
     let req_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
@@ -255,6 +261,8 @@ async fn handle(
             | "proxy-authorization" | "proxy-connection"
             // Internal network topology — must not leak to LLM providers
             | "x-forwarded-for" | "x-real-ip" | "forwarded"
+            // Tagging header — consumed by the proxy, not forwarded upstream
+            | "x-trace-tag"
         ) {
             continue;
         }
@@ -297,6 +305,7 @@ async fn handle(
                 trace_id: trace_id.clone(),
                 parent_id: parent_id.clone(),
                 prompt_hash: prompt_hash.clone(),
+                tags: tags.clone(),
             };
             try_store(&store_tx, record, verbose);
             // Return a 502 with CORS headers so the playground page receives a
@@ -350,6 +359,7 @@ async fn handle(
         let trace_id_for_spawn = trace_id.clone();
         let parent_id_for_spawn = parent_id.clone();
         let prompt_hash_for_spawn = prompt_hash.clone();
+        let tags_for_spawn = tags.clone();
 
         tokio::spawn(async move {
             // Accumulate all chunks (cheap: Bytes::clone increments Arc refcount)
@@ -454,6 +464,7 @@ async fn handle(
                 trace_id: trace_id_for_spawn,
                 parent_id: parent_id_for_spawn,
                 prompt_hash: prompt_hash_for_spawn,
+                tags: tags_for_spawn,
             };
             try_store(&store_tx, record, verbose);
         });
@@ -543,6 +554,7 @@ async fn handle(
             trace_id,
             parent_id,
             prompt_hash,
+            tags,
         };
         try_store(&store_tx, record, verbose);
 

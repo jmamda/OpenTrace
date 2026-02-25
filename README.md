@@ -178,6 +178,27 @@
 > | `--budget-alert-usd` | `TRACE_BUDGET_ALERT_USD` | — | Emit a stderr warning when spend exceeds this USD amount in the period |
 > | `--budget-period` | `TRACE_BUDGET_PERIOD` | `month` | Budget period: `day`, `week`, or `month` |
 > | `--route PATH=URL` | — | — | Route a path prefix to a different upstream. May be specified multiple times. More specific paths must come first. |
+
+#### Call tagging with `X-Trace-Tag`
+
+Add an `X-Trace-Tag` header to any request and the value is stored in the `tags` column. The header is consumed by the proxy and **never forwarded upstream**. Use it to attribute calls to a specific agent node, workflow step, experiment, or any label meaningful to your application:
+
+```python
+# Python / httpx / any HTTP client
+import openai
+
+client = openai.OpenAI(base_url="http://localhost:4000/v1")
+client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "..."}],
+    extra_headers={"X-Trace-Tag": "summarize-node"},
+)
+```
+
+```bash
+# Filter by tag in SQL
+sqlite3 ~/.trace/trace.db "SELECT model, latency_ms, cost_usd FROM calls WHERE tags = 'summarize-node';"
+```
 >
 > ---
 >
@@ -192,7 +213,7 @@
 >
 > ![Dashboard](dashboard.png)
 >
-> The dashboard auto-refreshes every 2 seconds and shows:
+> The dashboard receives new calls in real time via Server-Sent Events (`GET /stream`) and shows:
 >
 > - **Stat cards:** total calls, total cost, avg latency, calls last hour
 > - - **Live call log** with model filter and errors-only checkbox
@@ -456,7 +477,7 @@
 >
 > ### `trace search` — full-text search
 >
-> Search request and response bodies using SQLite FTS5 full-text search.
+> Search request bodies, response bodies, and tags using SQLite FTS5 full-text search.
 >
 > ```bash
 > trace search "database connection"      # search all bodies
@@ -691,6 +712,7 @@
 > | `prompt_hash` | TEXT | FNV-1a hash of the request body for deduplication and prompt analysis |
 > | `provider_request_id` | TEXT | Value of `x-request-id` response header — useful for provider support tickets |
 > | `error` | TEXT | Upstream connection error message, if any |
+> | `tags` | TEXT | Arbitrary tag from the `X-Trace-Tag` request header — group calls by agent node, workflow step, or experiment name. FTS5-indexed: searchable via `trace search` |
 >
 > **Notes:**
 > - Query strings are stripped from the stored `endpoint` (they may contain API keys). The full query string is forwarded to the upstream API.

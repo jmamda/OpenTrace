@@ -24,6 +24,7 @@ pub struct CallRecord {
     pub trace_id: Option<String>,
     pub parent_id: Option<String>,
     pub prompt_hash: Option<String>,
+    pub tags: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -164,6 +165,7 @@ fn build_status_clause(status: &Option<u16>, status_range: &Option<(u16, u16)>) 
 ///   8=input_tokens  9=output_tokens  10=cost_usd
 ///   11=request_body  12=response_body  13=error
 ///   14=provider_request_id  15=trace_id  16=parent_id
+///   17=prompt_hash  18=tags
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     Ok(CallRecord {
         id: row.get(0)?,
@@ -184,6 +186,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
         trace_id: row.get(15)?,
         parent_id: row.get(16)?,
         prompt_hash: row.get(17)?,
+        tags: row.get(18)?,
     })
 }
 
@@ -192,7 +195,7 @@ const SELECT_COLS: &str = "
     status_code, latency_ms, ttft_ms,
     input_tokens, output_tokens, cost_usd,
     request_body, response_body, error,
-    provider_request_id, trace_id, parent_id, prompt_hash";
+    provider_request_id, trace_id, parent_id, prompt_hash, tags";
 
 /// Same columns as SELECT_COLS but table-qualified for use in JOINs
 /// where bare column names (e.g. `id`) would be ambiguous.
@@ -201,7 +204,7 @@ const SELECT_COLS_CALLS: &str = "
     calls.status_code, calls.latency_ms, calls.ttft_ms,
     calls.input_tokens, calls.output_tokens, calls.cost_usd,
     calls.request_body, calls.response_body, calls.error,
-    calls.provider_request_id, calls.trace_id, calls.parent_id, calls.prompt_hash";
+    calls.provider_request_id, calls.trace_id, calls.parent_id, calls.prompt_hash, calls.tags";
 
 /// Escape a raw user query into a valid FTS5 MATCH expression.
 ///
@@ -303,7 +306,8 @@ impl Store {
                 provider_request_id TEXT,
                 trace_id            TEXT,
                 parent_id           TEXT,
-                prompt_hash         TEXT
+                prompt_hash         TEXT,
+                tags                TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
@@ -325,33 +329,34 @@ impl Store {
                 request_body,
                 response_body,
                 error,
+                tags,
                 content='calls',
                 content_rowid='rowid'
             );
             CREATE TRIGGER IF NOT EXISTS calls_fts_ai
                 AFTER INSERT ON calls BEGIN
                     INSERT INTO calls_fts(rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error)
+                                          request_body, response_body, error, tags)
                     VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
-                            new.request_body, new.response_body, new.error);
+                            new.request_body, new.response_body, new.error, new.tags);
                 END;
             CREATE TRIGGER IF NOT EXISTS calls_fts_ad
                 AFTER DELETE ON calls BEGIN
                     INSERT INTO calls_fts(calls_fts, rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error)
+                                          request_body, response_body, error, tags)
                     VALUES ('delete', old.rowid, old.id, old.model, old.provider, old.endpoint,
-                            old.request_body, old.response_body, old.error);
+                            old.request_body, old.response_body, old.error, old.tags);
                 END;
             CREATE TRIGGER IF NOT EXISTS calls_fts_au
                 AFTER UPDATE ON calls BEGIN
                     INSERT INTO calls_fts(calls_fts, rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error)
+                                          request_body, response_body, error, tags)
                     VALUES ('delete', old.rowid, old.id, old.model, old.provider, old.endpoint,
-                            old.request_body, old.response_body, old.error);
+                            old.request_body, old.response_body, old.error, old.tags);
                     INSERT INTO calls_fts(rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error)
+                                          request_body, response_body, error, tags)
                     VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
-                            new.request_body, new.response_body, new.error);
+                            new.request_body, new.response_body, new.error, new.tags);
                 END;
         ",
         )?;
@@ -365,6 +370,7 @@ impl Store {
             "ALTER TABLE calls ADD COLUMN trace_id TEXT",
             "ALTER TABLE calls ADD COLUMN parent_id TEXT",
             "ALTER TABLE calls ADD COLUMN prompt_hash TEXT",
+            "ALTER TABLE calls ADD COLUMN tags TEXT",
         ] {
             if let Err(e) = self.conn.execute_batch(sql) {
                 let msg = e.to_string().to_lowercase();
@@ -377,9 +383,9 @@ impl Store {
         // Backfill FTS5 index for any rows inserted before the virtual table existed.
         if let Err(e) = self.conn.execute_batch(
             "INSERT INTO calls_fts(rowid, id, model, provider, endpoint, \
-                                   request_body, response_body, error) \
+                                   request_body, response_body, error, tags) \
              SELECT rowid, id, model, provider, endpoint, \
-                    request_body, response_body, error FROM calls \
+                    request_body, response_body, error, tags FROM calls \
              WHERE rowid NOT IN (SELECT rowid FROM calls_fts)",
         ) {
             // Only propagate if it's not a harmless \"already exists\" scenario.
@@ -399,8 +405,8 @@ impl Store {
                 status_code, latency_ms, ttft_ms,
                 input_tokens, output_tokens,
                 cost_usd, request_body, response_body, error,
-                provider_request_id, trace_id, parent_id, prompt_hash
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                provider_request_id, trace_id, parent_id, prompt_hash, tags
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 r.id,
                 r.timestamp,
@@ -420,6 +426,7 @@ impl Store {
                 r.trace_id,
                 r.parent_id,
                 r.prompt_hash,
+                r.tags,
             ],
         )?;
         Ok(())
@@ -1354,6 +1361,7 @@ mod tests {
             trace_id: None,
             parent_id: None,
             prompt_hash: None,
+            tags: None,
         }
     }
 

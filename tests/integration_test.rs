@@ -928,6 +928,7 @@ async fn retention_prunes_old_records() {
         trace_id: None,
         parent_id: None,
         prompt_hash: None,
+        tags: None,
     };
     store.insert(&old).unwrap();
 

@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.3.5",
+    version = "0.3.6",
     long_about = None,
 )]
 struct Cli {
@@ -2922,6 +2922,7 @@ mod tests {
             trace_id: None,
             parent_id: None,
             prompt_hash: None,
+            tags: None,
         }
     }
 
@@ -3002,6 +3003,7 @@ mod tests {
             trace_id: None,
             parent_id: None,
             prompt_hash: None,
+            tags: None,
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "trace"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 description = "The strace of LLM calls — local-first observability proxy"
 
