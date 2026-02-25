@@ -1815,6 +1815,7 @@ dependencies = [
  "colored",
  "criterion",
  "futures-util",
+ "http-body-util",
  "reqwest",
  "rusqlite",
  "serde",

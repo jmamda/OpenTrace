@@ -1265,6 +1265,8 @@ mod tests {
 
     #[tokio::test]
     async fn serve_stream_delivers_broadcast_record() {
+        use http_body_util::BodyExt;
+
         let store = Store::open_in_memory().unwrap();
         let store = Arc::new(Mutex::new(store));
         let (event_tx, _rx) = broadcast::channel::<CallRecord>(16);
@@ -1274,14 +1276,13 @@ mod tests {
         };
         let app = router(state);
 
-        // Send one record into the channel before the request so it is
-        // buffered and delivered immediately when the stream opens.
-        // _rx keeps the receiver alive so send() does not return SendError.
-        event_tx
-            .send(make_record("sse-test-1", "gpt-4o", 200))
-            .unwrap();
-        // Drop the extra sender so the BroadcastStream closes after draining.
-        drop(event_tx);
+        // Spawn a task that sends a record after a brief delay so that
+        // stream_handler has time to subscribe before the send.
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = tx.send(make_record("sse-test-1", "gpt-4o", 200));
+        });
 
         let resp = app
             .oneshot(
@@ -1294,9 +1295,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 200);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("data:"), "expected SSE data line");
-        assert!(body_str.contains("gpt-4o"), "expected model in SSE payload");
+
+        // Read frames from the infinite SSE stream until we get a data line
+        // or the 500ms safety timeout fires.
+        let mut body = resp.into_body();
+        let text = tokio::time::timeout(std::time::Duration::from_millis(500), async move {
+            loop {
+                match body.frame().await {
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            let s = String::from_utf8_lossy(&data).into_owned();
+                            if s.contains("data:") {
+                                return s;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            String::new()
+        })
+        .await
+        .expect("timed out waiting for SSE data frame");
+
+        assert!(
+            text.contains("data:"),
+            "expected SSE data line, got: {text}"
+        );
+        assert!(
+            text.contains("gpt-4o"),
+            "expected model in SSE payload, got: {text}"
+        );
     }
 }
