@@ -559,8 +559,8 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![escaped, limit_i64], |row| {
             let record = row_to_record(row)?;
-            let rank: f64 = row.get(18)?;
-            let snippet: String = row.get(19).unwrap_or_default();
+            let rank: f64 = row.get(19)?;
+            let snippet: String = row.get(20).unwrap_or_default();
             Ok(SearchResult {
                 record,
                 rank,

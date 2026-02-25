@@ -1267,7 +1267,7 @@ mod tests {
     async fn serve_stream_delivers_broadcast_record() {
         let store = Store::open_in_memory().unwrap();
         let store = Arc::new(Mutex::new(store));
-        let (event_tx, _) = broadcast::channel::<CallRecord>(16);
+        let (event_tx, _rx) = broadcast::channel::<CallRecord>(16);
         let state = ServeState {
             store: Arc::clone(&store),
             event_tx: event_tx.clone(),
@@ -1276,6 +1276,7 @@ mod tests {
 
         // Send one record into the channel before the request so it is
         // buffered and delivered immediately when the stream opens.
+        // _rx keeps the receiver alive so send() does not return SendError.
         event_tx
             .send(make_record("sse-test-1", "gpt-4o", 200))
             .unwrap();
