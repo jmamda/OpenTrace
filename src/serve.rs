@@ -1300,17 +1300,12 @@ mod tests {
         // or the 500ms safety timeout fires.
         let mut body = resp.into_body();
         let text = tokio::time::timeout(std::time::Duration::from_millis(500), async move {
-            loop {
-                match body.frame().await {
-                    Some(Ok(frame)) => {
-                        if let Ok(data) = frame.into_data() {
-                            let s = String::from_utf8_lossy(&data).into_owned();
-                            if s.contains("data:") {
-                                return s;
-                            }
-                        }
+            while let Some(Ok(frame)) = body.frame().await {
+                if let Ok(data) = frame.into_data() {
+                    let s = String::from_utf8_lossy(&data).into_owned();
+                    if s.contains("data:") {
+                        return s;
                     }
-                    _ => break,
                 }
             }
             String::new()
