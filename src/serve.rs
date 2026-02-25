@@ -999,10 +999,7 @@ pub async fn cmd_serve(port: u16) -> Result<()> {
         });
     }
 
-    let state = ServeState {
-        store,
-        event_tx,
-    };
+    let state = ServeState { store, event_tx };
 
     let app = router(state);
     let addr = format!("127.0.0.1:{}", port);
