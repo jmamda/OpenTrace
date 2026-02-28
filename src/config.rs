@@ -218,15 +218,36 @@ fn check_unknown_fields(raw_toml: &str, warnings: &mut Vec<String>) {
 
     // Known [start] scalar/table fields
     let known_start: &[&str] = &[
-        "port", "upstream", "bind", "retention_days", "metrics_port",
-        "otel_endpoint", "redact_fields", "budget_alert_usd", "budget_period",
-        "upstream_timeout", "no_request_bodies", "verbose", "routes",
-        "db_path", "max_request_body_bytes", "max_stored_response_bytes",
-        "max_stored_stream_bytes", "max_accumulation_bytes",
-        "channel_capacity", "graceful_shutdown_timeout",
-        "prices", "unknown_price_input", "unknown_price_output",
-        "langfuse", "langsmith", "weave", "phoenix",
-        "sqlite", "otel", "metrics",
+        "port",
+        "upstream",
+        "bind",
+        "retention_days",
+        "metrics_port",
+        "otel_endpoint",
+        "redact_fields",
+        "budget_alert_usd",
+        "budget_period",
+        "upstream_timeout",
+        "no_request_bodies",
+        "verbose",
+        "routes",
+        "db_path",
+        "max_request_body_bytes",
+        "max_stored_response_bytes",
+        "max_stored_stream_bytes",
+        "max_accumulation_bytes",
+        "channel_capacity",
+        "graceful_shutdown_timeout",
+        "prices",
+        "unknown_price_input",
+        "unknown_price_output",
+        "langfuse",
+        "langsmith",
+        "weave",
+        "phoenix",
+        "sqlite",
+        "otel",
+        "metrics",
     ];
     if let Some(toml::Value::Table(start)) = table.get("start") {
         for key in start.keys() {
@@ -270,10 +291,16 @@ fn validate_start_config(start: &StartConfig, warnings: &mut Vec<String>) {
     if let Some(prices) = &start.prices {
         for (model, entry) in prices {
             if entry.input < 0.0 {
-                warnings.push(format!("start.prices.\"{}\".input is negative: {}", model, entry.input));
+                warnings.push(format!(
+                    "start.prices.\"{}\".input is negative: {}",
+                    model, entry.input
+                ));
             }
             if entry.output < 0.0 {
-                warnings.push(format!("start.prices.\"{}\".output is negative: {}", model, entry.output));
+                warnings.push(format!(
+                    "start.prices.\"{}\".output is negative: {}",
+                    model, entry.output
+                ));
             }
         }
     }
@@ -287,7 +314,10 @@ fn validate_start_config(start: &StartConfig, warnings: &mut Vec<String>) {
     }
     if let Some(v) = start.max_stored_response_bytes {
         if v > gb {
-            warnings.push(format!("start.max_stored_response_bytes ({}) exceeds 1GB", v));
+            warnings.push(format!(
+                "start.max_stored_response_bytes ({}) exceeds 1GB",
+                v
+            ));
         }
     }
     if let Some(v) = start.max_accumulation_bytes {
@@ -620,7 +650,10 @@ timeout = 8
         let cfg = parse(toml);
         let ls = cfg.start.unwrap().langsmith.unwrap();
         assert_eq!(ls.api_key.as_deref(), Some("ls-test"));
-        assert_eq!(ls.endpoint.as_deref(), Some("https://api.smith.langchain.com"));
+        assert_eq!(
+            ls.endpoint.as_deref(),
+            Some("https://api.smith.langchain.com")
+        );
         assert_eq!(ls.timeout, Some(8));
     }
 
@@ -675,7 +708,11 @@ timeout = 6
         let raw = "[start]\nport = 4000\nupstream = \"https://api.openai.com\"\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.is_empty(), "expected no warnings, got: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -683,7 +720,11 @@ timeout = 6
         let raw = "[start]\nport = 4000\n\n[bogus]\nfoo = 1\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.iter().any(|w| w.contains("bogus")), "expected bogus warning: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("bogus")),
+            "expected bogus warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -691,7 +732,11 @@ timeout = 6
         let raw = "[start]\nport = 4000\ntypo_field = true\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.iter().any(|w| w.contains("typo_field")), "expected typo_field warning: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("typo_field")),
+            "expected typo_field warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -699,7 +744,11 @@ timeout = 6
         let raw = "[start]\nport = 0\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.iter().any(|w| w.contains("port")), "expected port warning: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("port")),
+            "expected port warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -707,7 +756,11 @@ timeout = 6
         let raw = "[start]\nunknown_price_input = -1.0\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.iter().any(|w| w.contains("negative")), "expected negative price warning: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("negative")),
+            "expected negative price warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -715,7 +768,11 @@ timeout = 6
         let raw = "[start.langfuse]\npublic_key = \"pk-lf-test\"\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.iter().any(|w| w.contains("secret_key missing")), "expected langfuse warning: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("secret_key missing")),
+            "expected langfuse warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -723,6 +780,10 @@ timeout = 6
         let raw = "[start.weave]\nproject = \"entity/proj\"\n";
         let cfg = parse(raw);
         let warnings = validate_config(raw, &cfg);
-        assert!(warnings.iter().any(|w| w.contains("api_key missing")), "expected weave warning: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("api_key missing")),
+            "expected weave warning: {:?}",
+            warnings
+        );
     }
 }

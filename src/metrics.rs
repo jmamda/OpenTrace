@@ -71,9 +71,7 @@ impl MetricsState {
     /// Create a metrics state with optional custom latency histogram bucket bounds.
     /// If `None`, uses `DEFAULT_LATENCY_BOUNDS_MS`.
     pub fn with_latency_buckets(custom_bounds: Option<&[u64]>) -> Self {
-        let bounds: Vec<u64> = custom_bounds
-            .unwrap_or(DEFAULT_LATENCY_BOUNDS_MS)
-            .to_vec();
+        let bounds: Vec<u64> = custom_bounds.unwrap_or(DEFAULT_LATENCY_BOUNDS_MS).to_vec();
         let mut le_labels: Vec<String> = bounds.iter().map(|b| b.to_string()).collect();
         le_labels.push("+Inf".to_string());
         let num_buckets = le_labels.len();
@@ -180,10 +178,7 @@ impl MetricsState {
 
         // Per-agent call counter
         if let Some(ref agent) = r.agent_name {
-            *inner
-                .agent_calls
-                .entry(agent.clone())
-                .or_insert(0) += 1;
+            *inner.agent_calls.entry(agent.clone()).or_insert(0) += 1;
         }
 
         // ttft_ms histogram

@@ -634,7 +634,18 @@ async fn main() -> Result<()> {
             status_range,
             agent,
             workflow,
-        } => cmd_watch(model, provider, errors, status, status_range, agent, workflow).await,
+        } => {
+            cmd_watch(
+                model,
+                provider,
+                errors,
+                status,
+                status_range,
+                agent,
+                workflow,
+            )
+            .await
+        }
         Commands::Show {
             id,
             no_bodies,
@@ -667,7 +678,17 @@ async fn main() -> Result<()> {
             status_range,
             agent,
             workflow,
-        } => cmd_export(format, model, provider, since, until, status, status_range, agent, workflow),
+        } => cmd_export(
+            format,
+            model,
+            provider,
+            since,
+            until,
+            status,
+            status_range,
+            agent,
+            workflow,
+        ),
         Commands::Serve { port } => {
             let serve_cfg = cfg.serve.as_ref();
             let resolved_port = port
@@ -817,8 +838,8 @@ async fn cmd_start(
         .unwrap_or_else(|| "month".to_string());
 
     // New config values: CLI > env > config > hardcoded defaults.
-    let db_path_override: Option<String> = db_path_arg
-        .or_else(|| start_cfg.and_then(|s| s.db_path.clone()));
+    let db_path_override: Option<String> =
+        db_path_arg.or_else(|| start_cfg.and_then(|s| s.db_path.clone()));
 
     let channel_capacity = channel_capacity_arg
         .or_else(|| start_cfg.and_then(|s| s.channel_capacity))
@@ -879,9 +900,14 @@ async fn cmd_start(
     let langsmith_timeout = start_cfg.and_then(|s| s.langsmith.as_ref().and_then(|l| l.timeout));
     let weave_timeout = start_cfg.and_then(|s| s.weave.as_ref().and_then(|w| w.timeout));
     let phoenix_timeout = start_cfg.and_then(|s| s.phoenix.as_ref().and_then(|p| p.timeout));
-    let otel_service_name = start_cfg.and_then(|s| s.otel.as_ref().and_then(|o| o.service_name.clone()));
+    let otel_service_name =
+        start_cfg.and_then(|s| s.otel.as_ref().and_then(|o| o.service_name.clone()));
     let otel_timeout = start_cfg.and_then(|s| s.otel.as_ref().and_then(|o| o.timeout));
-    let metrics_buckets: Option<Vec<u64>> = start_cfg.and_then(|s| s.metrics.as_ref().and_then(|m| m.latency_buckets_ms.clone()));
+    let metrics_buckets: Option<Vec<u64>> = start_cfg.and_then(|s| {
+        s.metrics
+            .as_ref()
+            .and_then(|m| m.latency_buckets_ms.clone())
+    });
 
     // Validate upstream URL scheme early — prevent footguns like file:/// or ftp://.
     {
@@ -1113,13 +1139,13 @@ async fn cmd_start(
     };
 
     // Build OtelExporter if --otel-endpoint is set.
-    let otel_exporter: Option<Arc<otel::OtelExporter>> = otel_endpoint
-        .as_deref()
-        .map(|ep| Arc::new(otel::OtelExporter::with_service_name(
+    let otel_exporter: Option<Arc<otel::OtelExporter>> = otel_endpoint.as_deref().map(|ep| {
+        Arc::new(otel::OtelExporter::with_service_name(
             ep.to_string(),
             otel_service_name.as_deref(),
             otel_timeout,
-        )));
+        ))
+    });
 
     // Build optional external sinks.
     let langfuse_sink: Option<Arc<sink::LangfuseSink>> = match (
@@ -1135,9 +1161,13 @@ async fn cmd_start(
         _ => None,
     };
 
-    let langsmith_sink: Option<Arc<sink::LangSmithSink>> = langsmith_api_key
-        .as_deref()
-        .map(|k| Arc::new(sink::LangSmithSink::with_timeout(&langsmith_endpoint, k, langsmith_timeout)));
+    let langsmith_sink: Option<Arc<sink::LangSmithSink>> = langsmith_api_key.as_deref().map(|k| {
+        Arc::new(sink::LangSmithSink::with_timeout(
+            &langsmith_endpoint,
+            k,
+            langsmith_timeout,
+        ))
+    });
 
     let weave_sink: Option<Arc<sink::WeaveSink>> =
         match (weave_api_key.as_deref(), weave_project.as_deref()) {
@@ -1150,9 +1180,13 @@ async fn cmd_start(
             _ => None,
         };
 
-    let phoenix_sink: Option<Arc<sink::PhoenixSink>> = phoenix_endpoint
-        .as_deref()
-        .map(|ep| Arc::new(sink::PhoenixSink::with_timeout(ep, phoenix_api_key.as_deref(), phoenix_timeout)));
+    let phoenix_sink: Option<Arc<sink::PhoenixSink>> = phoenix_endpoint.as_deref().map(|ep| {
+        Arc::new(sink::PhoenixSink::with_timeout(
+            ep,
+            phoenix_api_key.as_deref(),
+            phoenix_timeout,
+        ))
+    });
 
     let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(channel_capacity);
 
@@ -1401,7 +1435,11 @@ async fn cmd_start(
         .await
         .context("server error")?;
 
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(graceful_shutdown_timeout), writer_handle).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(graceful_shutdown_timeout),
+        writer_handle,
+    )
+    .await;
 
     Ok(())
 }
@@ -2380,7 +2418,11 @@ fn cmd_config(
             let s = cfg.start.as_ref();
 
             fn cfg_src(has_val: bool) -> &'static str {
-                if has_val { "(config)" } else { "(default)" }
+                if has_val {
+                    "(config)"
+                } else {
+                    "(default)"
+                }
             }
 
             println!("[start]");
@@ -2391,7 +2433,8 @@ fn cmd_config(
             );
             println!(
                 "  upstream             = {}  {}",
-                s.and_then(|s| s.upstream.as_deref()).unwrap_or("https://api.openai.com"),
+                s.and_then(|s| s.upstream.as_deref())
+                    .unwrap_or("https://api.openai.com"),
                 cfg_src(s.and_then(|s| s.upstream.as_ref()).is_some())
             );
             println!(
@@ -2401,7 +2444,8 @@ fn cmd_config(
             );
             println!(
                 "  db_path              = {}  {}",
-                s.and_then(|s| s.db_path.as_deref()).unwrap_or("~/.trace/trace.db"),
+                s.and_then(|s| s.db_path.as_deref())
+                    .unwrap_or("~/.trace/trace.db"),
                 cfg_src(s.and_then(|s| s.db_path.as_ref()).is_some())
             );
             println!(
@@ -2418,22 +2462,26 @@ fn cmd_config(
             println!("  Body limits:");
             println!(
                 "    max_request_body   = {} bytes  {}",
-                s.and_then(|s| s.max_request_body_bytes).unwrap_or(16 * 1024 * 1024),
+                s.and_then(|s| s.max_request_body_bytes)
+                    .unwrap_or(16 * 1024 * 1024),
                 cfg_src(s.and_then(|s| s.max_request_body_bytes).is_some())
             );
             println!(
                 "    max_stored_resp    = {} bytes  {}",
-                s.and_then(|s| s.max_stored_response_bytes).unwrap_or(10 * 1024 * 1024),
+                s.and_then(|s| s.max_stored_response_bytes)
+                    .unwrap_or(10 * 1024 * 1024),
                 cfg_src(s.and_then(|s| s.max_stored_response_bytes).is_some())
             );
             println!(
                 "    max_stored_stream  = {} bytes  {}",
-                s.and_then(|s| s.max_stored_stream_bytes).unwrap_or(256 * 1024),
+                s.and_then(|s| s.max_stored_stream_bytes)
+                    .unwrap_or(256 * 1024),
                 cfg_src(s.and_then(|s| s.max_stored_stream_bytes).is_some())
             );
             println!(
                 "    max_accumulation   = {} bytes  {}",
-                s.and_then(|s| s.max_accumulation_bytes).unwrap_or(4 * 1024 * 1024),
+                s.and_then(|s| s.max_accumulation_bytes)
+                    .unwrap_or(4 * 1024 * 1024),
                 cfg_src(s.and_then(|s| s.max_accumulation_bytes).is_some())
             );
             println!();
@@ -2470,7 +2518,8 @@ fn cmd_config(
             );
             println!(
                 "    service_name       = {}  {}",
-                ot.and_then(|o| o.service_name.as_deref()).unwrap_or("opentrace"),
+                ot.and_then(|o| o.service_name.as_deref())
+                    .unwrap_or("opentrace"),
                 cfg_src(ot.and_then(|o| o.service_name.as_ref()).is_some())
             );
             println!();
@@ -2481,7 +2530,11 @@ fn cmd_config(
                 s.and_then(|s| s.metrics_port)
                     .or_else(|| mt.and_then(|m| m.port))
                     .unwrap_or(0),
-                cfg_src(s.and_then(|s| s.metrics_port).or_else(|| mt.and_then(|m| m.port)).is_some())
+                cfg_src(
+                    s.and_then(|s| s.metrics_port)
+                        .or_else(|| mt.and_then(|m| m.port))
+                        .is_some()
+                )
             );
             if let Some(ref v) = s.and_then(|s| s.redact_fields.clone()) {
                 println!("  redact_fields        = {:?}", v);
@@ -2490,7 +2543,8 @@ fn cmd_config(
                 println!(
                     "  budget               = ${:.2} / {}",
                     v,
-                    s.and_then(|s| s.budget_period.as_deref()).unwrap_or("month")
+                    s.and_then(|s| s.budget_period.as_deref())
+                        .unwrap_or("month")
                 );
             }
             if let Some(ref routes) = s.and_then(|s| s.routes.clone()) {
@@ -2510,13 +2564,15 @@ fn cmd_config(
             if lf.and_then(|l| l.public_key.as_ref()).is_some() {
                 println!(
                     "    langfuse           = {}",
-                    lf.and_then(|l| l.url.as_deref()).unwrap_or("https://cloud.langfuse.com")
+                    lf.and_then(|l| l.url.as_deref())
+                        .unwrap_or("https://cloud.langfuse.com")
                 );
             }
             if ls.and_then(|l| l.api_key.as_ref()).is_some() {
                 println!(
                     "    langsmith          = {}",
-                    ls.and_then(|l| l.endpoint.as_deref()).unwrap_or("https://api.smith.langchain.com")
+                    ls.and_then(|l| l.endpoint.as_deref())
+                        .unwrap_or("https://api.smith.langchain.com")
                 );
             }
             if wv.and_then(|w| w.api_key.as_ref()).is_some() {
@@ -2525,7 +2581,8 @@ fn cmd_config(
             if px.and_then(|p| p.endpoint.as_ref()).is_some() {
                 println!(
                     "    phoenix            = {}",
-                    px.and_then(|p| p.endpoint.as_deref()).unwrap_or("(not set)")
+                    px.and_then(|p| p.endpoint.as_deref())
+                        .unwrap_or("(not set)")
                 );
             }
             if lf.and_then(|l| l.public_key.as_ref()).is_none()
@@ -2675,7 +2732,16 @@ fn print_query_header_ex(show_agent: bool) {
             "{}",
             format!(
                 "{:<8}  {:<19}  {:<22}  {:<14}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
-                "id", "timestamp", "model", "agent", "status", "latency", "ttft", "in", "out", "cost"
+                "id",
+                "timestamp",
+                "model",
+                "agent",
+                "status",
+                "latency",
+                "ttft",
+                "in",
+                "out",
+                "cost"
             )
             .bold()
             .underline()
@@ -2697,7 +2763,16 @@ fn print_watch_header_ex(cumulative_cost: f64, show_agent: bool) {
             "{}{}",
             format!(
                 "{:<8}  {:<19}  {:<22}  {:<14}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
-                "id", "timestamp", "model", "agent", "status", "latency", "ttft", "in", "out", "cost"
+                "id",
+                "timestamp",
+                "model",
+                "agent",
+                "status",
+                "latency",
+                "ttft",
+                "in",
+                "out",
+                "cost"
             )
             .bold()
             .underline(),
@@ -2721,10 +2796,7 @@ fn print_call_row_ex(call: &store::CallRecord, show_agent: bool) {
     };
     let ts = call.timestamp.get(..19).unwrap_or(&call.timestamp);
     let model_short = truncate(&call.model, 22);
-    let agent_short = truncate(
-        call.agent_name.as_deref().unwrap_or("-"),
-        14,
-    );
+    let agent_short = truncate(call.agent_name.as_deref().unwrap_or("-"), 14);
     let is_error = call.status_code == 0 || call.status_code >= 400 || call.error.is_some();
     let error_tag = if is_error {
         capture::classify_error(call)
@@ -3298,8 +3370,7 @@ fn cmd_workflow(id: String, json: bool) -> Result<()> {
     println!();
 
     // Build a parent_id -> children map for indentation.
-    let id_set: std::collections::HashSet<&str> =
-        calls.iter().map(|c| c.id.as_str()).collect();
+    let id_set: std::collections::HashSet<&str> = calls.iter().map(|c| c.id.as_str()).collect();
     for call in &calls {
         let is_child = call
             .parent_id
@@ -3371,10 +3442,7 @@ fn cmd_workflow(id: String, json: bool) -> Result<()> {
         );
     }
     if error_count > 0 {
-        println!(
-            "  errors     {}",
-            error_count.to_string().red()
-        );
+        println!("  errors     {}", error_count.to_string().red());
     }
 
     Ok(())
@@ -3414,7 +3482,10 @@ async fn cmd_prices(
                     .join(".trace")
                     .join("prices.json");
                 capture::save_price_cache(&prices, &cache_path)?;
-                println!("Updated {} model prices from LiteLLM community database.", prices.len());
+                println!(
+                    "Updated {} model prices from LiteLLM community database.",
+                    prices.len()
+                );
                 println!("Saved to: {}", cache_path.display());
             }
             Err(e) => {
@@ -3428,14 +3499,15 @@ async fn cmd_prices(
     if unknown {
         // Query DB for distinct models, find those without known pricing.
         let store = store::Store::open().context("failed to open trace database")?;
-        let db_models: Vec<String> = store.stats_by_model()?.into_iter().map(|m| m.model).collect();
+        let db_models: Vec<String> = store
+            .stats_by_model()?
+            .into_iter()
+            .map(|m| m.model)
+            .collect();
 
         let unknown_models: Vec<&String> = db_models
             .iter()
-            .filter(|m| {
-                !config_overrides.contains_key(m.as_str())
-                    && !capture::is_known_model(m)
-            })
+            .filter(|m| !config_overrides.contains_key(m.as_str()) && !capture::is_known_model(m))
             .collect();
 
         if json {
@@ -3453,19 +3525,16 @@ async fn cmd_prices(
             println!();
             println!(
                 "{}",
-                format!("  {:<40}  {}", "model", "suggestion").bold().underline()
+                format!("  {:<40}  {}", "model", "suggestion")
+                    .bold()
+                    .underline()
             );
             for m in &unknown_models {
                 let (in_p, out_p) = capture::model_prices(m);
-                println!(
-                    "  {:<40}  fallback ${:.2}/${:.2} per MTok",
-                    m, in_p, out_p
-                );
+                println!("  {:<40}  fallback ${:.2}/${:.2} per MTok", m, in_p, out_p);
             }
             println!();
-            println!(
-                "Add pricing overrides in your config file under [start.prices.MODEL_NAME]"
-            );
+            println!("Add pricing overrides in your config file under [start.prices.MODEL_NAME]");
         }
         return Ok(());
     }
@@ -3473,7 +3542,11 @@ async fn cmd_prices(
     if check {
         // Combined view: show all DB models + bundled, with source column.
         let store = store::Store::open().context("failed to open trace database")?;
-        let db_models: Vec<String> = store.stats_by_model()?.into_iter().map(|m| m.model).collect();
+        let db_models: Vec<String> = store
+            .stats_by_model()?
+            .into_iter()
+            .map(|m| m.model)
+            .collect();
 
         // Merge: all DB models + all bundled models
         let mut all_models: Vec<String> = db_models.clone();
@@ -3572,12 +3645,9 @@ async fn cmd_prices(
     println!();
     println!(
         "{}",
-        format!(
-            "  {:<40}  {:>10}  {:>11}",
-            "model", "in/MTok", "out/MTok"
-        )
-        .bold()
-        .underline()
+        format!("  {:<40}  {:>10}  {:>11}", "model", "in/MTok", "out/MTok")
+            .bold()
+            .underline()
     );
     for (name, inp, outp) in &bundled {
         println!("  {:<40}  ${:>8.2}  ${:>9.2}", name, inp, outp);
@@ -3619,8 +3689,7 @@ fn cmd_agents(since: Option<String>, until: Option<String>) -> Result<()> {
     if agents.is_empty() {
         println!(
             "{}",
-            "No agent data found. Set X-Trace-Agent header on LLM calls to populate."
-                .dimmed()
+            "No agent data found. Set X-Trace-Agent header on LLM calls to populate.".dimmed()
         );
         return Ok(());
     }

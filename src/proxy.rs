@@ -502,7 +502,11 @@ async fn handle(
                 if text.is_empty() {
                     None
                 } else if text.len() > max_stored_stream {
-                    Some(format!("(truncated at {}KB — {} bytes total)", max_stored_stream / 1024, text.len()))
+                    Some(format!(
+                        "(truncated at {}KB — {} bytes total)",
+                        max_stored_stream / 1024,
+                        text.len()
+                    ))
                 } else {
                     Some(text)
                 }

@@ -1469,9 +1469,7 @@ async fn api_workflow_handler(
     }
 }
 
-async fn api_agents_handler(
-    State(state): State<ServeState>,
-) -> Json<AgentsResponse> {
+async fn api_agents_handler(State(state): State<ServeState>) -> Json<AgentsResponse> {
     let store = state.store.lock().unwrap();
     let agents = store
         .query_agent_stats(&QueryFilter::default())

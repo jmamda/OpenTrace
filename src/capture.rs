@@ -1050,9 +1050,7 @@ pub async fn fetch_litellm_prices() -> anyhow::Result<HashMap<String, (f64, f64)
 
 /// Load a cached price map from a JSON file on disk.
 #[allow(dead_code)]
-pub fn load_price_cache(
-    path: &std::path::Path,
-) -> anyhow::Result<HashMap<String, (f64, f64)>> {
+pub fn load_price_cache(path: &std::path::Path) -> anyhow::Result<HashMap<String, (f64, f64)>> {
     let data = std::fs::read_to_string(path)?;
     let map: HashMap<String, (f64, f64)> = serde_json::from_str(&data)?;
     Ok(map)
@@ -1616,7 +1614,8 @@ mod tests {
         // 1000 input (900 cached read, 100 regular), 200 output.
         let body =
             r#"{"usage":{"input_tokens":1000,"cache_read_input_tokens":900,"output_tokens":200}}"#;
-        let with_cache = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 200, &no_overrides);
+        let with_cache =
+            estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 200, &no_overrides);
         let without_cache = estimate_cost("claude-3-5-sonnet-20241022", 1000, 200);
         assert!(
             with_cache < without_cache,
@@ -1636,7 +1635,8 @@ mod tests {
         let no_overrides = HashMap::new();
         // Cache write = 1.25x normal input price.
         let body = r#"{"usage":{"input_tokens":1000,"cache_creation_input_tokens":800,"output_tokens":0}}"#;
-        let with_write = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 0, &no_overrides);
+        let with_write =
+            estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 0, &no_overrides);
         // Expected: 200 regular * $3/M + 800 write * $3.75/M
         let expected = (200.0 * 3.00 + 800.0 * 3.75) / 1_000_000.0;
         assert!(
@@ -2680,7 +2680,9 @@ mod tests {
     fn list_bundled_prices_contains_ollama() {
         let prices = list_bundled_prices();
         assert!(
-            prices.iter().any(|(p, i, o)| *p == "ollama" && *i == 0.0 && *o == 0.0),
+            prices
+                .iter()
+                .any(|(p, i, o)| *p == "ollama" && *i == 0.0 && *o == 0.0),
             "should contain ollama at $0/$0"
         );
     }
