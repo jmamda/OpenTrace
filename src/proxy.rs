@@ -17,22 +17,28 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
 use crate::capture;
 use crate::store::{self, CallRecord};
 
-/// Maximum request body buffered in memory before forwarding upstream.
-const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024; // 16 MB
+/// Default maximum request body buffered in memory before forwarding upstream.
+#[allow(dead_code)]
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024; // 16 MB
 
-/// Maximum non-streaming response body size stored in the database.
+/// Default maximum non-streaming response body size stored in the database.
 /// Larger bodies are forwarded to the client but not persisted.
-const MAX_STORED_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+#[allow(dead_code)]
+pub const DEFAULT_MAX_STORED_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
-/// Maximum size of the extracted text content stored from a streaming response.
-const MAX_STORED_STREAM_RESPONSE_BYTES: usize = 256 * 1024; // 256 KB
+/// Default maximum size of the extracted text content stored from a streaming response.
+#[allow(dead_code)]
+pub const DEFAULT_MAX_STORED_STREAM_RESPONSE_BYTES: usize = 256 * 1024; // 256 KB
 
-/// Maximum raw SSE bytes accumulated in memory per streaming call.
+/// Default maximum raw SSE bytes accumulated in memory per streaming call.
 /// Prevents OOM at high concurrency with large streaming responses.
-const MAX_ACCUMULATION_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+#[allow(dead_code)]
+pub const DEFAULT_MAX_ACCUMULATION_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 
 /// Records silently dropped due to the store channel being full.
 /// Visible via `trace stats` when > 0.
@@ -60,6 +66,13 @@ pub struct ProxyState {
     /// Top-level JSON keys whose values are replaced with "[REDACTED]" before
     /// storing.  Forwarded traffic is never modified.
     pub redact_fields: Vec<String>,
+    /// Configurable body size limits (use DEFAULT_* constants when not set).
+    pub max_request_body_bytes: usize,
+    pub max_stored_response_bytes: usize,
+    pub max_stored_stream_response_bytes: usize,
+    pub max_accumulation_bytes: usize,
+    /// User-configured per-model price overrides (model_name → (input_per_mtok, output_per_mtok)).
+    pub price_overrides: Arc<HashMap<String, (f64, f64)>>,
 }
 
 pub fn router(state: ProxyState) -> Router {
@@ -149,7 +162,7 @@ fn add_cors_headers(builder: axum::http::response::Builder) -> axum::http::respo
         .header("Access-Control-Allow-Origin", "*")
         .header(
             "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, x-api-key, anthropic-version",
+            "Authorization, Content-Type, x-api-key, anthropic-version, x-trace-tag, x-trace-agent, x-trace-workflow, x-trace-span",
         )
         .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 }
@@ -189,8 +202,28 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    // Multi-agent orchestration headers — consumed by the proxy, stored in DB,
+    // never forwarded upstream.
+    let agent_name = headers
+        .get("x-trace-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let workflow_id = headers
+        .get("x-trace-workflow")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let span_name = headers
+        .get("x-trace-span")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let max_request_body = state.max_request_body_bytes;
+    let max_stored_response = state.max_stored_response_bytes;
+    let max_stored_stream = state.max_stored_stream_response_bytes;
+    let max_accumulation = state.max_accumulation_bytes;
+
     // Read and buffer request body.
-    let req_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
+    let req_bytes = axum::body::to_bytes(body, max_request_body)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -208,9 +241,40 @@ async fn handle(
     // Single parse extracts both model and streaming flag.
     let (model, streaming) = capture::extract_request_info(&req_str);
 
+    // Skip recording non-LLM requests: GET health checks, empty bodies, etc.
+    // These produce "unknown" model noise in the database.
+    let is_llm_call = model != "unknown" || !req_bytes.is_empty();
+
+    // Inject `stream_options: {"include_usage": true}` into streaming requests
+    // so providers (OpenAI, Ollama, etc.) include token usage in SSE chunks.
+    // The original body is never modified for storage — only the forwarded copy.
+    let forwarded_bytes = if streaming && is_llm_call {
+        match serde_json::from_str::<serde_json::Value>(&req_str) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    let so = obj
+                        .entry("stream_options")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(so_obj) = so.as_object_mut() {
+                        so_obj
+                            .entry("include_usage")
+                            .or_insert(serde_json::json!(true));
+                    }
+                }
+                match serde_json::to_vec(&v) {
+                    Ok(bytes) => Bytes::from(bytes),
+                    Err(_) => req_bytes.clone(), // fallback: forward original
+                }
+            }
+            Err(_) => req_bytes.clone(), // not valid JSON, forward as-is
+        }
+    } else {
+        req_bytes.clone()
+    };
+
     // Pre-compute the stored request body: apply field redaction (if configured)
     // and respect the no_request_bodies flag.  Forwarded bytes are never modified.
-    let stored_req_body: Option<String> = if no_request_bodies {
+    let stored_req_body: Option<String> = if no_request_bodies || !is_llm_call {
         None
     } else {
         Some(capture::redact_json_fields(&req_str, &redact_fields))
@@ -222,11 +286,11 @@ async fn handle(
         .and_then(capture::extract_prompt_hash);
 
     // Warn on first use of unknown model so cost estimates are transparent.
-    if verbose && !capture::is_known_model(&model) {
-        eprintln!(
-            "[trace] warning: unknown model '{}', cost estimated at $1/$3 per MTok",
-            model
-        );
+    // Skip for non-LLM requests (health checks) to avoid noisy warnings.
+    let price_overrides = state.price_overrides.clone();
+    if is_llm_call && !capture::is_known_model_with_overrides(&model, &price_overrides) {
+        let (ip, op) = capture::model_prices_with_overrides(&model, &price_overrides);
+        capture::warn_unknown_model(&model, ip, op);
     }
 
     // Build upstream URL — include query string so params like ?limit=10 are forwarded.
@@ -248,7 +312,7 @@ async fn handle(
     //   client's internal IP to the upstream LLM provider — strip them.
     let mut req_builder = client
         .request(method.clone(), &upstream_url)
-        .body(req_bytes.clone());
+        .body(forwarded_bytes);
 
     for (name, value) in &headers {
         let n = name.as_str().to_lowercase();
@@ -263,6 +327,8 @@ async fn handle(
             | "x-forwarded-for" | "x-real-ip" | "forwarded"
             // Tagging header — consumed by the proxy, not forwarded upstream
             | "x-trace-tag"
+            // Multi-agent orchestration headers — consumed, not forwarded
+            | "x-trace-agent" | "x-trace-workflow" | "x-trace-span"
         ) {
             continue;
         }
@@ -285,29 +351,34 @@ async fn handle(
     let upstream_resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            let latency_ms = start.elapsed().as_millis() as u64;
-            let record = CallRecord {
-                id,
-                timestamp,
-                provider,
-                model,
-                endpoint,
-                status_code: 0,
-                latency_ms,
-                ttft_ms: None,
-                input_tokens: None,
-                output_tokens: None,
-                cost_usd: None,
-                request_body: stored_req_body,
-                response_body: None,
-                error: Some(e.to_string()),
-                provider_request_id: None,
-                trace_id: trace_id.clone(),
-                parent_id: parent_id.clone(),
-                prompt_hash: prompt_hash.clone(),
-                tags: tags.clone(),
-            };
-            try_store(&store_tx, record, verbose);
+            if is_llm_call {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let record = CallRecord {
+                    id,
+                    timestamp,
+                    provider,
+                    model,
+                    endpoint,
+                    status_code: 0,
+                    latency_ms,
+                    ttft_ms: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: None,
+                    request_body: stored_req_body,
+                    response_body: None,
+                    error: Some(e.to_string()),
+                    provider_request_id: None,
+                    trace_id: trace_id.clone(),
+                    parent_id: parent_id.clone(),
+                    prompt_hash: prompt_hash.clone(),
+                    tags: tags.clone(),
+                    agent_name: agent_name.clone(),
+                    workflow_id: workflow_id.clone(),
+                    span_name: span_name.clone(),
+                };
+                try_store(&store_tx, record, verbose);
+            }
             // Return a 502 with CORS headers so the playground page receives a
             // proper error response rather than an opaque network failure.
             let resp = add_cors_headers(Response::builder().status(StatusCode::BAD_GATEWAY))
@@ -360,10 +431,13 @@ async fn handle(
         let parent_id_for_spawn = parent_id.clone();
         let prompt_hash_for_spawn = prompt_hash.clone();
         let tags_for_spawn = tags.clone();
+        let agent_name_for_spawn = agent_name.clone();
+        let workflow_id_for_spawn = workflow_id.clone();
+        let span_name_for_spawn = span_name.clone();
 
         tokio::spawn(async move {
             // Accumulate all chunks (cheap: Bytes::clone increments Arc refcount)
-            // up to MAX_ACCUMULATION_BYTES to prevent OOM on huge responses.
+            // up to max_accumulation to prevent OOM on huge responses.
             // All chunks are still forwarded to the client regardless of cap.
             let mut accumulated: Vec<Bytes> = Vec::new();
             let mut accumulated_bytes: usize = 0;
@@ -381,7 +455,7 @@ async fn handle(
 
                         if !overflow {
                             let chunk_len = chunk.len();
-                            if accumulated_bytes + chunk_len <= MAX_ACCUMULATION_BYTES {
+                            if accumulated_bytes + chunk_len <= max_accumulation {
                                 accumulated.push(chunk.clone()); // cheap: Arc refcount bump
                                 accumulated_bytes += chunk_len;
                             } else {
@@ -412,6 +486,7 @@ async fn handle(
                     &accumulated,
                     i,
                     o,
+                    &price_overrides,
                 )),
                 _ => None,
             };
@@ -426,8 +501,8 @@ async fn handle(
                 let text = capture::extract_response_text_from_chunks(&accumulated);
                 if text.is_empty() {
                     None
-                } else if text.len() > MAX_STORED_STREAM_RESPONSE_BYTES {
-                    Some(format!("(truncated at 256KB — {} bytes total)", text.len()))
+                } else if text.len() > max_stored_stream {
+                    Some(format!("(truncated at {}KB — {} bytes total)", max_stored_stream / 1024, text.len()))
                 } else {
                     Some(text)
                 }
@@ -465,6 +540,9 @@ async fn handle(
                 parent_id: parent_id_for_spawn,
                 prompt_hash: prompt_hash_for_spawn,
                 tags: tags_for_spawn,
+                agent_name: agent_name_for_spawn,
+                workflow_id: workflow_id_for_spawn,
+                span_name: span_name_for_spawn,
             };
             try_store(&store_tx, record, verbose);
         });
@@ -485,7 +563,7 @@ async fn handle(
 
         // Only parse and store the body if it's within a reasonable size.
         // Very large binary responses are forwarded but not persisted.
-        let resp_str = if resp_bytes.len() > MAX_STORED_RESPONSE_BYTES {
+        let resp_str = if resp_bytes.len() > max_stored_response {
             if verbose {
                 eprintln!("[trace] warning: response body ({} bytes) exceeds storage limit, body not stored",
                     resp_bytes.len());
@@ -495,7 +573,7 @@ async fn handle(
             Some(format!(
                 "(response body {} bytes — exceeds {}MB storage limit, not stored)",
                 resp_bytes.len(),
-                MAX_STORED_RESPONSE_BYTES / (1024 * 1024)
+                max_stored_response / (1024 * 1024)
             ))
         } else {
             match std::str::from_utf8(&resp_bytes) {
@@ -520,6 +598,7 @@ async fn handle(
                 resp_str.as_deref().unwrap_or(""),
                 i,
                 o,
+                &price_overrides,
             )),
             _ => None,
         };
@@ -535,28 +614,33 @@ async fn handle(
             );
         }
 
-        let record = CallRecord {
-            id,
-            timestamp,
-            provider,
-            model,
-            endpoint,
-            status_code: status.as_u16(),
-            latency_ms,
-            ttft_ms,
-            input_tokens,
-            output_tokens,
-            cost_usd,
-            request_body: stored_req_body,
-            response_body: resp_str,
-            error: None,
-            provider_request_id,
-            trace_id,
-            parent_id,
-            prompt_hash,
-            tags,
-        };
-        try_store(&store_tx, record, verbose);
+        if is_llm_call {
+            let record = CallRecord {
+                id,
+                timestamp,
+                provider,
+                model,
+                endpoint,
+                status_code: status.as_u16(),
+                latency_ms,
+                ttft_ms,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                request_body: stored_req_body,
+                response_body: resp_str,
+                error: None,
+                provider_request_id,
+                trace_id,
+                parent_id,
+                prompt_hash,
+                tags,
+                agent_name,
+                workflow_id,
+                span_name,
+            };
+            try_store(&store_tx, record, verbose);
+        }
 
         Ok(builder
             .body(Body::from(resp_bytes))

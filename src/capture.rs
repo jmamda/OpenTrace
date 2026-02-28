@@ -1,7 +1,8 @@
 use crate::store::CallRecord;
 use bytes::Bytes;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 /// Extract model name and streaming flag in a single JSON parse.
 pub fn extract_request_info(body: &str) -> (String, bool) {
@@ -405,7 +406,15 @@ pub fn classify_error(r: &CallRecord) -> Option<&'static str> {
 /// because they would suppress cost warnings for unknown models that happen
 /// to share a prefix with a known vendor (e.g. "gpt-new-unknown-v99").
 pub fn is_known_model(model: &str) -> bool {
-    !matches!(model_prices(model), (1.00, 3.00))
+    let prices = model_prices(model);
+    // (0.0, 0.0) = known free model (ollama/local), (1.00, 3.00) = unknown fallback
+    prices != (1.00, 3.00)
+}
+
+/// Like `is_known_model`, but also checks the user-configured price overrides.
+pub fn is_known_model_with_overrides(model: &str, overrides: &HashMap<String, (f64, f64)>) -> bool {
+    let prices = model_prices_with_overrides(model, overrides);
+    prices != (1.00, 3.00)
 }
 
 /// Estimate cost in USD. Returns 0.0 for invalid inputs.
@@ -432,11 +441,12 @@ pub fn estimate_cost_from_body(
     body: &str,
     input_tokens: i64,
     output_tokens: i64,
+    overrides: &HashMap<String, (f64, f64)>,
 ) -> f64 {
     if input_tokens < 0 || output_tokens < 0 {
         return 0.0;
     }
-    let (input_price, output_price) = model_prices(model);
+    let (input_price, output_price) = model_prices_with_overrides(model, overrides);
 
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(usage) = v.get("usage") {
@@ -464,24 +474,26 @@ pub fn estimate_cost_from_body(
             }
         }
     }
-    estimate_cost(model, input_tokens, output_tokens)
+    let (ip, op) = model_prices_with_overrides(model, overrides);
+    (input_tokens as f64 * ip + output_tokens as f64 * op) / 1_000_000.0
 }
 
 /// Estimate cost from streaming SSE chunks, adjusting for prompt-cache discounts.
 ///
 /// Parses the accumulated chunk stream for Anthropic and OpenAI cache token fields
 /// using the same discount rates as `estimate_cost_from_body`.
-/// Falls back to `estimate_cost()` when cache tokens are absent.
+/// Falls back to simple price calculation when cache tokens are absent.
 pub fn estimate_cost_from_chunks(
     model: &str,
     chunks: &[Bytes],
     input_tokens: i64,
     output_tokens: i64,
+    overrides: &HashMap<String, (f64, f64)>,
 ) -> f64 {
     if input_tokens < 0 || output_tokens < 0 {
         return 0.0;
     }
-    let (input_price, output_price) = model_prices(model);
+    let (input_price, output_price) = model_prices_with_overrides(model, overrides);
 
     // Collect cache token counts across all SSE events.
     let mut ant_write: i64 = 0;
@@ -547,7 +559,7 @@ pub fn estimate_cost_from_chunks(
             + output_tokens as f64 * output_price)
             / 1_000_000.0;
     }
-    estimate_cost(model, input_tokens, output_tokens)
+    (input_tokens as f64 * input_price + output_tokens as f64 * output_price) / 1_000_000.0
 }
 
 pub fn model_prices(model: &str) -> (f64, f64) {
@@ -556,6 +568,13 @@ pub fn model_prices(model: &str) -> (f64, f64) {
     // before less-specific ones, or the less-specific arm fires first.
     // e.g. "gpt-4.1" before "gpt-4", "o1-mini" before "o1", etc.
     match model {
+        // ── Ollama / self-hosted / local models = free ─────────────────────
+        "" => (0.0, 0.0),
+        m if m.contains("ollama") => (0.0, 0.0),
+        m if m.contains("local-") => (0.0, 0.0),
+        m if m.contains("self-hosted") => (0.0, 0.0),
+        m if m.contains("gguf") => (0.0, 0.0),
+
         // ── Embeddings (output_tokens always 0; only input price matters) ──
         m if m.contains("text-embedding-3-large") => (0.13, 0.0),
         m if m.contains("text-embedding-3-small") => (0.02, 0.0),
@@ -753,6 +772,305 @@ pub fn model_prices(model: &str) -> (f64, f64) {
     }
 }
 
+// ── Pricing overrides and discovery ──────────────────────────────────────
+
+/// Like `model_prices`, but checks a user-provided override map first.
+///
+/// Lookup order:
+/// 1. Exact match on full model string in `overrides`
+/// 2. Substring match in `overrides` (iterate all keys, check `model.contains(key)`)
+/// 3. Built-in match table (`model_prices`)
+pub fn model_prices_with_overrides(
+    model: &str,
+    overrides: &HashMap<String, (f64, f64)>,
+) -> (f64, f64) {
+    // 1. Exact match
+    if let Some(&prices) = overrides.get(model) {
+        return prices;
+    }
+    // 2. Substring match (longest key wins to mirror the bundled table's specificity rule)
+    let mut best: Option<(&str, (f64, f64))> = None;
+    for (pattern, &prices) in overrides {
+        if model.contains(pattern.as_str()) {
+            match best {
+                Some((prev_pat, _)) if pattern.len() <= prev_pat.len() => {}
+                _ => best = Some((pattern.as_str(), prices)),
+            }
+        }
+    }
+    if let Some((_, prices)) = best {
+        return prices;
+    }
+    // 3. Built-in table
+    model_prices(model)
+}
+
+/// Like `model_prices_with_overrides`, but uses caller-supplied defaults
+/// instead of the hardcoded (1.00, 3.00) fallback for unknown models.
+#[allow(dead_code)]
+pub fn model_prices_with_config(
+    model: &str,
+    overrides: &HashMap<String, (f64, f64)>,
+    default_input: f64,
+    default_output: f64,
+) -> (f64, f64) {
+    // 1. Exact match in overrides
+    if let Some(&prices) = overrides.get(model) {
+        return prices;
+    }
+    // 2. Substring match in overrides
+    let mut best: Option<(&str, (f64, f64))> = None;
+    for (pattern, &prices) in overrides {
+        if model.contains(pattern.as_str()) {
+            match best {
+                Some((prev_pat, _)) if pattern.len() <= prev_pat.len() => {}
+                _ => best = Some((pattern.as_str(), prices)),
+            }
+        }
+    }
+    if let Some((_, prices)) = best {
+        return prices;
+    }
+    // 3. Built-in table — but replace the fallback
+    let prices = model_prices(model);
+    if prices == (1.00, 3.00) {
+        (default_input, default_output)
+    } else {
+        prices
+    }
+}
+
+/// Returns all entries from the bundled price table.
+///
+/// Each entry is `(pattern, input_per_mtok, output_per_mtok)`.
+/// Used by `trace prices` CLI command to list known model prices.
+pub fn list_bundled_prices() -> Vec<(&'static str, f64, f64)> {
+    vec![
+        // Ollama / self-hosted
+        ("(empty model)", 0.0, 0.0),
+        ("ollama", 0.0, 0.0),
+        ("local-", 0.0, 0.0),
+        ("self-hosted", 0.0, 0.0),
+        ("gguf", 0.0, 0.0),
+        // Embeddings
+        ("text-embedding-3-large", 0.13, 0.0),
+        ("text-embedding-3-small", 0.02, 0.0),
+        ("text-embedding-ada-002", 0.10, 0.0),
+        // OpenAI o-series
+        ("o1-mini", 1.10, 4.40),
+        ("o1-preview", 15.00, 60.00),
+        ("o1", 15.00, 60.00),
+        ("o3-mini", 1.10, 4.40),
+        ("o3", 10.00, 40.00),
+        // OpenAI GPT-5
+        ("gpt-5.2", 1.75, 14.00),
+        ("gpt-5.1-codex", 0.25, 2.00),
+        ("codex-mini", 1.50, 6.00),
+        ("gpt-5.1", 1.25, 10.00),
+        ("gpt-5", 1.25, 10.00),
+        // OpenAI GPT-4.1
+        ("gpt-4.1-mini", 0.40, 1.60),
+        ("gpt-4.1-nano", 0.10, 0.40),
+        ("gpt-4.1", 2.00, 8.00),
+        // OpenAI GPT-4o
+        ("gpt-4o-mini", 0.15, 0.60),
+        ("gpt-4o", 2.50, 10.00),
+        // OpenAI GPT-4 legacy
+        ("gpt-4-turbo", 10.00, 30.00),
+        ("gpt-4", 30.00, 60.00),
+        ("gpt-3.5", 0.50, 1.50),
+        // Anthropic Claude 4
+        ("claude-opus-4-6", 5.00, 25.00),
+        ("claude-opus-4-5", 5.00, 25.00),
+        ("claude-opus-4", 5.00, 25.00),
+        ("claude-sonnet-4-6", 3.00, 15.00),
+        ("claude-sonnet-4-5", 3.00, 15.00),
+        ("claude-sonnet-4", 3.00, 15.00),
+        ("claude-haiku-4", 1.00, 5.00),
+        // Anthropic Claude 3.7
+        ("claude-3-7-sonnet", 3.00, 15.00),
+        // Anthropic Claude 3.5
+        ("claude-3-5-sonnet", 3.00, 15.00),
+        ("claude-3-5-haiku", 0.80, 4.00),
+        // Anthropic Claude 3
+        ("claude-3-opus", 15.00, 75.00),
+        ("claude-3-sonnet", 3.00, 15.00),
+        ("claude-3-haiku", 0.25, 1.25),
+        // Google Gemini 3.1
+        ("gemini-3.1-pro", 2.00, 12.00),
+        ("gemini-3.1-flash", 0.10, 0.40),
+        ("gemini-3.1", 2.00, 12.00),
+        // Google Gemini 3.0
+        ("gemini-3-pro", 2.00, 12.00),
+        ("gemini-3", 2.00, 12.00),
+        // Google Gemini 2.5
+        ("gemini-2.5-pro", 1.25, 10.00),
+        ("gemini-2.5-flash", 0.075, 0.30),
+        // Google Gemini 2.0
+        ("gemini-2.0-flash-lite", 0.075, 0.30),
+        ("gemini-2.0-flash", 0.10, 0.40),
+        ("gemini-2.0", 0.10, 0.40),
+        // Google Gemini 1.5
+        ("gemini-1.5-flash-8b", 0.0375, 0.15),
+        ("gemini-1.5-pro", 1.25, 5.00),
+        ("gemini-1.5-flash", 0.075, 0.30),
+        // xAI Grok
+        ("grok-3", 3.00, 15.00),
+        ("grok-2", 2.00, 10.00),
+        ("grok", 5.00, 15.00),
+        // Meta Llama 4
+        ("llama-4-maverick", 0.24, 0.77),
+        ("llama4-maverick", 0.24, 0.77),
+        ("llama-4-scout", 0.20, 0.60),
+        ("llama4-scout", 0.20, 0.60),
+        // Meta Llama 3.3
+        ("llama-3.3-70b", 0.59, 0.79),
+        ("llama3-3-70b", 0.59, 0.79),
+        // Meta Llama 3.2
+        ("llama-3.2-90b", 0.90, 0.90),
+        ("llama3-2-90b", 0.90, 0.90),
+        ("llama-3.2-11b", 0.18, 0.18),
+        ("llama3-2-11b", 0.18, 0.18),
+        ("llama-3.2-3b", 0.06, 0.06),
+        ("llama3-2-3b", 0.06, 0.06),
+        ("llama-3.2-1b", 0.04, 0.04),
+        ("llama3-2-1b", 0.04, 0.04),
+        // Meta Llama 3.1
+        ("llama-3.1-405b", 3.00, 3.00),
+        ("llama3-1-405b", 3.00, 3.00),
+        ("llama-3.1-70b", 0.52, 0.75),
+        ("llama3-1-70b", 0.52, 0.75),
+        ("llama-3.1-8b", 0.18, 0.18),
+        ("llama3-1-8b", 0.18, 0.18),
+        // Mistral
+        ("mistral-large", 2.00, 6.00),
+        ("mistral-medium", 2.75, 8.10),
+        ("mistral-small", 0.20, 0.60),
+        ("codestral", 0.30, 0.90),
+        ("pixtral", 2.00, 6.00),
+        ("mixtral", 0.24, 0.24),
+        // DeepSeek
+        ("deepseek-r1", 0.55, 2.19),
+        ("deepseek", 0.14, 0.28),
+        // Cohere
+        ("command-r-plus", 2.50, 10.00),
+        ("command-r", 0.50, 1.50),
+        // Perplexity
+        ("sonar-pro", 3.00, 15.00),
+        ("sonar", 1.00, 5.00),
+        // Amazon Nova
+        ("nova-premier", 2.50, 12.50),
+        ("nova-pro", 0.80, 3.20),
+        ("nova-lite", 0.06, 0.24),
+        ("nova-micro", 0.035, 0.14),
+        // AI21 Jamba
+        ("jamba + -large", 2.00, 8.00),
+        ("jamba + -mini", 0.20, 0.40),
+        ("jamba", 2.00, 8.00),
+        // Qwen
+        ("qwq-32b-preview", 1.60, 6.40),
+        ("qwq", 0.20, 0.60),
+        ("qwen3-coder-next", 0.07, 0.30),
+        ("qwen3-coder", 1.00, 5.00),
+        ("qwen3.5", 0.90, 3.60),
+        ("qwen3-max", 1.20, 6.00),
+        ("qwen3", 0.40, 1.20),
+        ("qwen2.5-72b", 0.15, 0.40),
+        ("qwen2.5-7b", 0.10, 0.30),
+        ("qwen2.5", 0.35, 0.75),
+        ("qwen-max", 1.60, 6.40),
+        ("qwen-plus", 0.30, 1.20),
+        ("qwen-turbo", 0.05, 0.20),
+        ("qwen", 0.40, 1.20),
+        // Kimi / Moonshot
+        ("kimi-k2.5", 0.60, 3.00),
+        ("kimi", 0.60, 3.00),
+        // Zhipu GLM
+        ("glm-5", 1.00, 3.20),
+        ("glm-4.7-x", 4.50, 8.90),
+        ("glm-4.7-flash", 0.05, 0.10),
+        ("glm-4.7", 0.60, 2.20),
+        ("glm-4.5-x", 4.50, 8.90),
+        ("glm-4.5-flash", 0.05, 0.10),
+        ("glm-4.5", 0.55, 2.00),
+        ("glm-4", 0.55, 2.00),
+        // Google Gemma
+        ("gemma", 0.10, 0.10),
+    ]
+}
+
+/// Thread-safe set of model names we have already warned about.
+static WARNED_MODELS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Print a stderr warning the first time an unknown model is seen.
+///
+/// This always prints (not gated on verbose) but deduplicates: each model
+/// name is warned about at most once per process lifetime.
+pub fn warn_unknown_model(model: &str, input_price: f64, output_price: f64) {
+    let mut guard = WARNED_MODELS.lock().unwrap_or_else(|e| e.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.insert(model.to_string()) {
+        eprintln!(
+            "[trace] unknown model pricing: \"{}\" \u{2014} using fallback ${:.2}/${:.2} per MTok. Set [prices] in .trace.toml to override.",
+            model, input_price, output_price
+        );
+    }
+}
+
+/// Fetch the LiteLLM community price list and convert to per-million-token pricing.
+///
+/// This is intended for CLI use (`trace prices --fetch`) and is NOT called on
+/// the hot proxy path.
+pub async fn fetch_litellm_prices() -> anyhow::Result<HashMap<String, (f64, f64)>> {
+    let url = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+    let body = reqwest::get(url).await?.text().await?;
+    let root: serde_json::Value = serde_json::from_str(&body)?;
+    let obj = root
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("expected JSON object at top level"))?;
+
+    let mut prices = HashMap::new();
+    for (model_name, entry) in obj {
+        // Skip the "sample_spec" meta-entry that LiteLLM includes.
+        if model_name == "sample_spec" {
+            continue;
+        }
+        let input_cost = entry["input_cost_per_token"].as_f64().unwrap_or(0.0);
+        let output_cost = entry["output_cost_per_token"].as_f64().unwrap_or(0.0);
+        // Convert per-token to per-million-token
+        let input_per_mtok = input_cost * 1_000_000.0;
+        let output_per_mtok = output_cost * 1_000_000.0;
+        // Only include entries that have at least one non-zero price
+        if input_per_mtok > 0.0 || output_per_mtok > 0.0 {
+            prices.insert(model_name.clone(), (input_per_mtok, output_per_mtok));
+        }
+    }
+    Ok(prices)
+}
+
+/// Load a cached price map from a JSON file on disk.
+#[allow(dead_code)]
+pub fn load_price_cache(
+    path: &std::path::Path,
+) -> anyhow::Result<HashMap<String, (f64, f64)>> {
+    let data = std::fs::read_to_string(path)?;
+    let map: HashMap<String, (f64, f64)> = serde_json::from_str(&data)?;
+    Ok(map)
+}
+
+/// Save a price map to a JSON file on disk.
+pub fn save_price_cache(
+    prices: &HashMap<String, (f64, f64)>,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(prices)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,6 +1098,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 
@@ -1289,12 +1610,13 @@ mod tests {
 
     #[test]
     fn estimate_cost_from_body_anthropic_cache_read_is_cheaper() {
+        let no_overrides = HashMap::new();
         // claude-3-5-sonnet: $3.00/M input, $15.00/M output.
         // Cache read = 10% of input price = $0.30/M.
         // 1000 input (900 cached read, 100 regular), 200 output.
         let body =
             r#"{"usage":{"input_tokens":1000,"cache_read_input_tokens":900,"output_tokens":200}}"#;
-        let with_cache = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 200);
+        let with_cache = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 200, &no_overrides);
         let without_cache = estimate_cost("claude-3-5-sonnet-20241022", 1000, 200);
         assert!(
             with_cache < without_cache,
@@ -1311,9 +1633,10 @@ mod tests {
 
     #[test]
     fn estimate_cost_from_body_anthropic_cache_write_is_pricier() {
+        let no_overrides = HashMap::new();
         // Cache write = 1.25x normal input price.
         let body = r#"{"usage":{"input_tokens":1000,"cache_creation_input_tokens":800,"output_tokens":0}}"#;
-        let with_write = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 0);
+        let with_write = estimate_cost_from_body("claude-3-5-sonnet-20241022", body, 1000, 0, &no_overrides);
         // Expected: 200 regular * $3/M + 800 write * $3.75/M
         let expected = (200.0 * 3.00 + 800.0 * 3.75) / 1_000_000.0;
         assert!(
@@ -1324,10 +1647,11 @@ mod tests {
 
     #[test]
     fn estimate_cost_from_body_openai_cached_tokens_50pct_discount() {
+        let no_overrides = HashMap::new();
         // gpt-4o: $2.50/M input. Cached reads are 50% = $1.25/M.
         // 1000 input (800 cached), 0 output.
         let body = r#"{"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800},"completion_tokens":0}}"#;
-        let with_cache = estimate_cost_from_body("gpt-4o", body, 1000, 0);
+        let with_cache = estimate_cost_from_body("gpt-4o", body, 1000, 0, &no_overrides);
         // Expected: 200 regular * $2.50/M + 800 cached * $1.25/M
         let expected = (200.0 * 2.50 + 800.0 * 1.25) / 1_000_000.0;
         assert!(
@@ -1338,8 +1662,9 @@ mod tests {
 
     #[test]
     fn estimate_cost_from_body_no_cache_falls_back_to_normal() {
+        let no_overrides = HashMap::new();
         let body = r#"{"usage":{"prompt_tokens":1000,"completion_tokens":200}}"#;
-        let from_body = estimate_cost_from_body("gpt-4o", body, 1000, 200);
+        let from_body = estimate_cost_from_body("gpt-4o", body, 1000, 200, &no_overrides);
         let normal = estimate_cost("gpt-4o", 1000, 200);
         assert!((from_body - normal).abs() < 1e-9);
     }
@@ -1394,8 +1719,9 @@ mod tests {
     }
 
     #[test]
-    fn is_known_model_empty_string() {
-        assert!(!is_known_model(""));
+    fn is_known_model_empty_string_is_free() {
+        // Empty model name maps to ollama/local = $0.00/$0.00, which is "known".
+        assert!(is_known_model(""));
     }
 
     // -------------------------------------------------------------------------
@@ -2217,5 +2543,164 @@ mod tests {
             default_upstream_for_provider("unknown"),
             "https://api.openai.com"
         );
+    }
+
+    // ── Ollama / self-hosted free pricing ──────────────────────────────────
+
+    #[test]
+    fn model_prices_empty_string_is_free() {
+        assert_eq!(model_prices(""), (0.0, 0.0));
+    }
+
+    #[test]
+    fn model_prices_ollama_is_free() {
+        assert_eq!(model_prices("ollama/llama3"), (0.0, 0.0));
+        assert_eq!(model_prices("ollama-llama-3.1-8b"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn model_prices_local_is_free() {
+        assert_eq!(model_prices("local-llama-3.1-8b"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn model_prices_gguf_is_free() {
+        assert_eq!(model_prices("llama-3.1-8b-q4_k_m.gguf"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn is_known_model_ollama_is_known() {
+        assert!(is_known_model("ollama/llama3"));
+    }
+
+    // ── model_prices_with_overrides ───────────────────────────────────────
+
+    #[test]
+    fn overrides_exact_match_wins() {
+        let mut overrides = HashMap::new();
+        overrides.insert("my-custom-model".to_string(), (0.50, 1.00));
+        assert_eq!(
+            model_prices_with_overrides("my-custom-model", &overrides),
+            (0.50, 1.00)
+        );
+    }
+
+    #[test]
+    fn overrides_substring_match() {
+        let mut overrides = HashMap::new();
+        overrides.insert("custom".to_string(), (0.75, 2.00));
+        assert_eq!(
+            model_prices_with_overrides("my-custom-model-v2", &overrides),
+            (0.75, 2.00)
+        );
+    }
+
+    #[test]
+    fn overrides_longest_substring_wins() {
+        let mut overrides = HashMap::new();
+        overrides.insert("gpt".to_string(), (0.10, 0.10));
+        overrides.insert("gpt-4o-mini".to_string(), (0.05, 0.05));
+        assert_eq!(
+            model_prices_with_overrides("gpt-4o-mini-2024", &overrides),
+            (0.05, 0.05)
+        );
+    }
+
+    #[test]
+    fn overrides_falls_through_to_bundled() {
+        let overrides = HashMap::new();
+        assert_eq!(
+            model_prices_with_overrides("gpt-4o", &overrides),
+            (2.50, 10.00)
+        );
+    }
+
+    #[test]
+    fn overrides_unknown_uses_default_fallback() {
+        let overrides = HashMap::new();
+        assert_eq!(
+            model_prices_with_overrides("xyz-unknown", &overrides),
+            (1.00, 3.00)
+        );
+    }
+
+    // ── model_prices_with_config ──────────────────────────────────────────
+
+    #[test]
+    fn config_custom_defaults_for_unknown() {
+        let overrides = HashMap::new();
+        assert_eq!(
+            model_prices_with_config("xyz-unknown", &overrides, 0.50, 1.50),
+            (0.50, 1.50)
+        );
+    }
+
+    #[test]
+    fn config_known_model_ignores_custom_defaults() {
+        let overrides = HashMap::new();
+        // gpt-4o should still use bundled price, not custom defaults
+        assert_eq!(
+            model_prices_with_config("gpt-4o", &overrides, 0.50, 1.50),
+            (2.50, 10.00)
+        );
+    }
+
+    #[test]
+    fn config_override_wins_over_bundled_and_defaults() {
+        let mut overrides = HashMap::new();
+        overrides.insert("gpt-4o".to_string(), (99.0, 99.0));
+        assert_eq!(
+            model_prices_with_config("gpt-4o", &overrides, 0.50, 1.50),
+            (99.0, 99.0)
+        );
+    }
+
+    // ── list_bundled_prices ───────────────────────────────────────────────
+
+    #[test]
+    fn list_bundled_prices_is_non_empty() {
+        let prices = list_bundled_prices();
+        assert!(
+            prices.len() > 80,
+            "should have 80+ entries, got {}",
+            prices.len()
+        );
+    }
+
+    #[test]
+    fn list_bundled_prices_contains_gpt4o() {
+        let prices = list_bundled_prices();
+        assert!(
+            prices.iter().any(|(p, _, _)| *p == "gpt-4o"),
+            "should contain gpt-4o"
+        );
+    }
+
+    #[test]
+    fn list_bundled_prices_contains_ollama() {
+        let prices = list_bundled_prices();
+        assert!(
+            prices.iter().any(|(p, i, o)| *p == "ollama" && *i == 0.0 && *o == 0.0),
+            "should contain ollama at $0/$0"
+        );
+    }
+
+    // ── load/save price cache ─────────────────────────────────────────────
+
+    #[test]
+    fn price_cache_round_trip() {
+        let dir = std::env::temp_dir().join("trace_test_price_cache");
+        let path = dir.join("prices.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut prices = HashMap::new();
+        prices.insert("test-model".to_string(), (1.23, 4.56));
+        prices.insert("another-model".to_string(), (0.0, 0.0));
+
+        save_price_cache(&prices, &path).expect("save should succeed");
+        let loaded = load_price_cache(&path).expect("load should succeed");
+        assert_eq!(loaded, prices);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -30,7 +30,8 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::store::{
-    CallRecord, DailyStat, ModelStats, ProviderStats, QueryFilter, SearchResult, Stats, Store,
+    AgentStats, CallRecord, DailyStat, ModelStats, ProviderStats, QueryFilter, SearchResult, Stats,
+    Store,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,83 +39,115 @@ use crate::store::{
 // ---------------------------------------------------------------------------
 
 const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OpenTrace</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
+:root{
+  --bg-primary:#0f0f0f;--bg-secondary:#1a1a1a;--text-primary:#e0e0e0;--text-muted:#555;
+  --accent:#4fc3f7;--border:#2a2a2a;--card-bg:#1a1a1a;--error:#ef5350;--success:#66bb6a;--warning:#ffd54f;
+  --th-bg:#151515;--hover-bg:#1c1c1c;--input-bg:#1a1a1a;--input-border:#333;
+}
+[data-theme="light"]{
+  --bg-primary:#f5f5f5;--bg-secondary:#fff;--text-primary:#222;--text-muted:#999;
+  --accent:#0077b6;--border:#ddd;--card-bg:#fff;--error:#d32f2f;--success:#388e3c;--warning:#f9a825;
+  --th-bg:#eee;--hover-bg:#fafafa;--input-bg:#fff;--input-border:#ccc;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:monospace;background:#0f0f0f;color:#e0e0e0;padding:1rem}
+body{font-family:'JetBrains Mono','Fira Code','SF Mono','Cascadia Code',monospace;background:var(--bg-primary);color:var(--text-primary);padding:1rem}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;flex-wrap:wrap;gap:.5rem}
-h1{color:#4fc3f7;font-size:1.1rem;letter-spacing:.05em}
+h1{color:var(--accent);font-size:1.1rem;letter-spacing:.05em}
 .nav{display:flex;align-items:center;gap:.75rem}
-.nav-link{color:#4fc3f7;text-decoration:none;font-size:.85rem}
+.nav-link{color:var(--accent);text-decoration:none;font-size:.85rem}
 .nav-link:hover{text-decoration:underline}
-#dark-toggle{background:none;border:1px solid #333;color:#888;padding:.2rem .5rem;border-radius:3px;cursor:pointer;font-size:.8rem}
+#dark-toggle{background:none;border:1px solid var(--input-border);color:var(--text-muted);padding:.2rem .5rem;border-radius:3px;cursor:pointer;font-size:.8rem}
 .cards-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;margin-bottom:.5rem}
-.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:4px;padding:.75rem 1rem}
-.card-label{color:#666;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.25rem}
-.card-value{color:#4fc3f7;font-size:1.3rem;font-weight:bold}
-.section-label{color:#555;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.3rem;margin-top:.25rem}
+.card{background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:.75rem 1rem}
+.card-label{color:var(--text-muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.25rem}
+.card-value{color:var(--accent);font-size:1.3rem;font-weight:bold}
+.card-spark{height:40px;margin-top:.25rem}
+.section-label{color:var(--text-muted);font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.3rem;margin-top:.25rem}
+#charts-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.75rem;margin-bottom:.75rem}
+.chart-card{background:var(--card-bg);border:1px solid var(--border);border-radius:4px;padding:.75rem}
+.chart-card .chart-title{color:var(--text-muted);font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem}
 #heatmap-wrap{margin-bottom:.75rem;overflow-x:auto}
 #heatmap{display:block}
 .hm-cell{cursor:default}
-#heatmap-legend{display:flex;gap:.75rem;align-items:center;font-size:.7rem;color:#666;margin-top:.3rem;flex-wrap:wrap}
+#heatmap-legend{display:flex;gap:.75rem;align-items:center;font-size:.7rem;color:var(--text-muted);margin-top:.3rem;flex-wrap:wrap}
 details#model-breakdown{margin-bottom:.75rem}
-details#model-breakdown summary{color:#555;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;user-select:none;padding:.2rem 0}
-details#model-breakdown summary:hover{color:#888}
+details#model-breakdown summary{color:var(--text-muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;user-select:none;padding:.2rem 0}
+details#model-breakdown summary:hover{color:var(--text-primary)}
 #breakdown-table{margin-top:.5rem;width:100%;border-collapse:collapse;font-size:.75rem}
-#breakdown-table th{background:#151515;color:#666;text-align:right;padding:.3rem .5rem;border-bottom:1px solid #2a2a2a}
+#breakdown-table th{background:var(--th-bg);color:var(--text-muted);text-align:right;padding:.3rem .5rem;border-bottom:1px solid var(--border)}
 #breakdown-table th:first-child{text-align:left}
-#breakdown-table td{padding:.25rem .5rem;border-bottom:1px solid #1a1a1a;text-align:right}
+#breakdown-table td{padding:.25rem .5rem;border-bottom:1px solid var(--border);text-align:right}
 #breakdown-table td:first-child{text-align:left}
+.tab-bar{display:flex;gap:0;margin-bottom:.75rem;border-bottom:1px solid var(--border)}
+.tab-btn{background:none;border:none;color:var(--text-muted);padding:.4rem .8rem;cursor:pointer;font-family:inherit;font-size:.8rem;border-bottom:2px solid transparent;transition:color .15s,border-color .15s}
+.tab-btn:hover{color:var(--text-primary)}
+.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-content{display:none}.tab-content.active{display:block}
 .filters{display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem;flex-wrap:wrap}
-.filters input[type=text]{background:#1a1a1a;border:1px solid #333;color:#e0e0e0;padding:.3rem .5rem;border-radius:3px;font-family:monospace;font-size:.85rem}
+.filters input[type=text]{background:var(--input-bg);border:1px solid var(--input-border);color:var(--text-primary);padding:.3rem .5rem;border-radius:3px;font-family:inherit;font-size:.85rem}
 #f-search{width:240px}
 #f-model{width:140px}
 #f-provider{width:130px}
-.filters label{color:#888;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:.25rem}
+.filters label{color:var(--text-muted);font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:.25rem}
 .export-wrap{position:relative;margin-left:auto}
-.export-btn{background:#1a1a1a;border:1px solid #333;color:#4fc3f7;padding:.3rem .6rem;border-radius:3px;font-family:monospace;font-size:.82rem;cursor:pointer}
-.export-btn:hover{border-color:#4fc3f7}
-.export-menu{display:none;position:absolute;right:0;top:110%;background:#1e1e1e;border:1px solid #333;border-radius:3px;z-index:200;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,.5)}
-.export-menu a{display:block;padding:.35rem .7rem;color:#ccc;font-size:.8rem;cursor:pointer;text-decoration:none;font-family:monospace}
-.export-menu a:hover{background:#2a2a2a;color:#4fc3f7}
+.export-btn{background:var(--input-bg);border:1px solid var(--input-border);color:var(--accent);padding:.3rem .6rem;border-radius:3px;font-family:inherit;font-size:.82rem;cursor:pointer}
+.export-btn:hover{border-color:var(--accent)}
+.export-menu{display:none;position:absolute;right:0;top:110%;background:var(--bg-secondary);border:1px solid var(--input-border);border-radius:3px;z-index:200;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,.5)}
+.export-menu a{display:block;padding:.35rem .7rem;color:var(--text-primary);font-size:.8rem;cursor:pointer;text-decoration:none;font-family:inherit}
+.export-menu a:hover{background:var(--hover-bg);color:var(--accent)}
 .export-wrap:hover .export-menu{display:block}
-table{width:100%;border-collapse:collapse;font-size:.78rem}
-th{background:#151515;color:#666;text-align:right;padding:.35rem .5rem;border-bottom:1px solid #2a2a2a;position:sticky;top:0;white-space:nowrap}
-th:first-child,th:nth-child(3),th:nth-child(4){text-align:left}
-td{padding:.3rem .5rem;border-bottom:1px solid #1a1a1a;text-align:right;white-space:nowrap}
-td:first-child,td:nth-child(3),td:nth-child(4){text-align:left}
-tr:hover td{background:#1c1c1c}
-tr.row-err td{color:#ef5350}
-tr.row-err:hover td{background:#1c1c1c}
-.ok{color:#66bb6a}.err{color:#ef5350}.dim{color:#555}
-#status{color:#444;font-size:.7rem;margin-top:.5rem}
-#detail-panel{display:none;position:fixed;top:0;right:0;width:420px;height:100vh;background:#111;border-left:1px solid #2a2a2a;overflow-y:auto;padding:1rem;z-index:100;font-size:.78rem}
+table.call-table{width:100%;border-collapse:collapse;font-size:.78rem}
+table.call-table th{background:var(--th-bg);color:var(--text-muted);text-align:right;padding:.35rem .5rem;border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap;cursor:pointer;user-select:none}
+table.call-table th:first-child,table.call-table th:nth-child(3),table.call-table th:nth-child(4){text-align:left}
+table.call-table th:hover{color:var(--text-primary)}
+table.call-table td{padding:.3rem .5rem;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
+table.call-table td:first-child,table.call-table td:nth-child(3),table.call-table td:nth-child(4){text-align:left}
+table.call-table tr:hover td{background:var(--hover-bg)}
+table.call-table tr.row-err td{color:var(--error)}
+table.call-table tr.row-err:hover td{background:var(--hover-bg)}
+table.call-table tr.sse-new{border-left:3px solid var(--accent);transition:border-left-color 2s ease}
+table.call-table tr.sse-fade{border-left-color:transparent}
+.ok{color:var(--success)}.err{color:var(--error)}.dim{color:var(--text-muted)}
+#status{color:var(--text-muted);font-size:.7rem;margin-top:.5rem}
+#load-more-wrap{text-align:center;margin-top:.5rem}
+#load-more-btn{background:var(--input-bg);border:1px solid var(--input-border);color:var(--accent);padding:.3rem 1rem;border-radius:3px;font-family:inherit;font-size:.8rem;cursor:pointer}
+#load-more-btn:hover{border-color:var(--accent)}
+#detail-panel{display:none;position:fixed;top:0;right:0;width:420px;height:100vh;background:var(--bg-secondary);border-left:1px solid var(--border);overflow-y:auto;padding:1rem;z-index:100;font-size:.78rem}
 .detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem}
-.detail-title{color:#4fc3f7;font-weight:bold}
-.detail-close{background:none;border:none;color:#888;cursor:pointer;font-size:1rem;line-height:1}
-.section-hdr{color:#4fc3f7;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin:.75rem 0 .3rem;border-bottom:1px solid #2a2a2a;padding-bottom:.2rem}
+.detail-title{color:var(--accent);font-weight:bold}
+.detail-close{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:1rem;line-height:1}
+.section-hdr{color:var(--accent);font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin:.75rem 0 .3rem;border-bottom:1px solid var(--border);padding-bottom:.2rem}
 .section-hdr:first-child{margin-top:0}
-body.light{background:#f5f5f5;color:#222}
-body.light .card{background:#fff;border-color:#ddd}
-body.light .card-label{color:#999}
-body.light .card-value{color:#0077b6}
-body.light th{background:#eee;color:#888}
-body.light #breakdown-table th{background:#eee;color:#888}
-body.light td{border-color:#eee}
-body.light #breakdown-table td{border-color:#eee}
-body.light tr:hover td{background:#fafafa}
-body.light .filters input[type=text]{background:#fff;border-color:#ccc;color:#222}
-body.light #dark-toggle{border-color:#ccc;color:#666}
-body.light #status{color:#aaa}
-body.light #detail-panel{background:#fafafa;border-color:#ddd}
-body.light .section-hdr{border-color:#ddd;color:#0077b6}
+.detail-link{color:var(--accent);font-size:.75rem;cursor:pointer;text-decoration:none;display:inline-block;margin-top:.3rem}
+.detail-link:hover{text-decoration:underline}
+.tag-badge{display:inline-block;background:var(--accent);color:var(--bg-primary);font-size:.65rem;padding:.1rem .35rem;border-radius:3px;margin:.1rem .15rem .1rem 0;font-weight:bold}
+.collapsible-body{cursor:pointer;color:var(--accent);font-size:.72rem;padding:.3rem .4rem;background:var(--bg-primary);border-radius:3px;margin-top:.2rem;border:1px solid var(--border)}
+.collapsible-body:hover{border-color:var(--accent)}
+.collapsible-pre{display:none;background:var(--bg-primary);padding:.5rem;border-radius:3px;font-size:.72rem;overflow-x:auto;white-space:pre-wrap;margin-top:.2rem}
+.agents-table,.workflow-timeline{width:100%;border-collapse:collapse;font-size:.78rem}
+.agents-table th{background:var(--th-bg);color:var(--text-muted);padding:.35rem .5rem;border-bottom:1px solid var(--border);text-align:right}
+.agents-table th:first-child{text-align:left}
+.agents-table td{padding:.3rem .5rem;border-bottom:1px solid var(--border);text-align:right}
+.agents-table td:first-child{text-align:left;color:var(--accent);cursor:pointer}
+.agents-table td:first-child:hover{text-decoration:underline}
+.agents-table tr:hover td{background:var(--hover-bg)}
+.wf-list{list-style:none;padding:0}
+.wf-item{padding:.3rem .5rem;cursor:pointer;font-size:.78rem;border-bottom:1px solid var(--border)}
+.wf-item:hover{background:var(--hover-bg);color:var(--accent)}
+.wf-bar-wrap{position:relative;margin:.3rem 0;height:22px}
+.wf-bar{position:absolute;height:20px;border-radius:3px;top:1px;font-size:.65rem;line-height:20px;padding:0 4px;overflow:hidden;white-space:nowrap;color:#fff;min-width:2px}
+.wf-bar-label{font-size:.65rem;color:var(--text-muted);margin-bottom:.15rem}
 @media(max-width:600px){
   .cards-grid{grid-template-columns:1fr}
-  table{display:block;overflow-x:auto}
+  #charts-row{grid-template-columns:1fr}
+  table.call-table{display:block;overflow-x:auto}
   .header{flex-direction:column;align-items:flex-start}
   #f-search{width:100%}
   #detail-panel{width:100%;left:0}
@@ -132,15 +165,22 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
 
 <!-- Stat cards row 1 -->
 <div class="cards-grid">
-  <div class="card"><div class="card-label">Total calls</div><div class="card-value" id="s-calls">-</div></div>
-  <div class="card"><div class="card-label">Total cost</div><div class="card-value" id="s-cost">-</div></div>
-  <div class="card"><div class="card-label">Avg latency</div><div class="card-value" id="s-lat">-</div></div>
+  <div class="card"><div class="card-label">Total calls</div><div class="card-value" id="s-calls">-</div><div class="card-spark"><canvas id="spark-calls"></canvas></div></div>
+  <div class="card"><div class="card-label">Total cost</div><div class="card-value" id="s-cost">-</div><div class="card-spark"><canvas id="spark-cost"></canvas></div></div>
+  <div class="card"><div class="card-label">Avg latency</div><div class="card-value" id="s-lat">-</div><div class="card-spark"><canvas id="spark-lat"></canvas></div></div>
 </div>
 <!-- Stat cards row 2 -->
 <div class="cards-grid" style="margin-bottom:.75rem">
   <div class="card"><div class="card-label">Errors</div><div class="card-value" id="s-errors">-</div></div>
   <div class="card"><div class="card-label">p99 latency</div><div class="card-value" id="s-p99">-</div></div>
   <div class="card"><div class="card-label">Calls (1h)</div><div class="card-value" id="s-hour">-</div></div>
+</div>
+
+<!-- Donut charts + latency histogram -->
+<div id="charts-row">
+  <div class="chart-card"><div class="chart-title">Cost by Provider</div><canvas id="chart-provider"></canvas></div>
+  <div class="chart-card"><div class="chart-title">Cost by Model</div><canvas id="chart-model"></canvas></div>
+  <div class="chart-card"><div class="chart-title">Latency Distribution</div><canvas id="chart-latency"></canvas></div>
 </div>
 
 <!-- Heatmap -->
@@ -150,8 +190,8 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
   <div id="heatmap-legend"></div>
 </div>
 
-<!-- Model breakdown collapsible -->
-<details id="model-breakdown">
+<!-- Model breakdown collapsible (default open) -->
+<details id="model-breakdown" open>
   <summary>by model &#9658;</summary>
   <table id="breakdown-table">
     <thead><tr>
@@ -161,14 +201,24 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
   </table>
 </details>
 
+<!-- Tab bar for Calls / Agents / Workflows -->
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('calls')">Calls</button>
+  <button class="tab-btn" onclick="switchTab('agents')">Agents</button>
+  <button class="tab-btn" onclick="switchTab('workflows')">Workflows</button>
+</div>
+
+<!-- Tab: Calls -->
+<div id="tab-calls" class="tab-content active">
 <!-- Filters -->
 <div class="filters">
   <input type="text" id="f-search" placeholder="Search prompts, responses, models..." oninput="debouncedSearch()">
   <input type="text" id="f-model" placeholder="Filter model..." oninput="saveFilters();refresh()">
   <input type="text" id="f-provider" placeholder="Filter provider..." oninput="saveFilters();refresh()">
+  <input type="text" id="f-agent" placeholder="Filter agent..." oninput="saveFilters();refresh()">
   <label><input type="checkbox" id="f-errors" onchange="refresh()"> Errors only</label>
   <div class="export-wrap">
-    <button class="export-btn">Export ▾</button>
+    <button class="export-btn">Export &#9662;</button>
     <div class="export-menu">
       <a onclick="downloadExport('jsonl')">JSONL</a>
       <a onclick="downloadExport('csv')">CSV</a>
@@ -180,13 +230,30 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
 </div>
 
 <!-- Call log table -->
-<table>
-  <thead><tr>
-    <th>id</th><th>timestamp</th><th>model</th><th>provider</th><th>status</th>
-    <th>latency</th><th>ttft</th><th>in</th><th>out</th><th>cost</th>
+<table class="call-table">
+  <thead><tr id="thead-row">
+    <th data-col="id">id</th><th data-col="timestamp">timestamp</th><th data-col="model">model</th><th data-col="provider">provider</th><th data-col="status_code">status</th>
+    <th data-col="latency_ms">latency</th><th data-col="ttft_ms">ttft</th><th data-col="input_tokens">in</th><th data-col="output_tokens">out</th><th data-col="cost_usd">cost</th>
   </tr></thead>
   <tbody id="tbody"></tbody>
 </table>
+<div id="load-more-wrap"><button id="load-more-btn" onclick="loadMore()" style="display:none">Load more</button></div>
+</div>
+
+<!-- Tab: Agents -->
+<div id="tab-agents" class="tab-content">
+  <table class="agents-table">
+    <thead><tr><th>agent</th><th>calls</th><th>cost</th><th>avg ms</th><th>errors</th></tr></thead>
+    <tbody id="agents-tbody"></tbody>
+  </table>
+</div>
+
+<!-- Tab: Workflows -->
+<div id="tab-workflows" class="tab-content">
+  <div id="wf-list-wrap"></div>
+  <div id="wf-detail-wrap"></div>
+</div>
+
 <div id="status">Loading...</div>
 
 <!-- Detail panel -->
@@ -199,44 +266,108 @@ body.light .section-hdr{border-color:#ddd;color:#0077b6}
 </div>
 
 <script>
+/* ---- Utility ---- */
 function fmtMs(v){return v==null?'-':v+'ms'}
 function fmtCost(c){return c==null?'-':'$'+Number(c).toFixed(4)}
 function clearEl(el){while(el.firstChild)el.removeChild(el.firstChild);}
 function makeCell(text,cls){var td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;return td;}
 function makeTr(label,val){
   var tr=document.createElement('tr');
-  var td1=document.createElement('td');td1.style.color='#666';td1.style.padding='.2rem .4rem';td1.style.whiteSpace='nowrap';td1.style.verticalAlign='top';td1.textContent=label;
-  var td2=document.createElement('td');td2.style.color='#e0e0e0';td2.style.padding='.2rem .4rem';td2.style.wordBreak='break-all';td2.textContent=String(val);
+  var td1=document.createElement('td');td1.style.color='var(--text-muted)';td1.style.padding='.2rem .4rem';td1.style.whiteSpace='nowrap';td1.style.verticalAlign='top';td1.textContent=label;
+  var td2=document.createElement('td');td2.style.color='var(--text-primary)';td2.style.padding='.2rem .4rem';td2.style.wordBreak='break-all';td2.textContent=String(val);
   tr.appendChild(td1);tr.appendChild(td2);return tr;
 }
 
-// sticky filters
+/* ---- Relative timestamps ---- */
+function relTime(ts){
+  try{
+    var diff=Date.now()-new Date(ts).getTime();
+    if(diff<0)diff=0;
+    var s=Math.floor(diff/1000);
+    if(s<60)return s+'s ago';
+    var m=Math.floor(s/60);if(m<60)return m+'m ago';
+    var h=Math.floor(m/60);if(h<24)return h+'h ago';
+    var d=Math.floor(h/24);return d+'d ago';
+  }catch(e){return (ts||'').slice(0,19);}
+}
+
+/* ---- JSON syntax highlighting (safe: all values are entity-escaped) ---- */
+function highlightJSON(obj,indent){
+  if(indent===undefined)indent=0;
+  var pad='  '.repeat(indent);
+  if(obj===null)return '<span style="color:#888">null</span>';
+  if(typeof obj==='boolean')return '<span style="color:#ce93d8">'+obj+'</span>';
+  if(typeof obj==='number')return '<span style="color:#ffd54f">'+obj+'</span>';
+  if(typeof obj==='string'){
+    var escaped=obj.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    if(escaped.length>200)escaped=escaped.slice(0,200)+'...';
+    return '<span style="color:#81c784">"'+escaped+'"</span>';
+  }
+  if(Array.isArray(obj)){
+    if(obj.length===0)return '[]';
+    var items=obj.map(function(v){return pad+'  '+highlightJSON(v,indent+1);});
+    return '[\n'+items.join(',\n')+'\n'+pad+']';
+  }
+  if(typeof obj==='object'){
+    var keys=Object.keys(obj);
+    if(keys.length===0)return '{}';
+    var entries=keys.map(function(k){
+      var kEsc=k.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      return pad+'  <span style="color:#4fc3f7">"'+kEsc+'"</span>: '+highlightJSON(obj[k],indent+1);
+    });
+    return '{\n'+entries.join(',\n')+'\n'+pad+'}';
+  }
+  return String(obj);
+}
+
+/* ---- sticky filters ---- */
 (function(){
   var m=localStorage.getItem('ot-filter-model');
   var p=localStorage.getItem('ot-filter-provider');
+  var a=localStorage.getItem('ot-filter-agent');
   if(m)document.getElementById('f-model').value=m;
   if(p)document.getElementById('f-provider').value=p;
+  if(a)document.getElementById('f-agent').value=a;
 })();
 function saveFilters(){
   localStorage.setItem('ot-filter-model',document.getElementById('f-model').value);
   localStorage.setItem('ot-filter-provider',document.getElementById('f-provider').value);
+  localStorage.setItem('ot-filter-agent',document.getElementById('f-agent').value);
 }
 
-// dark mode
+/* ---- Global state ---- */
+var showAgentCol=false;
+var allCalls=[];
+var sortCol=null,sortDir='desc';
+var currentCallsPage=100;
+
+/* ---- Tab switching ---- */
+function switchTab(name){
+  document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active');});
+  document.querySelectorAll('.tab-content').forEach(function(c){c.classList.remove('active');});
+  document.querySelector('.tab-btn[onclick*="'+name+'"]').classList.add('active');
+  document.getElementById('tab-'+name).classList.add('active');
+  if(name==='agents')loadAgents();
+  if(name==='workflows')loadWorkflows();
+}
+
+/* ---- Theme toggle ---- */
 function toggleDark(){
-  document.body.classList.toggle('light');
-  var light=document.body.classList.contains('light');
-  localStorage.setItem('ot-theme',light?'light':'dark');
-  document.getElementById('dark-toggle').textContent=light?'\u263e':'\u2600';
+  var html=document.documentElement;
+  var isLight=html.getAttribute('data-theme')==='light';
+  html.setAttribute('data-theme',isLight?'dark':'light');
+  localStorage.setItem('ot-theme',isLight?'dark':'light');
+  document.getElementById('dark-toggle').textContent=isLight?'\u2600':'\u263e';
+  updateChartColors();
 }
 (function(){
   if(localStorage.getItem('ot-theme')==='light'){
-    document.body.classList.add('light');
+    document.documentElement.setAttribute('data-theme','light');
     document.getElementById('dark-toggle').textContent='\u263e';
   }
 })();
 
-// detail panel
+/* ---- Detail panel ---- */
 function closeDetail(){document.getElementById('detail-panel').style.display='none';}
 async function showDetail(id){
   var panel=document.getElementById('detail-panel');
@@ -274,7 +405,41 @@ async function showDetail(id){
       ['endpoint',r.endpoint],
       ['status',r.status_code],
       ['provider_request_id',r.provider_request_id||null],
+      ['agent',r.agent_name||null],
+      ['workflow',r.workflow_id||null],
+      ['span',r.span_name||null],
     ]);
+
+    /* Tags as badges */
+    if(r.tags){
+      var tagsDiv=document.createElement('div');
+      tagsDiv.style.marginTop='.3rem';
+      r.tags.split(',').forEach(function(t){
+        t=t.trim();if(!t)return;
+        var badge=document.createElement('span');
+        badge.className='tag-badge';
+        badge.textContent=t;
+        tagsDiv.appendChild(badge);
+      });
+      content.appendChild(tagsDiv);
+    }
+
+    /* Detail panel links */
+    if(r.workflow_id){
+      var wfLink=document.createElement('a');
+      wfLink.className='detail-link';
+      wfLink.textContent='View workflow \u2192';
+      wfLink.onclick=function(){closeDetail();switchTab('workflows');loadWorkflowDetail(r.workflow_id);};
+      content.appendChild(wfLink);
+      content.appendChild(document.createElement('br'));
+    }
+    if(r.agent_name){
+      var agLink=document.createElement('a');
+      agLink.className='detail-link';
+      agLink.textContent='Filter by agent \u2192';
+      agLink.onclick=function(){closeDetail();document.getElementById('f-agent').value=r.agent_name;saveFilters();switchTab('calls');refresh();};
+      content.appendChild(agLink);
+    }
 
     addSectionHdr('timing');
     addTable([
@@ -289,38 +454,84 @@ async function showDetail(id){
       ['cost_usd',fmtCost(r.cost_usd)],
     ]);
 
+    /* Collapsible request body with syntax highlighting */
     if(r.request_body){
       addSectionHdr('request');
-      var pre=document.createElement('pre');
-      pre.style.background='#1a1a1a';pre.style.padding='.5rem';pre.style.borderRadius='3px';
-      pre.style.fontSize='.72rem';pre.style.overflowX='auto';pre.style.whiteSpace='pre-wrap';
-      pre.textContent=r.request_body;
-      content.appendChild(pre);
+      var reqSize=r.request_body.length;
+      var reqToggle=document.createElement('div');
+      reqToggle.className='collapsible-body';
+      reqToggle.textContent='['+reqSize+' bytes] Click to expand';
+      var reqPre=document.createElement('pre');
+      reqPre.className='collapsible-pre';
+      try{var _rp=JSON.parse(r.request_body);reqPre.innerHTML=highlightJSON(_rp,0);}catch(e){reqPre.textContent=r.request_body;}
+      reqToggle.onclick=function(){
+        var vis=reqPre.style.display==='block';
+        reqPre.style.display=vis?'none':'block';
+        reqToggle.textContent=vis?'['+reqSize+' bytes] Click to expand':'['+reqSize+' bytes] Click to collapse';
+      };
+      content.appendChild(reqToggle);
+      content.appendChild(reqPre);
     }
+    /* Collapsible response body with syntax highlighting */
     if(r.response_body){
       addSectionHdr('response');
-      var pre2=document.createElement('pre');
-      pre2.style.background='#1a1a1a';pre2.style.padding='.5rem';pre2.style.borderRadius='3px';
-      pre2.style.fontSize='.72rem';pre2.style.overflowX='auto';pre2.style.whiteSpace='pre-wrap';
-      pre2.textContent=r.response_body;
-      content.appendChild(pre2);
+      var resSize=r.response_body.length;
+      var resToggle=document.createElement('div');
+      resToggle.className='collapsible-body';
+      resToggle.textContent='['+resSize+' bytes] Click to expand';
+      var resPre=document.createElement('pre');
+      resPre.className='collapsible-pre';
+      try{var _rs=JSON.parse(r.response_body);resPre.innerHTML=highlightJSON(_rs,0);}catch(e){resPre.textContent=r.response_body;}
+      resToggle.onclick=function(){
+        var vis=resPre.style.display==='block';
+        resPre.style.display=vis?'none':'block';
+        resToggle.textContent=vis?'['+resSize+' bytes] Click to expand':'['+resSize+' bytes] Click to collapse';
+      };
+      content.appendChild(resToggle);
+      content.appendChild(resPre);
     }
     if(r.error){
       addSectionHdr('error');
       var errDiv=document.createElement('div');
-      errDiv.style.color='#ef5350';errDiv.style.padding='.3rem .4rem';errDiv.style.fontSize='.78rem';
+      errDiv.style.color='var(--error)';errDiv.style.padding='.3rem .4rem';errDiv.style.fontSize='.78rem';
       errDiv.textContent=r.error;
       content.appendChild(errDiv);
     }
   }catch(e){content.textContent='Error: '+e.message;}
 }
 
-// Build a single table row for a CallRecord (shared by renderRows and prependRow)
-function makeRow(r){
+/* ---- Table sorting ---- */
+function sortCalls(col){
+  if(sortCol===col){sortDir=sortDir==='asc'?'desc':'asc';}
+  else{sortCol=col;sortDir='desc';}
+  document.querySelectorAll('#thead-row th').forEach(function(th){
+    var c=th.getAttribute('data-col');
+    var base=th.textContent.replace(/[\u25b2\u25bc\s]+$/,'');
+    if(c===sortCol)th.textContent=base+' '+(sortDir==='asc'?'\u25b2':'\u25bc');
+    else th.textContent=base;
+  });
+  allCalls.sort(function(a,b){
+    var va=a[col],vb=b[col];
+    if(va==null)va='';if(vb==null)vb='';
+    if(typeof va==='number'&&typeof vb==='number')return sortDir==='asc'?va-vb:vb-va;
+    return sortDir==='asc'?String(va).localeCompare(String(vb)):String(vb).localeCompare(String(va));
+  });
+  renderRows(allCalls);
+}
+(function(){
+  document.querySelectorAll('#thead-row th').forEach(function(th){
+    var col=th.getAttribute('data-col');
+    if(col)th.addEventListener('click',function(){sortCalls(col);});
+  });
+})();
+
+/* ---- Build a single table row ---- */
+function makeRow(r,isSSE){
   var ok=r.status_code>=200&&r.status_code<400&&!r.error;
   var tr=document.createElement('tr');
   tr.style.cursor='pointer';
   if(!ok)tr.className='row-err';
+  if(isSSE){tr.classList.add('sse-new');setTimeout(function(){tr.classList.add('sse-fade');},50);}
   (function(rid){
     tr.addEventListener('click',function(){showDetail(rid);});
   })(r.id);
@@ -338,7 +549,10 @@ function makeRow(r){
     });
   })(r.id);
   tr.appendChild(idCell);
-  tr.appendChild(makeCell((r.timestamp||'').slice(0,19),'dim'));
+  var tsCell=makeCell(relTime(r.timestamp),'dim');
+  tsCell.title=r.timestamp||'';
+  tsCell.setAttribute('data-ts',r.timestamp||'');
+  tr.appendChild(tsCell);
   tr.appendChild(makeCell(r.model||'-',null));
   tr.appendChild(makeCell(r.provider||'-','dim'));
   tr.appendChild(makeCell(String(r.status_code),ok?'ok':'err'));
@@ -347,23 +561,40 @@ function makeRow(r){
   tr.appendChild(makeCell(r.input_tokens!=null?String(r.input_tokens):'-','dim'));
   tr.appendChild(makeCell(r.output_tokens!=null?String(r.output_tokens):'-','dim'));
   tr.appendChild(makeCell(fmtCost(r.cost_usd),null));
+  if(showAgentCol)tr.appendChild(makeCell(r.agent_name||'-','dim'));
   return tr;
 }
-// row rendering (shared by refresh and search)
+
+/* ---- Render rows ---- */
 function renderRows(calls){
+  showAgentCol=calls.some(function(c){return c.agent_name;});
+  var theadRow=document.getElementById('thead-row');
+  var existingAgentTh=document.getElementById('th-agent');
+  if(showAgentCol&&!existingAgentTh){
+    var th=document.createElement('th');th.id='th-agent';th.textContent='agent';th.setAttribute('data-col','agent_name');
+    th.addEventListener('click',function(){sortCalls('agent_name');});
+    theadRow.appendChild(th);
+  } else if(!showAgentCol&&existingAgentTh){existingAgentTh.remove();}
   var tbody=document.getElementById('tbody');
   clearEl(tbody);
-  for(var i=0;i<calls.length;i++){tbody.appendChild(makeRow(calls[i]));}
+  for(var i=0;i<calls.length;i++){tbody.appendChild(makeRow(calls[i],false));}
+  document.getElementById('load-more-btn').style.display=calls.length>=currentCallsPage?'inline-block':'none';
 }
-// Prepend a single new row from SSE without rebuilding the whole table.
-// Caps at 200 rows to prevent unbounded DOM growth.
 function prependRow(r){
   var tbody=document.getElementById('tbody');
-  tbody.insertBefore(makeRow(r),tbody.firstChild);
+  tbody.insertBefore(makeRow(r,true),tbody.firstChild);
+  allCalls.unshift(r);
   while(tbody.rows.length>200)tbody.deleteRow(tbody.rows.length-1);
 }
 
-// search (debounced 300ms)
+/* ---- Refresh relative timestamps every 30s ---- */
+setInterval(function(){
+  document.querySelectorAll('#tbody td[data-ts]').forEach(function(td){
+    td.textContent=relTime(td.getAttribute('data-ts'));
+  });
+},30000);
+
+/* ---- Search (debounced 300ms) ---- */
 var searchTimer=null;
 function debouncedSearch(){clearTimeout(searchTimer);searchTimer=setTimeout(runSearch,300);}
 async function runSearch(){
@@ -373,20 +604,154 @@ async function runSearch(){
     var res=await fetch('/api/search?q='+encodeURIComponent(q)+'&limit=100');
     var data=await res.json();
     if(!res.ok){document.getElementById('status').textContent='Search error: '+(data||'');return;}
-    renderRows((data.results||[]).map(function(r){return r.record;}));
+    allCalls=(data.results||[]).map(function(r){return r.record;});
+    renderRows(allCalls);
     document.getElementById('status').textContent='Search: '+data.count+' result(s) for "'+q+'"';
   }catch(e){document.getElementById('status').textContent='Search error: '+e.message;}
 }
 
-// main refresh
+/* ---- Load more (pagination) ---- */
+async function loadMore(){
+  currentCallsPage+=100;
+  var model=document.getElementById('f-model').value;
+  var provider=document.getElementById('f-provider').value;
+  var agent=document.getElementById('f-agent').value;
+  var errors=document.getElementById('f-errors').checked;
+  var url='/api/calls?limit='+currentCallsPage;
+  if(model)url+='&model='+encodeURIComponent(model);
+  if(provider)url+='&provider='+encodeURIComponent(provider);
+  if(agent)url+='&agent='+encodeURIComponent(agent);
+  if(errors)url+='&errors=true';
+  try{
+    var res=await fetch(url);
+    allCalls=await res.json();
+    renderRows(allCalls);
+    document.getElementById('status').textContent='Loaded '+allCalls.length+' calls';
+  }catch(e){}
+}
+
+/* ---- Chart.js instances ---- */
+var chartProvider=null,chartModel=null,chartLatency=null;
+var sparkCallsChart=null,sparkCostChart=null,sparkLatChart=null;
+
+function getChartTextColor(){
+  return getComputedStyle(document.documentElement).getPropertyValue('--text-muted').trim()||'#555';
+}
+
+function makeSparkline(canvasId,data,color){
+  var ctx=document.getElementById(canvasId);
+  if(!ctx)return null;
+  return new Chart(ctx,{
+    type:'line',
+    data:{labels:data.map(function(_,i){return i;}),datasets:[{data:data,borderColor:color,borderWidth:1.5,fill:false,pointRadius:0,tension:0.3}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}},animation:false}
+  });
+}
+
+function makeDoughnut(canvasId,labels,values,colors){
+  var ctx=document.getElementById(canvasId);
+  if(!ctx)return null;
+  return new Chart(ctx,{
+    type:'doughnut',
+    data:{labels:labels,datasets:[{data:values,backgroundColor:colors,borderWidth:0}]},
+    options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{position:'bottom',labels:{color:getChartTextColor(),font:{size:10,family:'inherit'},boxWidth:10,padding:6}},tooltip:{callbacks:{label:function(c){return c.label+': $'+Number(c.raw).toFixed(4);}}}},animation:false}
+  });
+}
+
+function makeLatencyHistogram(canvasId,buckets){
+  var ctx=document.getElementById(canvasId);
+  if(!ctx)return null;
+  var labels=['<100ms','100-250','250-500','500ms-1s','1-2s','2-5s','5s+'];
+  var colors=['#66bb6a','#81c784','#ffd54f','#ffb74d','#ff8a65','#ef5350','#c62828'];
+  return new Chart(ctx,{
+    type:'bar',
+    data:{labels:labels,datasets:[{data:buckets,backgroundColor:colors,borderWidth:0}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return c.raw+' calls';}}}},scales:{x:{display:false},y:{ticks:{color:getChartTextColor(),font:{size:10,family:'inherit'}},grid:{display:false}}},animation:false}
+  });
+}
+
+function updateChartColors(){
+  var clr=getChartTextColor();
+  [chartProvider,chartModel].forEach(function(ch){
+    if(!ch)return;
+    ch.options.plugins.legend.labels.color=clr;
+    ch.update();
+  });
+  if(chartLatency){
+    chartLatency.options.scales.y.ticks.color=clr;
+    chartLatency.update();
+  }
+}
+
+var chartPalette=['#4fc3f7','#81c784','#ffd54f','#ce93d8','#ff8a65','#4db6ac','#a1887f','#90a4ae','#f48fb1','#aed581'];
+
+/* ---- Sparklines from heatmap data ---- */
+async function loadSparklines(){
+  try{
+    var res=await fetch('/api/heatmap?days=7');
+    if(!res.ok)return;
+    var data=await res.json();
+    var days=data.days||[];
+    var costArr=[],callsArr=[],latArr=[];
+    var map={};days.forEach(function(d){map[d.date]=d;});
+    var now=new Date();
+    for(var i=6;i>=0;i--){
+      var d=new Date(now);d.setDate(now.getDate()-i);
+      var key=d.toISOString().slice(0,10);
+      var s=map[key];
+      costArr.push(s?s.cost_usd:0);
+      callsArr.push(s?s.calls:0);
+      latArr.push(0);
+    }
+    if(sparkCallsChart)sparkCallsChart.destroy();
+    if(sparkCostChart)sparkCostChart.destroy();
+    if(sparkLatChart)sparkLatChart.destroy();
+    sparkCallsChart=makeSparkline('spark-calls',callsArr,'#4fc3f7');
+    sparkCostChart=makeSparkline('spark-cost',costArr,'#81c784');
+    sparkLatChart=makeSparkline('spark-lat',latArr,'#ffd54f');
+  }catch(e){}
+}
+
+/* ---- Render charts from stats data ---- */
+function renderCharts(statsData,calls){
+  var providers=statsData.providers||[];
+  var pLabels=providers.map(function(p){return p.provider;});
+  var pValues=providers.map(function(p){return p.total_cost_usd;});
+  if(chartProvider)chartProvider.destroy();
+  chartProvider=makeDoughnut('chart-provider',pLabels,pValues,chartPalette.slice(0,pLabels.length));
+
+  var models=statsData.models||[];
+  var mLabels=models.map(function(m){return m.model;}).slice(0,10);
+  var mValues=models.map(function(m){return m.total_cost_usd;}).slice(0,10);
+  if(chartModel)chartModel.destroy();
+  chartModel=makeDoughnut('chart-model',mLabels,mValues,chartPalette.slice(0,mLabels.length));
+
+  var buckets=[0,0,0,0,0,0,0];
+  (calls||[]).forEach(function(c){
+    var ms=c.latency_ms||0;
+    if(ms<100)buckets[0]++;
+    else if(ms<250)buckets[1]++;
+    else if(ms<500)buckets[2]++;
+    else if(ms<1000)buckets[3]++;
+    else if(ms<2000)buckets[4]++;
+    else if(ms<5000)buckets[5]++;
+    else buckets[6]++;
+  });
+  if(chartLatency)chartLatency.destroy();
+  chartLatency=makeLatencyHistogram('chart-latency',buckets);
+}
+
+/* ---- Main refresh ---- */
 async function refresh(){
   if(document.getElementById('f-search').value.trim()){return;}
   var model=document.getElementById('f-model').value;
   var provider=document.getElementById('f-provider').value;
+  var agent=document.getElementById('f-agent').value;
   var errors=document.getElementById('f-errors').checked;
-  var url='/api/calls?limit=100';
+  var url='/api/calls?limit='+currentCallsPage;
   if(model)url+='&model='+encodeURIComponent(model);
   if(provider)url+='&provider='+encodeURIComponent(provider);
+  if(agent)url+='&agent='+encodeURIComponent(agent);
   if(errors)url+='&errors=true';
   try{
     var [r1,r2]=await Promise.all([fetch(url),fetch('/api/stats')]);
@@ -399,8 +764,9 @@ async function refresh(){
     document.getElementById('s-errors').textContent=String(s.error_count);
     document.getElementById('s-p99').textContent=Math.round(data.p99_latency_ms||0)+'ms';
     document.getElementById('s-hour').textContent=String(s.calls_last_hour);
+    allCalls=calls;
     renderRows(calls);
-    // populate model breakdown
+    renderCharts(data,calls);
     var btbody=document.getElementById('breakdown-tbody');
     clearEl(btbody);
     (data.models||[]).forEach(function(m){
@@ -409,7 +775,7 @@ async function refresh(){
         var td=document.createElement('td');
         td.textContent=String(v);
         td.style.padding='.25rem .5rem';
-        td.style.borderBottom='1px solid #1a1a1a';
+        td.style.borderBottom='1px solid var(--border)';
         if(i>0)td.style.textAlign='right';
         tr.appendChild(td);
       });
@@ -419,7 +785,7 @@ async function refresh(){
   }catch(e){document.getElementById('status').textContent='Error: '+e.message;}
 }
 
-// heatmap
+/* ---- Heatmap ---- */
 async function loadHeatmap(){
   try{
     var res=await fetch('/api/heatmap?days=90');
@@ -461,7 +827,6 @@ function renderHeatmap(days){
     title.textContent=cell.date+': '+cell.stat.calls+' calls, $'+Number(cell.stat.cost_usd).toFixed(4)+(cell.stat.error_count>0?' ('+cell.stat.error_count+' errors)':'');
     g.appendChild(rect);g.appendChild(title);svg.appendChild(g);
   });
-  // month labels
   var lastMonth='';
   cells.forEach(function(cell,idx){
     var col=Math.floor(idx/7);
@@ -496,13 +861,110 @@ function renderHeatmapLegend(){
   });
 }
 
-// ---- Export helpers ----
+/* ---- Agents tab ---- */
+async function loadAgents(){
+  try{
+    var res=await fetch('/api/agents');
+    var data=await res.json();
+    var tbody=document.getElementById('agents-tbody');
+    clearEl(tbody);
+    (data.agents||[]).forEach(function(a){
+      var tr=document.createElement('tr');
+      var tdName=document.createElement('td');
+      tdName.textContent=a.agent_name||'-';
+      tdName.onclick=function(){
+        document.getElementById('f-agent').value=a.agent_name||'';
+        saveFilters();switchTab('calls');refresh();
+      };
+      tr.appendChild(tdName);
+      [a.calls,'$'+Number(a.total_cost_usd||0).toFixed(4),Math.round(a.avg_latency_ms||0)+'ms',a.errors||0].forEach(function(v){
+        var td=document.createElement('td');td.textContent=String(v);tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+  }catch(e){}
+}
+
+/* ---- Workflows tab ---- */
+async function loadWorkflows(){
+  try{
+    var res=await fetch('/api/calls?limit=1000');
+    var calls=await res.json();
+    var wfMap={};
+    calls.forEach(function(c){
+      if(!c.workflow_id)return;
+      if(!wfMap[c.workflow_id])wfMap[c.workflow_id]={id:c.workflow_id,count:0,cost:0};
+      wfMap[c.workflow_id].count++;
+      wfMap[c.workflow_id].cost+=(c.cost_usd||0);
+    });
+    var wfList=Object.values(wfMap);
+    var wrap=document.getElementById('wf-list-wrap');
+    clearEl(wrap);
+    document.getElementById('wf-detail-wrap').textContent='';
+    if(wfList.length===0){wrap.textContent='No workflows found.';return;}
+    var ul=document.createElement('ul');ul.className='wf-list';
+    wfList.forEach(function(wf){
+      var li=document.createElement('li');li.className='wf-item';
+      li.textContent=wf.id+' ('+wf.count+' calls, $'+wf.cost.toFixed(4)+')';
+      li.onclick=function(){loadWorkflowDetail(wf.id);};
+      ul.appendChild(li);
+    });
+    wrap.appendChild(ul);
+  }catch(e){}
+}
+
+async function loadWorkflowDetail(wfId){
+  try{
+    var res=await fetch('/api/workflow/'+encodeURIComponent(wfId));
+    if(!res.ok)return;
+    var data=await res.json();
+    var wrap=document.getElementById('wf-detail-wrap');
+    clearEl(wrap);
+    var hdr=document.createElement('div');
+    hdr.style.marginBottom='.5rem';hdr.style.fontSize='.8rem';hdr.style.color='var(--accent)';
+    hdr.textContent='Workflow: '+wfId+' ('+data.calls.length+' calls, $'+Number(data.total_cost_usd).toFixed(4)+', '+data.total_latency_ms+'ms total)';
+    wrap.appendChild(hdr);
+    if(data.calls.length>0){
+      var minTs=Infinity,maxEnd=0;
+      data.calls.forEach(function(c){
+        var t0=new Date(c.timestamp).getTime();
+        if(t0<minTs)minTs=t0;
+        var t1=t0+(c.latency_ms||0);
+        if(t1>maxEnd)maxEnd=t1;
+      });
+      var span=maxEnd-minTs||1;
+      data.calls.forEach(function(c){
+        var t0=new Date(c.timestamp).getTime();
+        var left=((t0-minTs)/span)*100;
+        var width=Math.max(((c.latency_ms||0)/span)*100,1);
+        var label=document.createElement('div');
+        label.className='wf-bar-label';
+        label.textContent=(c.model||'?')+' '+c.latency_ms+'ms';
+        var barWrap=document.createElement('div');
+        barWrap.className='wf-bar-wrap';
+        var bar=document.createElement('div');
+        bar.className='wf-bar';
+        bar.style.left=left+'%';bar.style.width=width+'%';
+        var sc=c.status_code||0;
+        bar.style.background=sc>=500?'var(--error)':sc>=400?'var(--warning)':'var(--success)';
+        bar.textContent=(c.id||'').slice(0,8);
+        bar.style.cursor='pointer';
+        bar.onclick=function(){showDetail(c.id);};
+        barWrap.appendChild(bar);
+        wrap.appendChild(label);
+        wrap.appendChild(barWrap);
+      });
+    }
+  }catch(e){}
+}
+
+/* ---- Export helpers ---- */
 function uuidv4(){return([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16));}
 function addMs(ts,ms){try{var d=new Date(ts);d.setMilliseconds(d.getMilliseconds()+ms);return d.toISOString();}catch(e){return ts;}}
 function toMs(ts){try{return new Date(ts).getTime();}catch(e){return 0;}}
 
 function fmtRecord(r,fmt){
-  if(fmt==='csv') return null; // handled separately
+  if(fmt==='csv') return null;
   if(fmt==='langfuse'){
     return JSON.stringify({batch:[{id:uuidv4(),type:'generation-create',body:{
       id:r.id,traceId:r.id,name:'llm-call',startTime:r.timestamp,endTime:addMs(r.timestamp,r.latency_ms||0),
@@ -530,7 +992,6 @@ function fmtRecord(r,fmt){
       attributes:{provider:r.provider,endpoint:r.endpoint,status_code:r.status_code,cost_usd:r.cost_usd||null,latency_ms:r.latency_ms}
     }]});
   }
-  // jsonl (default)
   return JSON.stringify(r);
 }
 
@@ -562,8 +1023,8 @@ document.addEventListener('keydown',function(e){
 });
 refresh();
 loadHeatmap();
-// SSE: receive new call records in real time.
-// Falls back to 2-second polling while the SSE connection is down.
+loadSparklines();
+/* ---- SSE ---- */
 var sseActive=false;
 function connectSSE(){
   var es=new EventSource('/stream');
@@ -572,18 +1033,18 @@ function connectSSE(){
     try{
       var r=JSON.parse(evt.data);
       if(r.type==='ping')return;
-      // Honour active filters — only prepend if the record matches
       var mf=document.getElementById('f-model').value.trim().toLowerCase();
       var pf=document.getElementById('f-provider').value.trim().toLowerCase();
+      var af=document.getElementById('f-agent').value.trim().toLowerCase();
       var ef=document.getElementById('f-errors').checked;
       var sf=document.getElementById('f-search').value.trim();
-      if(sf)return; // search active — let the search view handle its own refresh
+      if(sf)return;
       if(mf&&!(r.model||'').toLowerCase().includes(mf))return;
       if(pf&&!(r.provider||'').toLowerCase().includes(pf))return;
+      if(af&&!(r.agent_name||'').toLowerCase().includes(af))return;
       if(ef&&!(r.error||(r.status_code>=400||r.status_code===0)))return;
       prependRow(r);
     }catch(e){}
-    // Refresh stat cards on every new call (single cheap fetch)
     fetch('/api/stats').then(function(res){return res.json();}).then(function(data){
       var s=data.stats;
       document.getElementById('s-calls').textContent=String(s.total_calls);
@@ -597,11 +1058,10 @@ function connectSSE(){
   es.onerror=function(){
     sseActive=false;
     es.close();
-    setTimeout(connectSSE,3000); // reconnect after 3 s
+    setTimeout(connectSSE,3000);
   };
 }
 connectSSE();
-// Polling fallback — fires only when SSE is reconnecting
 setInterval(function(){if(!sseActive)refresh();},2000);
 </script>
 </body>
@@ -775,6 +1235,8 @@ struct CallsQuery {
     limit: Option<usize>,
     model: Option<String>,
     provider: Option<String>,
+    agent: Option<String>,
+    workflow: Option<String>,
     errors: Option<bool>,
     since: Option<String>,
     until: Option<String>,
@@ -823,6 +1285,8 @@ fn router(state: ServeState) -> Router {
         .route("/api/search", get(api_search_handler))
         .route("/api/heatmap", get(api_heatmap_handler))
         .route("/api/detail/:id", get(api_detail_handler))
+        .route("/api/workflow/:id", get(api_workflow_handler))
+        .route("/api/agents", get(api_agents_handler))
         .route("/playground", get(playground_handler))
         .with_state(state)
 }
@@ -870,6 +1334,8 @@ async fn api_calls_handler(
         errors_only: params.errors.unwrap_or(false),
         model: params.model,
         provider: params.provider,
+        agent: params.agent,
+        workflow: params.workflow,
         since: params.since,
         until: params.until,
         ..Default::default()
@@ -949,6 +1415,68 @@ async fn api_detail_handler(
         )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workflow & agent API types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct WorkflowResponse {
+    workflow_id: String,
+    calls: Vec<CallRecord>,
+    total_cost_usd: f64,
+    total_latency_ms: u64,
+    agents: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AgentsResponse {
+    agents: Vec<AgentStats>,
+}
+
+async fn api_workflow_handler(
+    State(state): State<ServeState>,
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowResponse>, (StatusCode, String)> {
+    let store = state.store.lock().unwrap();
+    match store.query_workflow(&id) {
+        Ok(calls) => {
+            if calls.is_empty() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("No calls found for workflow: {id}"),
+                ));
+            }
+            let total_cost_usd: f64 = calls.iter().filter_map(|c| c.cost_usd).sum();
+            let total_latency_ms: u64 = calls.iter().map(|c| c.latency_ms).sum();
+            let mut agents: Vec<String> = calls
+                .iter()
+                .filter_map(|c| c.agent_name.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            agents.sort();
+            Ok(Json(WorkflowResponse {
+                workflow_id: id,
+                calls,
+                total_cost_usd,
+                total_latency_ms,
+                agents,
+            }))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+async fn api_agents_handler(
+    State(state): State<ServeState>,
+) -> Json<AgentsResponse> {
+    let store = state.store.lock().unwrap();
+    let agents = store
+        .query_agent_stats(&QueryFilter::default())
+        .unwrap_or_default();
+    Json(AgentsResponse { agents })
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1576,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

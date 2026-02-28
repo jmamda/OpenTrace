@@ -20,14 +20,29 @@ pub struct WeaveSink {
     client: reqwest::Client,
 }
 
+/// Default timeout for Weave HTTP requests (seconds).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
 impl WeaveSink {
     /// Create a new sink.
     ///
     /// `base_url` is typically `https://trace.wandb.ai`.
     /// `project_id` must be `"entity/project"`.
+    #[allow(dead_code)]
     pub fn new(base_url: &str, api_key: &str, project_id: &str) -> Self {
+        Self::with_timeout(base_url, api_key, project_id, None)
+    }
+
+    /// Create a new sink with optional custom timeout (seconds).
+    pub fn with_timeout(
+        base_url: &str,
+        api_key: &str,
+        project_id: &str,
+        timeout_secs: Option<u64>,
+    ) -> Self {
+        let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(timeout))
             .build()
             .unwrap_or_default();
         WeaveSink {
@@ -52,6 +67,20 @@ impl WeaveSink {
         // an object key — extract model string first.
         let model_key = record.model.as_str();
 
+        let mut attributes = json!({
+            "provider": record.provider,
+            "endpoint": record.endpoint,
+            "status_code": record.status_code as i64,
+            "cost_usd": record.cost_usd,
+            "latency_ms": record.latency_ms
+        });
+        if let Some(ref agent) = record.agent_name {
+            attributes["agent_name"] = json!(agent);
+        }
+        if let Some(ref wf) = record.workflow_id {
+            attributes["workflow_id"] = json!(wf);
+        }
+
         let payload = json!({
             "calls": [{
                 "id": record.id,
@@ -74,13 +103,7 @@ impl WeaveSink {
                         }
                     }
                 },
-                "attributes": {
-                    "provider": record.provider,
-                    "endpoint": record.endpoint,
-                    "status_code": record.status_code as i64,
-                    "cost_usd": record.cost_usd,
-                    "latency_ms": record.latency_ms
-                }
+                "attributes": attributes
             }]
         });
 
@@ -163,6 +186,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

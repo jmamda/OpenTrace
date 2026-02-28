@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.3.6",
+    version = "0.3.7",
     long_about = None,
 )]
 struct Cli {
@@ -129,6 +129,22 @@ enum Commands {
         /// Example: --route /v1/messages=https://api.anthropic.com
         #[arg(long = "route", value_name = "PATH=URL")]
         route: Vec<String>,
+
+        /// Path to SQLite database file
+        #[arg(long, env = "TRACE_DB_PATH")]
+        db_path: Option<String>,
+
+        /// Background writer channel capacity
+        #[arg(long, env = "TRACE_CHANNEL_CAPACITY")]
+        channel_capacity: Option<usize>,
+
+        /// Max request body size in bytes
+        #[arg(long, env = "TRACE_MAX_REQUEST_BODY")]
+        max_request_body_bytes: Option<usize>,
+
+        /// Graceful shutdown timeout in seconds
+        #[arg(long)]
+        graceful_shutdown_timeout: Option<u64>,
     },
 
     /// Query captured calls
@@ -176,6 +192,14 @@ enum Commands {
         /// Filter by HTTP status code range (e.g. 400-499)
         #[arg(long, value_parser = parse_status_range)]
         status_range: Option<(u16, u16)>,
+
+        /// Filter by agent name (substring match)
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Filter by workflow ID (exact match)
+        #[arg(long)]
+        workflow: Option<String>,
     },
 
     /// Watch for new calls in real time (polls every 250ms)
@@ -199,6 +223,14 @@ enum Commands {
         /// Filter by HTTP status code range (e.g. 400-499)
         #[arg(long, value_parser = parse_status_range)]
         status_range: Option<(u16, u16)>,
+
+        /// Filter by agent name (substring match)
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Filter by workflow ID (exact match)
+        #[arg(long)]
+        workflow: Option<String>,
     },
 
     /// Show full detail for a single call by ID (prefix of 8+ chars is fine)
@@ -279,6 +311,14 @@ enum Commands {
         /// Filter by HTTP status code range (e.g. 400-599)
         #[arg(long, value_parser = parse_status_range)]
         status_range: Option<(u16, u16)>,
+
+        /// Filter by agent name (substring match)
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Filter by workflow ID (exact match)
+        #[arg(long)]
+        workflow: Option<String>,
     },
 
     /// Start the local web dashboard (reads existing trace.db, no proxy)
@@ -413,6 +453,44 @@ enum Commands {
         #[arg(short, long, env = "TRACE_UI_PORT")]
         port: Option<u16>,
     },
+
+    /// Show all calls in a workflow as a timeline tree
+    Workflow {
+        /// Workflow ID
+        id: String,
+        /// Output as JSON
+        #[arg(short, long)]
+        json: bool,
+    },
+
+    /// Show per-agent stats summary
+    Agents {
+        /// Only include calls at or after this timestamp
+        #[arg(long)]
+        since: Option<String>,
+        /// Only include calls at or before this timestamp
+        #[arg(long)]
+        until: Option<String>,
+    },
+
+    /// List known model prices and detect unknown models
+    Prices {
+        /// Show models from your DB that have no known pricing
+        #[arg(long)]
+        unknown: bool,
+
+        /// Show all models with pricing source (bundled, config, fallback)
+        #[arg(long)]
+        check: bool,
+
+        /// Fetch latest prices from LiteLLM community database
+        #[arg(long)]
+        update: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -483,6 +561,10 @@ async fn main() -> Result<()> {
             budget_alert_usd,
             budget_period,
             route,
+            db_path,
+            channel_capacity,
+            max_request_body_bytes,
+            graceful_shutdown_timeout,
         } => {
             cmd_start(
                 port,
@@ -507,6 +589,10 @@ async fn main() -> Result<()> {
                 budget_alert_usd,
                 budget_period,
                 route,
+                db_path,
+                channel_capacity,
+                max_request_body_bytes,
+                graceful_shutdown_timeout,
                 &cfg,
             )
             .await
@@ -523,6 +609,8 @@ async fn main() -> Result<()> {
             until,
             status,
             status_range,
+            agent,
+            workflow,
         } => cmd_query(
             last,
             json,
@@ -535,6 +623,8 @@ async fn main() -> Result<()> {
             until,
             status,
             status_range,
+            agent,
+            workflow,
         ),
         Commands::Watch {
             model,
@@ -542,7 +632,9 @@ async fn main() -> Result<()> {
             errors,
             status,
             status_range,
-        } => cmd_watch(model, provider, errors, status, status_range).await,
+            agent,
+            workflow,
+        } => cmd_watch(model, provider, errors, status, status_range, agent, workflow).await,
         Commands::Show {
             id,
             no_bodies,
@@ -573,7 +665,9 @@ async fn main() -> Result<()> {
             until,
             status,
             status_range,
-        } => cmd_export(format, model, provider, since, until, status, status_range),
+            agent,
+            workflow,
+        } => cmd_export(format, model, provider, since, until, status, status_range, agent, workflow),
         Commands::Serve { port } => {
             let serve_cfg = cfg.serve.as_ref();
             let resolved_port = port
@@ -620,6 +714,14 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Commands::Workflow { id, json } => cmd_workflow(id, json),
+        Commands::Agents { since, until } => cmd_agents(since, until),
+        Commands::Prices {
+            unknown,
+            check,
+            update,
+            json,
+        } => cmd_prices(unknown, check, update, json, &cfg).await,
     }
 }
 
@@ -647,8 +749,41 @@ async fn cmd_start(
     budget_alert_usd: Option<f64>,
     budget_period: Option<String>,
     route_args: Vec<String>,
+    db_path_arg: Option<String>,
+    channel_capacity_arg: Option<usize>,
+    max_request_body_bytes_arg: Option<usize>,
+    graceful_shutdown_timeout_arg: Option<u64>,
     cfg: &config::TraceConfig,
 ) -> Result<()> {
+    // ── Config validation ────────────────────────────────────────────────
+    if let Some(cfg_path) = config::config_path() {
+        if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+            let warnings = config::validate_config(&raw, cfg);
+            if !warnings.is_empty() {
+                eprintln!(
+                    "{}",
+                    format!("Config warnings ({})", cfg_path.display()).yellow()
+                );
+                for w in &warnings {
+                    eprintln!("  {} {}", "⚠".yellow(), w.yellow());
+                }
+
+                use std::io::IsTerminal;
+                if std::io::stdin().is_terminal() {
+                    eprint!("Continue? [Y/n] ");
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).ok();
+                    let trimmed = answer.trim().to_lowercase();
+                    if trimmed == "n" || trimmed == "no" {
+                        anyhow::bail!("aborted by user due to config warnings");
+                    }
+                } else {
+                    eprintln!("  (non-interactive: continuing)");
+                }
+            }
+        }
+    }
+
     // Merge CLI/env args with config file defaults. Priority: CLI > env > config > hardcoded.
     let start_cfg = cfg.start.as_ref();
     let port = port
@@ -680,6 +815,73 @@ async fn cmd_start(
     let budget_period = budget_period
         .or_else(|| start_cfg.and_then(|s| s.budget_period.clone()))
         .unwrap_or_else(|| "month".to_string());
+
+    // New config values: CLI > env > config > hardcoded defaults.
+    let db_path_override: Option<String> = db_path_arg
+        .or_else(|| start_cfg.and_then(|s| s.db_path.clone()));
+
+    let channel_capacity = channel_capacity_arg
+        .or_else(|| start_cfg.and_then(|s| s.channel_capacity))
+        .unwrap_or(20_000);
+
+    let max_request_body_bytes = max_request_body_bytes_arg
+        .or_else(|| start_cfg.and_then(|s| s.max_request_body_bytes))
+        .unwrap_or(16 * 1024 * 1024); // 16 MB default
+
+    let max_stored_response_bytes = start_cfg
+        .and_then(|s| s.max_stored_response_bytes)
+        .unwrap_or(10 * 1024 * 1024); // 10 MB default
+
+    let max_stored_stream_response_bytes = start_cfg
+        .and_then(|s| s.max_stored_stream_bytes)
+        .unwrap_or(256 * 1024); // 256 KB default
+
+    let max_accumulation_bytes = start_cfg
+        .and_then(|s| s.max_accumulation_bytes)
+        .unwrap_or(4 * 1024 * 1024); // 4 MB default
+
+    let graceful_shutdown_timeout = graceful_shutdown_timeout_arg
+        .or_else(|| start_cfg.and_then(|s| s.graceful_shutdown_timeout))
+        .unwrap_or(5);
+
+    // Sink config fallback: CLI flags > env vars (already via clap env) > config TOML > None.
+    let langfuse_public_key = langfuse_public_key
+        .or_else(|| start_cfg.and_then(|s| s.langfuse.as_ref().and_then(|l| l.public_key.clone())));
+    let langfuse_secret_key = langfuse_secret_key
+        .or_else(|| start_cfg.and_then(|s| s.langfuse.as_ref().and_then(|l| l.secret_key.clone())));
+    let langfuse_url = if langfuse_url != "https://cloud.langfuse.com" {
+        langfuse_url // CLI override
+    } else {
+        start_cfg
+            .and_then(|s| s.langfuse.as_ref().and_then(|l| l.url.clone()))
+            .unwrap_or(langfuse_url)
+    };
+    let langsmith_api_key = langsmith_api_key
+        .or_else(|| start_cfg.and_then(|s| s.langsmith.as_ref().and_then(|l| l.api_key.clone())));
+    let langsmith_endpoint = if langsmith_endpoint != "https://api.smith.langchain.com" {
+        langsmith_endpoint // CLI override
+    } else {
+        start_cfg
+            .and_then(|s| s.langsmith.as_ref().and_then(|l| l.endpoint.clone()))
+            .unwrap_or(langsmith_endpoint)
+    };
+    let weave_api_key = weave_api_key
+        .or_else(|| start_cfg.and_then(|s| s.weave.as_ref().and_then(|w| w.api_key.clone())));
+    let weave_project = weave_project
+        .or_else(|| start_cfg.and_then(|s| s.weave.as_ref().and_then(|w| w.project.clone())));
+    let phoenix_endpoint = phoenix_endpoint
+        .or_else(|| start_cfg.and_then(|s| s.phoenix.as_ref().and_then(|p| p.endpoint.clone())));
+    let phoenix_api_key = phoenix_api_key
+        .or_else(|| start_cfg.and_then(|s| s.phoenix.as_ref().and_then(|p| p.api_key.clone())));
+
+    // Extract sink timeouts, OTel service name, and metrics buckets from config.
+    let langfuse_timeout = start_cfg.and_then(|s| s.langfuse.as_ref().and_then(|l| l.timeout));
+    let langsmith_timeout = start_cfg.and_then(|s| s.langsmith.as_ref().and_then(|l| l.timeout));
+    let weave_timeout = start_cfg.and_then(|s| s.weave.as_ref().and_then(|w| w.timeout));
+    let phoenix_timeout = start_cfg.and_then(|s| s.phoenix.as_ref().and_then(|p| p.timeout));
+    let otel_service_name = start_cfg.and_then(|s| s.otel.as_ref().and_then(|o| o.service_name.clone()));
+    let otel_timeout = start_cfg.and_then(|s| s.otel.as_ref().and_then(|o| o.timeout));
+    let metrics_buckets: Option<Vec<u64>> = start_cfg.and_then(|s| s.metrics.as_ref().and_then(|m| m.latency_buckets_ms.clone()));
 
     // Validate upstream URL scheme early — prevent footguns like file:/// or ftp://.
     {
@@ -760,8 +962,16 @@ async fn cmd_start(
         entries
     };
 
-    let store = store::Store::open().context("failed to open trace database")?;
-    let db_path = store::db_path()?;
+    let store = if let Some(ref p) = db_path_override {
+        store::Store::open_at(std::path::Path::new(p)).context("failed to open trace database")?
+    } else {
+        store::Store::open().context("failed to open trace database")?
+    };
+    let db_path = if let Some(ref p) = db_path_override {
+        std::path::PathBuf::from(p)
+    } else {
+        store::db_path()?
+    };
 
     println!("{}", format!("trace v{}", env!("CARGO_PKG_VERSION")).bold());
     println!(
@@ -895,7 +1105,9 @@ async fn cmd_start(
 
     // Build MetricsState if --metrics-port is set.
     let metrics_state: Option<Arc<metrics::MetricsState>> = if metrics_port > 0 {
-        Some(Arc::new(metrics::MetricsState::new()))
+        Some(Arc::new(metrics::MetricsState::with_latency_buckets(
+            metrics_buckets.as_deref(),
+        )))
     } else {
         None
     };
@@ -903,40 +1115,46 @@ async fn cmd_start(
     // Build OtelExporter if --otel-endpoint is set.
     let otel_exporter: Option<Arc<otel::OtelExporter>> = otel_endpoint
         .as_deref()
-        .map(|ep| Arc::new(otel::OtelExporter::new(ep.to_string())));
+        .map(|ep| Arc::new(otel::OtelExporter::with_service_name(
+            ep.to_string(),
+            otel_service_name.as_deref(),
+            otel_timeout,
+        )));
 
     // Build optional external sinks.
     let langfuse_sink: Option<Arc<sink::LangfuseSink>> = match (
         langfuse_public_key.as_deref(),
         langfuse_secret_key.as_deref(),
     ) {
-        (Some(pub_k), Some(sec_k)) => Some(Arc::new(sink::LangfuseSink::new(
+        (Some(pub_k), Some(sec_k)) => Some(Arc::new(sink::LangfuseSink::with_timeout(
             &langfuse_url,
             pub_k,
             sec_k,
+            langfuse_timeout,
         ))),
         _ => None,
     };
 
     let langsmith_sink: Option<Arc<sink::LangSmithSink>> = langsmith_api_key
         .as_deref()
-        .map(|k| Arc::new(sink::LangSmithSink::new(&langsmith_endpoint, k)));
+        .map(|k| Arc::new(sink::LangSmithSink::with_timeout(&langsmith_endpoint, k, langsmith_timeout)));
 
     let weave_sink: Option<Arc<sink::WeaveSink>> =
         match (weave_api_key.as_deref(), weave_project.as_deref()) {
-            (Some(key), Some(proj)) => Some(Arc::new(sink::WeaveSink::new(
+            (Some(key), Some(proj)) => Some(Arc::new(sink::WeaveSink::with_timeout(
                 "https://trace.wandb.ai",
                 key,
                 proj,
+                weave_timeout,
             ))),
             _ => None,
         };
 
     let phoenix_sink: Option<Arc<sink::PhoenixSink>> = phoenix_endpoint
         .as_deref()
-        .map(|ep| Arc::new(sink::PhoenixSink::new(ep, phoenix_api_key.as_deref())));
+        .map(|ep| Arc::new(sink::PhoenixSink::with_timeout(ep, phoenix_api_key.as_deref(), phoenix_timeout)));
 
-    let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(20_000);
+    let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(channel_capacity);
 
     let metrics_writer = metrics_state.clone();
     let otel_writer = otel_exporter.clone();
@@ -1041,6 +1259,19 @@ async fn cmd_start(
         }
     }
 
+    // Build price overrides map from config (same extraction pattern as cmd_prices).
+    let price_overrides: Arc<std::collections::HashMap<String, (f64, f64)>> = Arc::new(
+        start_cfg
+            .and_then(|s| s.prices.as_ref())
+            .map(|prices| {
+                prices
+                    .iter()
+                    .map(|(k, v)| (k.clone(), (v.input, v.output)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
+
     let state = proxy::ProxyState {
         upstream: Arc::new(upstream),
         routes,
@@ -1049,6 +1280,11 @@ async fn cmd_start(
         verbose,
         no_request_bodies,
         redact_fields,
+        max_request_body_bytes,
+        max_stored_response_bytes,
+        max_stored_stream_response_bytes,
+        max_accumulation_bytes,
+        price_overrides,
     };
 
     // Flush DROPPED_RECORDS counter to DB every 10s.
@@ -1165,7 +1401,7 @@ async fn cmd_start(
         .await
         .context("server error")?;
 
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer_handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(graceful_shutdown_timeout), writer_handle).await;
 
     Ok(())
 }
@@ -1209,6 +1445,8 @@ fn cmd_query(
     until: Option<String>,
     status: Option<u16>,
     status_range: Option<(u16, u16)>,
+    agent: Option<String>,
+    workflow: Option<String>,
 ) -> Result<()> {
     let since = since.map(parse_since_ts).transpose()?;
     let until = until.map(parse_until_ts).transpose()?;
@@ -1222,6 +1460,8 @@ fn cmd_query(
         until,
         status,
         status_range,
+        agent,
+        workflow,
     };
     let mut calls = store.query_filtered(limit, &filter)?;
 
@@ -1248,11 +1488,12 @@ fn cmd_query(
         return Ok(());
     }
 
-    print_query_header();
+    let show_agent = calls.iter().any(|c| c.agent_name.is_some());
+    print_query_header_ex(show_agent);
 
     let body_max = if full { usize::MAX } else { 120 };
     for call in &calls {
-        print_call_row(call);
+        print_call_row_ex(call, show_agent);
 
         if let Some(ref err) = call.error {
             println!("  {} {}", "error:".red(), err);
@@ -1293,14 +1534,19 @@ async fn cmd_watch(
     errors: bool,
     status: Option<u16>,
     status_range: Option<(u16, u16)>,
+    agent: Option<String>,
+    workflow: Option<String>,
 ) -> Result<()> {
     let store = store::Store::open().context("failed to open trace database")?;
+    let show_agent = agent.is_some() || workflow.is_some();
     let filter = store::QueryFilter {
         errors_only: errors,
         model,
         provider,
         status,
         status_range,
+        agent,
+        workflow,
         ..Default::default()
     };
 
@@ -1334,7 +1580,8 @@ async fn cmd_watch(
     }
 
     let mut cumulative_cost: f64 = 0.0;
-    print_watch_header(cumulative_cost);
+    let mut saw_agent = show_agent;
+    print_watch_header_ex(cumulative_cost, saw_agent);
     let mut rows_since_header: usize = 0;
 
     loop {
@@ -1357,12 +1604,15 @@ async fn cmd_watch(
 
         let new_records = store.query_after(&last_ts, &filter, 100)?;
         for record in &new_records {
+            if !saw_agent && record.agent_name.is_some() {
+                saw_agent = true;
+            }
             cumulative_cost += record.cost_usd.unwrap_or(0.0);
-            print_call_row(record);
+            print_call_row_ex(record, saw_agent);
             last_ts = record.timestamp.clone();
             rows_since_header += 1;
             if rows_since_header >= 20 {
-                print_watch_header(cumulative_cost);
+                print_watch_header_ex(cumulative_cost, saw_agent);
                 rows_since_header = 0;
             }
         }
@@ -1435,6 +1685,18 @@ fn cmd_show(id: String, no_bodies: bool, tree: bool) -> Result<()> {
             }
             if let Some(ref err) = r.error {
                 println!("  error        {}", err.red());
+            }
+            if let Some(ref tags) = r.tags {
+                println!("  tags         {}", tags.cyan());
+            }
+            if let Some(ref agent) = r.agent_name {
+                println!("  agent        {}", agent.cyan());
+            }
+            if let Some(ref wf) = r.workflow_id {
+                println!("  workflow     {}", wf.cyan());
+            }
+            if let Some(ref span) = r.span_name {
+                println!("  span         {}", span.cyan());
             }
             if no_bodies {
                 println!();
@@ -1740,6 +2002,57 @@ fn cmd_stats(
         }
     }
 
+    // Agent breakdown — show automatically in --breakdown when agents exist.
+    if breakdown {
+        let agent_filter = store::QueryFilter {
+            since: since.clone(),
+            until,
+            provider,
+            ..Default::default()
+        };
+        let agents = store.query_agent_stats(&agent_filter)?;
+        if !agents.is_empty() {
+            println!();
+            println!("{}", "by agent:".bold());
+            println!(
+                "{}",
+                format!(
+                    "  {:<20}  {:>6}  {:>8}  {:>8}  {:>9}  {:>8}  {:>6}",
+                    "agent", "calls", "in", "out", "cost", "avg ms", "errors"
+                )
+                .underline()
+            );
+            for a in &agents {
+                let in_str = if a.total_input_tokens > 0 {
+                    format!("{:>8}", fmt_tokens(a.total_input_tokens))
+                } else {
+                    "       -".to_string()
+                };
+                let out_str = if a.total_output_tokens > 0 {
+                    format!("{:>8}", fmt_tokens(a.total_output_tokens))
+                } else {
+                    "       -".to_string()
+                };
+                let cost_str = format!("${:>8.4}", a.total_cost_usd);
+                let err_str = if a.error_count > 0 {
+                    format!(" ({} err)", a.error_count).red().to_string()
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {:<20}  {:>6}  {}  {}  {}  {:>7.0}ms{}",
+                    truncate(&a.agent_name, 20),
+                    a.calls,
+                    in_str,
+                    out_str,
+                    cost_str.cyan(),
+                    a.avg_latency_ms,
+                    err_str,
+                );
+            }
+        }
+    }
+
     println!();
     println!("Run {} to see recent calls.", "trace query".yellow());
     Ok(())
@@ -1797,6 +2110,7 @@ fn cmd_clear(yes: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_export(
     format: String,
     model: Option<String>,
@@ -1805,6 +2119,8 @@ fn cmd_export(
     until: Option<String>,
     status: Option<u16>,
     status_range: Option<(u16, u16)>,
+    agent: Option<String>,
+    workflow: Option<String>,
 ) -> Result<()> {
     let since = since.map(parse_since_ts).transpose()?;
     let until = until.map(parse_until_ts).transpose()?;
@@ -1818,6 +2134,8 @@ fn cmd_export(
         until,
         status,
         status_range,
+        agent,
+        workflow,
     };
     let records = store.query_all_filtered(&filter)?;
 
@@ -2059,57 +2377,187 @@ fn cmd_config(
                 None => println!("No config file found — showing hardcoded defaults"),
             }
             println!();
-            println!("[start]");
-            if let Some(ref s) = cfg.start {
-                println!(
-                    "  port            = {}",
-                    s.port
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "4000 (default)".to_string())
-                );
-                println!(
-                    "  upstream        = {}",
-                    s.upstream
-                        .as_deref()
-                        .unwrap_or("https://api.openai.com (default)")
-                );
-                if let Some(v) = s.retention_days {
-                    println!("  retention_days  = {}", v);
-                }
-                if let Some(v) = s.metrics_port {
-                    println!("  metrics_port    = {}", v);
-                }
-                if let Some(ref v) = s.otel_endpoint {
-                    println!("  otel_endpoint   = {}", v);
-                }
-                if let Some(ref v) = s.redact_fields {
-                    println!("  redact_fields   = {:?}", v);
-                }
-                if let Some(v) = s.budget_alert_usd {
-                    println!("  budget_alert_usd = {}", v);
-                }
-                if let Some(ref v) = s.budget_period {
-                    println!("  budget_period   = {}", v);
-                }
-                if let Some(ref routes) = s.routes {
-                    for r in routes {
-                        println!("  route           {} -> {}", r.path, r.upstream);
-                    }
-                }
-            } else {
-                println!("  (using all defaults)");
+            let s = cfg.start.as_ref();
+
+            fn cfg_src(has_val: bool) -> &'static str {
+                if has_val { "(config)" } else { "(default)" }
             }
+
+            println!("[start]");
+            println!(
+                "  port                 = {}  {}",
+                s.and_then(|s| s.port).unwrap_or(4000),
+                cfg_src(s.and_then(|s| s.port).is_some())
+            );
+            println!(
+                "  upstream             = {}  {}",
+                s.and_then(|s| s.upstream.as_deref()).unwrap_or("https://api.openai.com"),
+                cfg_src(s.and_then(|s| s.upstream.as_ref()).is_some())
+            );
+            println!(
+                "  retention_days       = {}  {}",
+                s.and_then(|s| s.retention_days).unwrap_or(90),
+                cfg_src(s.and_then(|s| s.retention_days).is_some())
+            );
+            println!(
+                "  db_path              = {}  {}",
+                s.and_then(|s| s.db_path.as_deref()).unwrap_or("~/.trace/trace.db"),
+                cfg_src(s.and_then(|s| s.db_path.as_ref()).is_some())
+            );
+            println!(
+                "  channel_capacity     = {}  {}",
+                s.and_then(|s| s.channel_capacity).unwrap_or(20_000),
+                cfg_src(s.and_then(|s| s.channel_capacity).is_some())
+            );
+            println!(
+                "  graceful_shutdown    = {}s  {}",
+                s.and_then(|s| s.graceful_shutdown_timeout).unwrap_or(5),
+                cfg_src(s.and_then(|s| s.graceful_shutdown_timeout).is_some())
+            );
+            println!();
+            println!("  Body limits:");
+            println!(
+                "    max_request_body   = {} bytes  {}",
+                s.and_then(|s| s.max_request_body_bytes).unwrap_or(16 * 1024 * 1024),
+                cfg_src(s.and_then(|s| s.max_request_body_bytes).is_some())
+            );
+            println!(
+                "    max_stored_resp    = {} bytes  {}",
+                s.and_then(|s| s.max_stored_response_bytes).unwrap_or(10 * 1024 * 1024),
+                cfg_src(s.and_then(|s| s.max_stored_response_bytes).is_some())
+            );
+            println!(
+                "    max_stored_stream  = {} bytes  {}",
+                s.and_then(|s| s.max_stored_stream_bytes).unwrap_or(256 * 1024),
+                cfg_src(s.and_then(|s| s.max_stored_stream_bytes).is_some())
+            );
+            println!(
+                "    max_accumulation   = {} bytes  {}",
+                s.and_then(|s| s.max_accumulation_bytes).unwrap_or(4 * 1024 * 1024),
+                cfg_src(s.and_then(|s| s.max_accumulation_bytes).is_some())
+            );
+            println!();
+            println!("  SQLite:");
+            let sq = s.and_then(|s| s.sqlite.as_ref());
+            println!(
+                "    busy_timeout       = {}ms  {}",
+                sq.and_then(|q| q.busy_timeout).unwrap_or(5000),
+                cfg_src(sq.and_then(|q| q.busy_timeout).is_some())
+            );
+            println!(
+                "    cache_size         = {} KB  {}",
+                sq.and_then(|q| q.cache_size_kb).unwrap_or(32000),
+                cfg_src(sq.and_then(|q| q.cache_size_kb).is_some())
+            );
+            println!(
+                "    mmap_size          = {} MB  {}",
+                sq.and_then(|q| q.mmap_size_mb).unwrap_or(64),
+                cfg_src(sq.and_then(|q| q.mmap_size_mb).is_some())
+            );
+            println!(
+                "    sync_mode          = {}  {}",
+                sq.and_then(|q| q.sync_mode.as_deref()).unwrap_or("NORMAL"),
+                cfg_src(sq.and_then(|q| q.sync_mode.as_ref()).is_some())
+            );
+            println!();
+            println!("  OTel:");
+            let ot = s.and_then(|s| s.otel.as_ref());
+            println!(
+                "    endpoint           = {}",
+                s.and_then(|s| s.otel_endpoint.as_deref())
+                    .or_else(|| ot.and_then(|o| o.endpoint.as_deref()))
+                    .unwrap_or("(not set)")
+            );
+            println!(
+                "    service_name       = {}  {}",
+                ot.and_then(|o| o.service_name.as_deref()).unwrap_or("opentrace"),
+                cfg_src(ot.and_then(|o| o.service_name.as_ref()).is_some())
+            );
+            println!();
+            println!("  Metrics:");
+            let mt = s.and_then(|s| s.metrics.as_ref());
+            println!(
+                "    port               = {}  {}",
+                s.and_then(|s| s.metrics_port)
+                    .or_else(|| mt.and_then(|m| m.port))
+                    .unwrap_or(0),
+                cfg_src(s.and_then(|s| s.metrics_port).or_else(|| mt.and_then(|m| m.port)).is_some())
+            );
+            if let Some(ref v) = s.and_then(|s| s.redact_fields.clone()) {
+                println!("  redact_fields        = {:?}", v);
+            }
+            if let Some(v) = s.and_then(|s| s.budget_alert_usd) {
+                println!(
+                    "  budget               = ${:.2} / {}",
+                    v,
+                    s.and_then(|s| s.budget_period.as_deref()).unwrap_or("month")
+                );
+            }
+            if let Some(ref routes) = s.and_then(|s| s.routes.clone()) {
+                println!();
+                println!("  Routes:");
+                for r in routes {
+                    println!("    {} -> {}", r.path, r.upstream);
+                }
+            }
+            // Sinks
+            println!();
+            println!("  Sinks:");
+            let lf = s.and_then(|s| s.langfuse.as_ref());
+            let ls = s.and_then(|s| s.langsmith.as_ref());
+            let wv = s.and_then(|s| s.weave.as_ref());
+            let px = s.and_then(|s| s.phoenix.as_ref());
+            if lf.and_then(|l| l.public_key.as_ref()).is_some() {
+                println!(
+                    "    langfuse           = {}",
+                    lf.and_then(|l| l.url.as_deref()).unwrap_or("https://cloud.langfuse.com")
+                );
+            }
+            if ls.and_then(|l| l.api_key.as_ref()).is_some() {
+                println!(
+                    "    langsmith          = {}",
+                    ls.and_then(|l| l.endpoint.as_deref()).unwrap_or("https://api.smith.langchain.com")
+                );
+            }
+            if wv.and_then(|w| w.api_key.as_ref()).is_some() {
+                println!("    weave              = configured");
+            }
+            if px.and_then(|p| p.endpoint.as_ref()).is_some() {
+                println!(
+                    "    phoenix            = {}",
+                    px.and_then(|p| p.endpoint.as_deref()).unwrap_or("(not set)")
+                );
+            }
+            if lf.and_then(|l| l.public_key.as_ref()).is_none()
+                && ls.and_then(|l| l.api_key.as_ref()).is_none()
+                && wv.and_then(|w| w.api_key.as_ref()).is_none()
+                && px.and_then(|p| p.endpoint.as_ref()).is_none()
+            {
+                println!("    (none configured)");
+            }
+
+            // Pricing overrides
+            if let Some(ref prices) = s.and_then(|s| s.prices.clone()) {
+                println!();
+                println!("  Price overrides:");
+                for (model, entry) in prices {
+                    println!(
+                        "    {:<28}  in=${:.2}/MTok  out=${:.2}/MTok",
+                        model, entry.input, entry.output
+                    );
+                }
+            }
+
             println!();
             println!("[serve]");
-            if let Some(ref s) = cfg.serve {
+            if let Some(ref sv) = cfg.serve {
                 println!(
-                    "  port = {}",
-                    s.port
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "8080 (default)".to_string())
+                    "  port = {}  {}",
+                    sv.port.unwrap_or(8080),
+                    cfg_src(sv.port.is_some())
                 );
             } else {
-                println!("  (using all defaults)");
+                println!("  port = 8080  (default)");
             }
         }
         ConfigAction::Init => {
@@ -2210,6 +2658,110 @@ fn print_call_row(call: &store::CallRecord) {
         id_short,
         ts,
         model_short,
+        status_str,
+        error_tag,
+        latency_str,
+        ttft_str,
+        in_str,
+        out_str,
+        cost_str
+    );
+}
+
+/// Extended query header: adds an "agent" column when `show_agent` is true.
+fn print_query_header_ex(show_agent: bool) {
+    if show_agent {
+        println!(
+            "{}",
+            format!(
+                "{:<8}  {:<19}  {:<22}  {:<14}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
+                "id", "timestamp", "model", "agent", "status", "latency", "ttft", "in", "out", "cost"
+            )
+            .bold()
+            .underline()
+        );
+    } else {
+        print_query_header();
+    }
+}
+
+/// Extended watch header: adds an "agent" column when `show_agent` is true.
+fn print_watch_header_ex(cumulative_cost: f64, show_agent: bool) {
+    let cost_str = if cumulative_cost > 0.0 {
+        format!("  session cost ${:.4}", cumulative_cost)
+    } else {
+        String::new()
+    };
+    if show_agent {
+        println!(
+            "{}{}",
+            format!(
+                "{:<8}  {:<19}  {:<22}  {:<14}  {:>6}  {:>8}  {:>7}  {:>6}  {:>6}  {:>9}",
+                "id", "timestamp", "model", "agent", "status", "latency", "ttft", "in", "out", "cost"
+            )
+            .bold()
+            .underline(),
+            cost_str.dimmed()
+        );
+    } else {
+        print_watch_header(cumulative_cost);
+    }
+}
+
+/// Extended call row: adds an "agent" column when `show_agent` is true.
+fn print_call_row_ex(call: &store::CallRecord, show_agent: bool) {
+    if !show_agent {
+        print_call_row(call);
+        return;
+    }
+    let id_short = if call.id.len() >= 8 {
+        &call.id[..8]
+    } else {
+        &call.id
+    };
+    let ts = call.timestamp.get(..19).unwrap_or(&call.timestamp);
+    let model_short = truncate(&call.model, 22);
+    let agent_short = truncate(
+        call.agent_name.as_deref().unwrap_or("-"),
+        14,
+    );
+    let is_error = call.status_code == 0 || call.status_code >= 400 || call.error.is_some();
+    let error_tag = if is_error {
+        capture::classify_error(call)
+            .map(|tag| format!(" [{}]", tag).red().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let status_str = if is_error {
+        format!("{:>6}", call.status_code).red().to_string()
+    } else {
+        format!("{:>6}", call.status_code).green().to_string()
+    };
+    let latency_str = format!("{:>6}ms", call.latency_ms);
+    let ttft_str = call
+        .ttft_ms
+        .map(|t| format!("{:>5}ms", t))
+        .unwrap_or_else(|| format!("{:>7}", "-"));
+    let in_str = call
+        .input_tokens
+        .map(|t| format!("{:>6}", t))
+        .unwrap_or_else(|| "     -".to_string());
+    let out_str = call
+        .output_tokens
+        .map(|t| format!("{:>6}", t))
+        .unwrap_or_else(|| "     -".to_string());
+    let cost_str = call
+        .cost_usd
+        .map(|c| format!("${:>8.4}", c))
+        .unwrap_or_else(|| "         -".to_string());
+
+    println!(
+        "{:<8}  {:<19}  {:<22}  {:<14}  {}{}  {}  {}  {}  {}  {}",
+        id_short,
+        ts,
+        model_short,
+        agent_short,
         status_str,
         error_tag,
         latency_str,
@@ -2725,6 +3277,383 @@ async fn cmd_replay(
     Ok(())
 }
 
+fn cmd_workflow(id: String, json: bool) -> Result<()> {
+    let store = store::Store::open().context("failed to open trace database")?;
+    let calls = store.query_workflow(&id)?;
+
+    if calls.is_empty() {
+        println!(
+            "{}",
+            format!("No calls found for workflow_id: {}", id).red()
+        );
+        return Ok(());
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&calls)?);
+        return Ok(());
+    }
+
+    println!("{} {}", "workflow".bold(), id.cyan());
+    println!();
+
+    // Build a parent_id -> children map for indentation.
+    let id_set: std::collections::HashSet<&str> =
+        calls.iter().map(|c| c.id.as_str()).collect();
+    for call in &calls {
+        let is_child = call
+            .parent_id
+            .as_deref()
+            .map(|pid| id_set.contains(pid))
+            .unwrap_or(false);
+        let indent = if is_child { "  └ " } else { "  " };
+
+        let id_short = if call.id.len() >= 8 {
+            &call.id[..8]
+        } else {
+            &call.id
+        };
+        let ts = call.timestamp.get(..19).unwrap_or(&call.timestamp);
+        let agent = call.agent_name.as_deref().unwrap_or("-");
+        let span = call.span_name.as_deref().unwrap_or("");
+        let span_str = if span.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", span)
+        };
+        let is_error = call.status_code == 0 || call.status_code >= 400 || call.error.is_some();
+        let status_str = if is_error {
+            call.status_code.to_string().red().to_string()
+        } else {
+            call.status_code.to_string().green().to_string()
+        };
+        let cost_str = call
+            .cost_usd
+            .map(|c| format!("${:.4}", c))
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "{}{} {} {} {}ms {} {}{}",
+            indent,
+            id_short.to_string().cyan(),
+            ts.to_string().dimmed(),
+            truncate(&call.model, 22),
+            call.latency_ms,
+            status_str,
+            cost_str,
+            format!("  [{agent}]{span_str}").dimmed(),
+        );
+    }
+
+    // Summary
+    let total_cost: f64 = calls.iter().filter_map(|c| c.cost_usd).sum();
+    let total_latency: u64 = calls.iter().map(|c| c.latency_ms).sum();
+    let unique_agents: std::collections::HashSet<&str> = calls
+        .iter()
+        .filter_map(|c| c.agent_name.as_deref())
+        .collect();
+    let error_count = calls
+        .iter()
+        .filter(|c| c.status_code == 0 || c.status_code >= 400 || c.error.is_some())
+        .count();
+
+    println!();
+    println!("{}", "summary:".bold());
+    println!("  calls      {}", calls.len().to_string().cyan());
+    println!("  cost       {}", format!("${:.4}", total_cost).cyan());
+    println!("  latency    {}ms", total_latency.to_string().cyan());
+    if !unique_agents.is_empty() {
+        let agents_str: Vec<&str> = unique_agents.into_iter().collect();
+        println!(
+            "  agents     {} ({})",
+            agents_str.len().to_string().cyan(),
+            agents_str.join(", ")
+        );
+    }
+    if error_count > 0 {
+        println!(
+            "  errors     {}",
+            error_count.to_string().red()
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_prices(
+    unknown: bool,
+    check: bool,
+    update: bool,
+    json: bool,
+    cfg: &config::TraceConfig,
+) -> Result<()> {
+    let start_cfg = cfg.start.as_ref();
+
+    // Collect all bundled prices from the match table.
+    // We call model_prices() for each known model string.
+    let bundled = capture::list_bundled_prices();
+
+    // Config-level price overrides.
+    let config_overrides: std::collections::HashMap<String, (f64, f64)> = start_cfg
+        .and_then(|s| s.prices.as_ref())
+        .map(|prices| {
+            prices
+                .iter()
+                .map(|(k, v)| (k.clone(), (v.input, v.output)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if update {
+        match capture::fetch_litellm_prices().await {
+            Ok(prices) => {
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| ".".to_string());
+                let cache_path = std::path::PathBuf::from(home)
+                    .join(".trace")
+                    .join("prices.json");
+                capture::save_price_cache(&prices, &cache_path)?;
+                println!("Updated {} model prices from LiteLLM community database.", prices.len());
+                println!("Saved to: {}", cache_path.display());
+            }
+            Err(e) => {
+                eprintln!("Failed to fetch LiteLLM prices: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    if unknown {
+        // Query DB for distinct models, find those without known pricing.
+        let store = store::Store::open().context("failed to open trace database")?;
+        let db_models: Vec<String> = store.stats_by_model()?.into_iter().map(|m| m.model).collect();
+
+        let unknown_models: Vec<&String> = db_models
+            .iter()
+            .filter(|m| {
+                !config_overrides.contains_key(m.as_str())
+                    && !capture::is_known_model(m)
+            })
+            .collect();
+
+        if json {
+            println!("{}", serde_json::to_string_pretty(&unknown_models)?);
+            return Ok(());
+        }
+
+        if unknown_models.is_empty() {
+            println!("All models in your database have known pricing.");
+        } else {
+            println!(
+                "{} model(s) with no known pricing:",
+                unknown_models.len().to_string().yellow()
+            );
+            println!();
+            println!(
+                "{}",
+                format!("  {:<40}  {}", "model", "suggestion").bold().underline()
+            );
+            for m in &unknown_models {
+                let (in_p, out_p) = capture::model_prices(m);
+                println!(
+                    "  {:<40}  fallback ${:.2}/${:.2} per MTok",
+                    m, in_p, out_p
+                );
+            }
+            println!();
+            println!(
+                "Add pricing overrides in your config file under [start.prices.MODEL_NAME]"
+            );
+        }
+        return Ok(());
+    }
+
+    if check {
+        // Combined view: show all DB models + bundled, with source column.
+        let store = store::Store::open().context("failed to open trace database")?;
+        let db_models: Vec<String> = store.stats_by_model()?.into_iter().map(|m| m.model).collect();
+
+        // Merge: all DB models + all bundled models
+        let mut all_models: Vec<String> = db_models.clone();
+        for (name, _, _) in &bundled {
+            if !all_models.iter().any(|m| m == name) {
+                all_models.push(name.to_string());
+            }
+        }
+        all_models.sort();
+
+        if json {
+            let entries: Vec<serde_json::Value> = all_models
+                .iter()
+                .map(|m| {
+                    let (source, inp, outp) = if config_overrides.contains_key(m.as_str()) {
+                        let (i, o) = config_overrides[m.as_str()];
+                        ("config", i, o)
+                    } else if capture::is_known_model(m) {
+                        let (i, o) = capture::model_prices(m);
+                        ("bundled", i, o)
+                    } else {
+                        let (i, o) = capture::model_prices(m);
+                        ("fallback", i, o)
+                    };
+                    let in_db = db_models.contains(m);
+                    serde_json::json!({
+                        "model": m,
+                        "source": source,
+                        "input_per_mtok": inp,
+                        "output_per_mtok": outp,
+                        "in_db": in_db,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            return Ok(());
+        }
+
+        println!("{}", "trace prices --check".bold());
+        println!();
+        println!(
+            "{}",
+            format!(
+                "  {:<40}  {:>10}  {:>11}  {:<10}  {}",
+                "model", "in/MTok", "out/MTok", "source", "in DB"
+            )
+            .bold()
+            .underline()
+        );
+        for m in &all_models {
+            let (source, inp, outp) = if config_overrides.contains_key(m.as_str()) {
+                let (i, o) = config_overrides[m.as_str()];
+                ("config", i, o)
+            } else if capture::is_known_model(m) {
+                let (i, o) = capture::model_prices(m);
+                ("bundled", i, o)
+            } else {
+                let (i, o) = capture::model_prices(m);
+                ("fallback", i, o)
+            };
+            let in_db = if db_models.contains(m) { "yes" } else { "" };
+            let source_str = match source {
+                "fallback" => source.red().to_string(),
+                "config" => source.yellow().to_string(),
+                _ => source.to_string(),
+            };
+            println!(
+                "  {:<40}  ${:>8.2}  ${:>9.2}  {:<10}  {}",
+                truncate(m, 40),
+                inp,
+                outp,
+                source_str,
+                in_db
+            );
+        }
+        return Ok(());
+    }
+
+    // Default: list all bundled prices.
+    if json {
+        let entries: Vec<serde_json::Value> = bundled
+            .iter()
+            .map(|(name, inp, outp)| {
+                serde_json::json!({
+                    "model": name,
+                    "input_per_mtok": inp,
+                    "output_per_mtok": outp,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+
+    println!("{}", "trace prices".bold());
+    println!();
+    println!(
+        "{}",
+        format!(
+            "  {:<40}  {:>10}  {:>11}",
+            "model", "in/MTok", "out/MTok"
+        )
+        .bold()
+        .underline()
+    );
+    for (name, inp, outp) in &bundled {
+        println!("  {:<40}  ${:>8.2}  ${:>9.2}", name, inp, outp);
+    }
+    if !config_overrides.is_empty() {
+        println!();
+        println!("{}", "Config overrides:".bold());
+        for (name, (inp, outp)) in &config_overrides {
+            println!(
+                "  {:<40}  ${:>8.2}  ${:>9.2}  {}",
+                name,
+                inp,
+                outp,
+                "(config)".yellow()
+            );
+        }
+    }
+    println!();
+    println!(
+        "Showing {} bundled model prices. Use {} to check your DB models.",
+        bundled.len(),
+        "--check".yellow()
+    );
+    Ok(())
+}
+
+fn cmd_agents(since: Option<String>, until: Option<String>) -> Result<()> {
+    let since = since.map(parse_since_ts).transpose()?;
+    let until = until.map(parse_until_ts).transpose()?;
+
+    let store = store::Store::open().context("failed to open trace database")?;
+    let filter = store::QueryFilter {
+        since,
+        until,
+        ..Default::default()
+    };
+    let agents = store.query_agent_stats(&filter)?;
+
+    if agents.is_empty() {
+        println!(
+            "{}",
+            "No agent data found. Set X-Trace-Agent header on LLM calls to populate."
+                .dimmed()
+        );
+        return Ok(());
+    }
+
+    println!("{}", "trace agents".bold());
+    println!();
+    println!(
+        "{}",
+        format!(
+            "  {:<20}  {:>6}  {:>9}  {:>8}  {:>6}",
+            "agent", "calls", "cost", "avg ms", "errors"
+        )
+        .underline()
+    );
+    for a in &agents {
+        let cost_str = format!("${:>8.4}", a.total_cost_usd);
+        let err_str = if a.error_count > 0 {
+            a.error_count.to_string().red().to_string()
+        } else {
+            "0".to_string()
+        };
+        println!(
+            "  {:<20}  {:>6}  {}  {:>7.0}ms  {}",
+            truncate(&a.agent_name, 20),
+            a.calls,
+            cost_str.cyan(),
+            a.avg_latency_ms,
+            err_str,
+        );
+    }
+    Ok(())
+}
+
 fn parse_since_ts(s: String) -> Result<String> {
     if chrono::DateTime::parse_from_rfc3339(&s).is_ok() {
         return Ok(s);
@@ -2923,6 +3852,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 
@@ -3004,6 +3936,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

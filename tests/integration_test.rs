@@ -72,6 +72,11 @@ async fn start_proxy(upstream_url: String, db_path: &Path) -> u16 {
         verbose: false,
         no_request_bodies: false,
         redact_fields: vec![],
+        max_request_body_bytes: proxy::DEFAULT_MAX_REQUEST_BODY_BYTES,
+        max_stored_response_bytes: proxy::DEFAULT_MAX_STORED_RESPONSE_BYTES,
+        max_stored_stream_response_bytes: proxy::DEFAULT_MAX_STORED_STREAM_RESPONSE_BYTES,
+        max_accumulation_bytes: proxy::DEFAULT_MAX_ACCUMULATION_BYTES,
+        price_overrides: std::sync::Arc::new(std::collections::HashMap::new()),
     };
 
     let app = proxy::router(state);
@@ -590,6 +595,11 @@ async fn start_proxy_with_routes(
         verbose: false,
         no_request_bodies: false,
         redact_fields: vec![],
+        max_request_body_bytes: proxy::DEFAULT_MAX_REQUEST_BODY_BYTES,
+        max_stored_response_bytes: proxy::DEFAULT_MAX_STORED_RESPONSE_BYTES,
+        max_stored_stream_response_bytes: proxy::DEFAULT_MAX_STORED_STREAM_RESPONSE_BYTES,
+        max_accumulation_bytes: proxy::DEFAULT_MAX_ACCUMULATION_BYTES,
+        price_overrides: std::sync::Arc::new(std::collections::HashMap::new()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -929,6 +939,9 @@ async fn retention_prunes_old_records() {
         parent_id: None,
         prompt_hash: None,
         tags: None,
+        agent_name: None,
+        workflow_id: None,
+        span_name: None,
     };
     store.insert(&old).unwrap();
 

@@ -18,14 +18,28 @@ pub struct PhoenixSink {
     client: reqwest::Client,
 }
 
+/// Default timeout for Phoenix HTTP requests (seconds).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
 impl PhoenixSink {
     /// Create a new sink.
     ///
     /// `phoenix_url` defaults to `http://localhost:6006` for local Phoenix.
     /// `api_key` is optional — required for Arize Phoenix cloud.
+    #[allow(dead_code)]
     pub fn new(phoenix_url: &str, api_key: Option<&str>) -> Self {
+        Self::with_timeout(phoenix_url, api_key, None)
+    }
+
+    /// Create a new sink with optional custom timeout (seconds).
+    pub fn with_timeout(
+        phoenix_url: &str,
+        api_key: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Self {
+        let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(timeout))
             .build()
             .unwrap_or_default();
         PhoenixSink {
@@ -55,6 +69,13 @@ impl PhoenixSink {
         }
         if let (Some(i), Some(o)) = (record.input_tokens, record.output_tokens) {
             attrs.push(json!({"key": "llm.token_count.total", "value": {"intValue": i + o}}));
+        }
+
+        if let Some(ref agent) = record.agent_name {
+            attrs.push(json!({"key": "llm.agent_name", "value": {"stringValue": agent}}));
+        }
+        if let Some(ref wf) = record.workflow_id {
+            attrs.push(json!({"key": "session.id", "value": {"stringValue": wf}}));
         }
 
         if let Some(ref body) = record.request_body {
@@ -216,6 +237,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

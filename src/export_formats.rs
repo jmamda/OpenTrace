@@ -31,33 +31,48 @@ pub fn to_langfuse_line(r: &CallRecord) -> String {
         "DEFAULT"
     };
 
+    let mut metadata = json!({
+        "provider": r.provider,
+        "endpoint": r.endpoint,
+        "status_code": r.status_code,
+        "cost_usd": r.cost_usd,
+        "latency_ms": r.latency_ms
+    });
+    if let Some(ref agent) = r.agent_name {
+        metadata["agent_name"] = json!(agent);
+    }
+    if let Some(ref wf) = r.workflow_id {
+        metadata["workflow_id"] = json!(wf);
+    }
+
+    let mut body = json!({
+        "id": r.id,
+        "traceId": r.id,
+        "name": "llm-call",
+        "startTime": r.timestamp,
+        "endTime": end_time,
+        "model": r.model,
+        "input": req_body,
+        "output": resp_body,
+        "usage": {
+            "input": input_tokens,
+            "output": output_tokens,
+            "total": total_tokens
+        },
+        "metadata": metadata,
+        "level": level
+    });
+
+    // Use workflow_id as Langfuse traceId when present (correlates calls)
+    if let Some(ref wf) = r.workflow_id {
+        body["traceId"] = json!(wf);
+    }
+
     let v = json!({
         "batch": [{
             "id": Uuid::new_v4().to_string(),
             "type": "generation-create",
-            "body": {
-                "id": r.id,
-                "traceId": r.id,
-                "name": "llm-call",
-                "startTime": r.timestamp,
-                "endTime": end_time,
-                "model": r.model,
-                "input": req_body,
-                "output": resp_body,
-                "usage": {
-                    "input": input_tokens,
-                    "output": output_tokens,
-                    "total": total_tokens
-                },
-                "metadata": {
-                    "provider": r.provider,
-                    "endpoint": r.endpoint,
-                    "status_code": r.status_code,
-                    "cost_usd": r.cost_usd,
-                    "latency_ms": r.latency_ms
-                },
-                "level": level
-            }
+            "body": body
         }]
     });
     serde_json::to_string(&v).unwrap_or_default()
@@ -73,6 +88,23 @@ pub fn to_langsmith_line(r: &CallRecord) -> String {
     let inputs = parse_body(r.request_body.as_deref());
     let outputs = parse_body(r.response_body.as_deref());
 
+    let mut tags = vec![json!("opentrace"), json!(&r.provider)];
+    if let Some(ref agent) = r.agent_name {
+        tags.push(json!(agent));
+    }
+
+    let mut extra = json!({
+        "model": r.model,
+        "provider": r.provider,
+        "input_tokens": r.input_tokens,
+        "output_tokens": r.output_tokens,
+        "cost_usd": r.cost_usd,
+        "status_code": r.status_code
+    });
+    if let Some(ref wf) = r.workflow_id {
+        extra["workflow_id"] = json!(wf);
+    }
+
     let v = json!({
         "id": r.id,
         "name": "llm-call",
@@ -81,17 +113,10 @@ pub fn to_langsmith_line(r: &CallRecord) -> String {
         "outputs": {"output": outputs},
         "start_time": start_ms,
         "end_time": end_ms,
-        "extra": {
-            "model": r.model,
-            "provider": r.provider,
-            "input_tokens": r.input_tokens,
-            "output_tokens": r.output_tokens,
-            "cost_usd": r.cost_usd,
-            "status_code": r.status_code
-        },
+        "extra": extra,
         "error": r.error,
         "session_name": "opentrace",
-        "tags": ["opentrace", r.provider]
+        "tags": tags
     });
     serde_json::to_string(&v).unwrap_or_default()
 }
@@ -107,6 +132,20 @@ pub fn to_weave_line(r: &CallRecord) -> String {
     let prompt_tokens = r.input_tokens.unwrap_or(0);
     let completion_tokens = r.output_tokens.unwrap_or(0);
     let total_tokens = prompt_tokens + completion_tokens;
+
+    let mut attributes = json!({
+        "provider": r.provider,
+        "endpoint": r.endpoint,
+        "status_code": r.status_code,
+        "cost_usd": r.cost_usd,
+        "latency_ms": r.latency_ms
+    });
+    if let Some(ref agent) = r.agent_name {
+        attributes["agent_name"] = json!(agent);
+    }
+    if let Some(ref wf) = r.workflow_id {
+        attributes["workflow_id"] = json!(wf);
+    }
 
     let v = json!({
         "calls": [{
@@ -129,13 +168,7 @@ pub fn to_weave_line(r: &CallRecord) -> String {
                     }
                 }
             },
-            "attributes": {
-                "provider": r.provider,
-                "endpoint": r.endpoint,
-                "status_code": r.status_code,
-                "cost_usd": r.cost_usd,
-                "latency_ms": r.latency_ms
-            }
+            "attributes": attributes
         }]
     });
     serde_json::to_string(&v).unwrap_or_default()
@@ -217,6 +250,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

@@ -163,6 +163,9 @@ fn make_record(id: &str) -> CallRecord {
         parent_id: None,
         prompt_hash: None,
         tags: None,
+        agent_name: None,
+        workflow_id: None,
+        span_name: None,
     }
 }
 

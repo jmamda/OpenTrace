@@ -16,14 +16,24 @@ pub struct LangSmithSink {
     client: reqwest::Client,
 }
 
+/// Default timeout for LangSmith HTTP requests (seconds).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
 impl LangSmithSink {
     /// Create a new sink.
     ///
     /// `base_url` defaults to `https://api.smith.langchain.com`;
     /// override via `--langsmith-endpoint` for self-hosted.
+    #[allow(dead_code)]
     pub fn new(base_url: &str, api_key: &str) -> Self {
+        Self::with_timeout(base_url, api_key, None)
+    }
+
+    /// Create a new sink with optional custom timeout (seconds).
+    pub fn with_timeout(base_url: &str, api_key: &str, timeout_secs: Option<u64>) -> Self {
+        let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(timeout))
             .build()
             .unwrap_or_default();
         LangSmithSink {
@@ -41,6 +51,23 @@ impl LangSmithSink {
         let inputs = parse_body(record.request_body.as_deref());
         let outputs = parse_body(record.response_body.as_deref());
 
+        let mut tags = vec![json!("opentrace"), json!(&record.provider)];
+        if let Some(ref agent) = record.agent_name {
+            tags.push(json!(agent));
+        }
+
+        let mut extra = json!({
+            "model": record.model,
+            "provider": record.provider,
+            "input_tokens": record.input_tokens,
+            "output_tokens": record.output_tokens,
+            "cost_usd": record.cost_usd,
+            "status_code": record.status_code
+        });
+        if let Some(ref wf) = record.workflow_id {
+            extra["workflow_id"] = json!(wf);
+        }
+
         let payload = json!({
             "id": record.id,
             "name": "llm-call",
@@ -49,17 +76,10 @@ impl LangSmithSink {
             "outputs": {"output": outputs},
             "start_time": start_ms,
             "end_time": end_ms,
-            "extra": {
-                "model": record.model,
-                "provider": record.provider,
-                "input_tokens": record.input_tokens,
-                "output_tokens": record.output_tokens,
-                "cost_usd": record.cost_usd,
-                "status_code": record.status_code
-            },
+            "extra": extra,
             "error": record.error,
             "session_name": "opentrace",
-            "tags": ["opentrace", record.provider]
+            "tags": tags
         });
 
         let body = serde_json::to_string(&payload).unwrap_or_default();
@@ -137,6 +157,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

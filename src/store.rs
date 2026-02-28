@@ -4,6 +4,8 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::config::SqliteConfig;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CallRecord {
     pub id: String,
@@ -25,6 +27,9 @@ pub struct CallRecord {
     pub parent_id: Option<String>,
     pub prompt_hash: Option<String>,
     pub tags: Option<String>,
+    pub agent_name: Option<String>,
+    pub workflow_id: Option<String>,
+    pub span_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +118,34 @@ pub struct QueryFilter {
     pub until: Option<String>,
     pub status: Option<u16>,
     pub status_range: Option<(u16, u16)>,
+    /// Filter by agent name (substring match, e.g. "planner", "coder").
+    pub agent: Option<String>,
+    /// Filter by workflow ID (exact match).
+    pub workflow: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AgentStats {
+    pub agent_name: String,
+    pub calls: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cost_usd: f64,
+    pub avg_latency_ms: f64,
+    pub error_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkflowSummary {
+    pub workflow_id: String,
+    pub calls: i64,
+    pub total_cost_usd: f64,
+    pub total_latency_ms: i64,
+    pub agents: i64,
+    pub error_count: i64,
+    pub first_call: String,
+    pub last_call: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,6 +199,7 @@ fn build_status_clause(status: &Option<u16>, status_range: &Option<(u16, u16)>) 
 ///   11=request_body  12=response_body  13=error
 ///   14=provider_request_id  15=trace_id  16=parent_id
 ///   17=prompt_hash  18=tags
+///   19=agent_name  20=workflow_id  21=span_name
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     Ok(CallRecord {
         id: row.get(0)?,
@@ -187,6 +221,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
         parent_id: row.get(16)?,
         prompt_hash: row.get(17)?,
         tags: row.get(18)?,
+        agent_name: row.get(19)?,
+        workflow_id: row.get(20)?,
+        span_name: row.get(21)?,
     })
 }
 
@@ -195,7 +232,8 @@ const SELECT_COLS: &str = "
     status_code, latency_ms, ttft_ms,
     input_tokens, output_tokens, cost_usd,
     request_body, response_body, error,
-    provider_request_id, trace_id, parent_id, prompt_hash, tags";
+    provider_request_id, trace_id, parent_id, prompt_hash, tags,
+    agent_name, workflow_id, span_name";
 
 /// Same columns as SELECT_COLS but table-qualified for use in JOINs
 /// where bare column names (e.g. `id`) would be ambiguous.
@@ -204,7 +242,8 @@ const SELECT_COLS_CALLS: &str = "
     calls.status_code, calls.latency_ms, calls.ttft_ms,
     calls.input_tokens, calls.output_tokens, calls.cost_usd,
     calls.request_body, calls.response_body, calls.error,
-    calls.provider_request_id, calls.trace_id, calls.parent_id, calls.prompt_hash, calls.tags";
+    calls.provider_request_id, calls.trace_id, calls.parent_id, calls.prompt_hash, calls.tags,
+    calls.agent_name, calls.workflow_id, calls.span_name";
 
 /// Escape a raw user query into a valid FTS5 MATCH expression.
 ///
@@ -224,6 +263,12 @@ fn fts5_escape(query: &str) -> String {
         .join(" ")
 }
 
+/// Default SQLite pragma values (used when no config override is provided).
+pub const DEFAULT_BUSY_TIMEOUT: u32 = 5000;
+pub const DEFAULT_CACHE_SIZE_KB: u32 = 32000;
+pub const DEFAULT_MMAP_SIZE_MB: u32 = 64;
+pub const DEFAULT_SYNC_MODE: &str = "NORMAL";
+
 impl Store {
     /// Open an in-memory SQLite database.
     /// This avoids touching the filesystem and keeps every test isolated.
@@ -234,7 +279,7 @@ impl Store {
             conn,
             path: PathBuf::from(":memory:"),
         };
-        store.init()?;
+        store.init(None)?;
         Ok(store)
     }
 
@@ -250,12 +295,23 @@ impl Store {
             conn,
             path: path.to_path_buf(),
         };
-        store.init()?;
+        store.init(None)?;
         Ok(store)
     }
 
     pub fn open() -> Result<Self> {
-        let db_path = db_path()?;
+        Self::open_with_config(None, None)
+    }
+
+    /// Open the database with optional custom path and SQLite tuning config.
+    pub fn open_with_config(
+        custom_db_path: Option<&str>,
+        sqlite_config: Option<&SqliteConfig>,
+    ) -> Result<Self> {
+        let db_path = match custom_db_path {
+            Some(p) => PathBuf::from(p),
+            None => db_path()?,
+        };
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).context("failed to create .trace directory")?;
         }
@@ -274,19 +330,39 @@ impl Store {
             conn,
             path: db_path,
         };
-        store.init()?;
+        store.init(sqlite_config)?;
         Ok(store)
     }
 
-    fn init(&self) -> Result<()> {
+    fn init(&self, sqlite_config: Option<&SqliteConfig>) -> Result<()> {
+        let busy_timeout = sqlite_config
+            .and_then(|c| c.busy_timeout)
+            .unwrap_or(DEFAULT_BUSY_TIMEOUT);
+        let cache_size_kb = sqlite_config
+            .and_then(|c| c.cache_size_kb)
+            .unwrap_or(DEFAULT_CACHE_SIZE_KB);
+        let mmap_size_bytes = sqlite_config
+            .and_then(|c| c.mmap_size_mb)
+            .unwrap_or(DEFAULT_MMAP_SIZE_MB) as u64
+            * 1024
+            * 1024;
+        let sync_mode = sqlite_config
+            .and_then(|c| c.sync_mode.as_deref())
+            .unwrap_or(DEFAULT_SYNC_MODE);
+
+        self.conn.execute_batch(&format!(
+            "
+            PRAGMA busy_timeout = {};
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous={};
+            PRAGMA cache_size=-{};
+            PRAGMA temp_store=MEMORY;
+            PRAGMA mmap_size={};",
+            busy_timeout, sync_mode, cache_size_kb, mmap_size_bytes
+        ))?;
+
         self.conn.execute_batch(
             "
-            PRAGMA busy_timeout = 5000;
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-            PRAGMA cache_size=-32000;
-            PRAGMA temp_store=MEMORY;
-            PRAGMA mmap_size=67108864;
 
             CREATE TABLE IF NOT EXISTS calls (
                 id                  TEXT PRIMARY KEY,
@@ -313,8 +389,6 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
             CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(model);
             CREATE INDEX IF NOT EXISTS idx_calls_provider ON calls(provider);
-            CREATE INDEX IF NOT EXISTS idx_calls_trace_id ON calls(trace_id);
-            CREATE INDEX IF NOT EXISTS idx_calls_prompt_hash ON calls(prompt_hash);
 
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
@@ -330,33 +404,34 @@ impl Store {
                 response_body,
                 error,
                 tags,
+                agent_name,
                 content='calls',
                 content_rowid='rowid'
             );
             CREATE TRIGGER IF NOT EXISTS calls_fts_ai
                 AFTER INSERT ON calls BEGIN
                     INSERT INTO calls_fts(rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error, tags)
+                                          request_body, response_body, error, tags, agent_name)
                     VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
-                            new.request_body, new.response_body, new.error, new.tags);
+                            new.request_body, new.response_body, new.error, new.tags, new.agent_name);
                 END;
             CREATE TRIGGER IF NOT EXISTS calls_fts_ad
                 AFTER DELETE ON calls BEGIN
                     INSERT INTO calls_fts(calls_fts, rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error, tags)
+                                          request_body, response_body, error, tags, agent_name)
                     VALUES ('delete', old.rowid, old.id, old.model, old.provider, old.endpoint,
-                            old.request_body, old.response_body, old.error, old.tags);
+                            old.request_body, old.response_body, old.error, old.tags, old.agent_name);
                 END;
             CREATE TRIGGER IF NOT EXISTS calls_fts_au
                 AFTER UPDATE ON calls BEGIN
                     INSERT INTO calls_fts(calls_fts, rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error, tags)
+                                          request_body, response_body, error, tags, agent_name)
                     VALUES ('delete', old.rowid, old.id, old.model, old.provider, old.endpoint,
-                            old.request_body, old.response_body, old.error, old.tags);
+                            old.request_body, old.response_body, old.error, old.tags, old.agent_name);
                     INSERT INTO calls_fts(rowid, id, model, provider, endpoint,
-                                          request_body, response_body, error, tags)
+                                          request_body, response_body, error, tags, agent_name)
                     VALUES (new.rowid, new.id, new.model, new.provider, new.endpoint,
-                            new.request_body, new.response_body, new.error, new.tags);
+                            new.request_body, new.response_body, new.error, new.tags, new.agent_name);
                 END;
         ",
         )?;
@@ -371,6 +446,9 @@ impl Store {
             "ALTER TABLE calls ADD COLUMN parent_id TEXT",
             "ALTER TABLE calls ADD COLUMN prompt_hash TEXT",
             "ALTER TABLE calls ADD COLUMN tags TEXT",
+            "ALTER TABLE calls ADD COLUMN agent_name TEXT",
+            "ALTER TABLE calls ADD COLUMN workflow_id TEXT",
+            "ALTER TABLE calls ADD COLUMN span_name TEXT",
         ] {
             if let Err(e) = self.conn.execute_batch(sql) {
                 let msg = e.to_string().to_lowercase();
@@ -380,12 +458,20 @@ impl Store {
             }
         }
 
+        // Create indexes on migrated columns (must run AFTER ALTER TABLE ADD COLUMN).
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_calls_trace_id ON calls(trace_id);
+             CREATE INDEX IF NOT EXISTS idx_calls_prompt_hash ON calls(prompt_hash);
+             CREATE INDEX IF NOT EXISTS idx_calls_agent_name ON calls(agent_name);
+             CREATE INDEX IF NOT EXISTS idx_calls_workflow_id ON calls(workflow_id);",
+        )?;
+
         // Backfill FTS5 index for any rows inserted before the virtual table existed.
         if let Err(e) = self.conn.execute_batch(
             "INSERT INTO calls_fts(rowid, id, model, provider, endpoint, \
-                                   request_body, response_body, error, tags) \
+                                   request_body, response_body, error, tags, agent_name) \
              SELECT rowid, id, model, provider, endpoint, \
-                    request_body, response_body, error, tags FROM calls \
+                    request_body, response_body, error, tags, agent_name FROM calls \
              WHERE rowid NOT IN (SELECT rowid FROM calls_fts)",
         ) {
             // Only propagate if it's not a harmless \"already exists\" scenario.
@@ -405,8 +491,9 @@ impl Store {
                 status_code, latency_ms, ttft_ms,
                 input_tokens, output_tokens,
                 cost_usd, request_body, response_body, error,
-                provider_request_id, trace_id, parent_id, prompt_hash, tags
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                provider_request_id, trace_id, parent_id, prompt_hash, tags,
+                agent_name, workflow_id, span_name
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 r.id,
                 r.timestamp,
@@ -427,6 +514,9 @@ impl Store {
                 r.parent_id,
                 r.prompt_hash,
                 r.tags,
+                r.agent_name,
+                r.workflow_id,
+                r.span_name,
             ],
         )?;
         Ok(())
@@ -446,6 +536,11 @@ impl Store {
             .provider
             .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+        let agent_filter: Option<String> = filter
+            .agent
+            .as_deref()
+            .map(|a| a.replace('%', "\\%").replace('_', "\\_"));
+        let workflow_filter: Option<String> = filter.workflow.clone();
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
@@ -460,9 +555,11 @@ impl Store {
               AND (?3 IS NULL OR timestamp >= ?3)
               AND (?4 IS NULL OR timestamp <= ?4)
               AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
+              AND (?6 IS NULL OR agent_name LIKE '%' || ?6 || '%' ESCAPE '\\')
+              AND (?7 IS NULL OR workflow_id = ?7)
               {status_clause}
             ORDER BY timestamp DESC
-            LIMIT ?6"
+            LIMIT ?8"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -473,6 +570,8 @@ impl Store {
                 since,
                 until,
                 provider_filter,
+                agent_filter,
+                workflow_filter,
                 limit_i64
             ],
             row_to_record,
@@ -497,6 +596,11 @@ impl Store {
             .provider
             .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+        let agent_filter: Option<String> = filter
+            .agent
+            .as_deref()
+            .map(|a| a.replace('%', "\\%").replace('_', "\\_"));
+        let workflow_filter: Option<String> = filter.workflow.clone();
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
@@ -510,6 +614,8 @@ impl Store {
               AND (?3 IS NULL OR timestamp >= ?3)
               AND (?4 IS NULL OR timestamp <= ?4)
               AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
+              AND (?6 IS NULL OR agent_name LIKE '%' || ?6 || '%' ESCAPE '\\')
+              AND (?7 IS NULL OR workflow_id = ?7)
               {status_clause}
             ORDER BY timestamp ASC"
         );
@@ -521,7 +627,9 @@ impl Store {
                 model_filter,
                 since,
                 until,
-                provider_filter
+                provider_filter,
+                agent_filter,
+                workflow_filter
             ],
             row_to_record,
         )?;
@@ -559,8 +667,9 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![escaped, limit_i64], |row| {
             let record = row_to_record(row)?;
-            let rank: f64 = row.get(19)?;
-            let snippet: String = row.get(20).unwrap_or_default();
+            // rank and snippet follow the 22 SELECT_COLS_CALLS columns (indices 0-21).
+            let rank: f64 = row.get(22)?;
+            let snippet: String = row.get(23).unwrap_or_default();
             Ok(SearchResult {
                 record,
                 rank,
@@ -676,6 +785,11 @@ impl Store {
             .provider
             .as_deref()
             .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+        let agent_filter: Option<String> = filter
+            .agent
+            .as_deref()
+            .map(|a| a.replace('%', "\\%").replace('_', "\\_"));
+        let workflow_filter: Option<String> = filter.workflow.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         let sql = format!(
@@ -686,9 +800,11 @@ impl Store {
               AND (?2 = 0 OR (error IS NOT NULL OR status_code >= 400 OR status_code = 0))
               AND (?3 IS NULL OR model LIKE '%' || ?3 || '%' ESCAPE '\\')
               AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\')
+              AND (?5 IS NULL OR agent_name LIKE '%' || ?5 || '%' ESCAPE '\\')
+              AND (?6 IS NULL OR workflow_id = ?6)
               {status_clause}
             ORDER BY timestamp ASC
-            LIMIT ?5"
+            LIMIT ?7"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -698,6 +814,8 @@ impl Store {
                 errors_only_flag,
                 model_filter,
                 provider_filter,
+                agent_filter,
+                workflow_filter,
                 limit_i64
             ],
             row_to_record,
@@ -1296,6 +1414,128 @@ impl Store {
         Ok(text)
     }
 
+    /// Return all calls with the given workflow_id, ordered by timestamp ASC.
+    pub fn query_workflow(&self, workflow_id: &str) -> Result<Vec<CallRecord>> {
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM calls WHERE workflow_id = ?1 ORDER BY timestamp ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let records = stmt
+            .query_map(params![workflow_id], row_to_record)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(records)
+    }
+
+    /// Per-agent aggregated stats. Respects since/until/provider filters.
+    pub fn query_agent_stats(&self, filter: &QueryFilter) -> Result<Vec<AgentStats>> {
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let provider_filter: Option<String> = filter
+            .provider
+            .as_deref()
+            .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+        let since: Option<String> = filter.since.clone();
+        let until: Option<String> = filter.until.clone();
+
+        let sql = "
+            SELECT agent_name,
+                   COUNT(*) as calls,
+                   COALESCE(SUM(input_tokens), 0),
+                   COALESCE(SUM(output_tokens), 0),
+                   COALESCE(SUM(cost_usd), 0.0),
+                   COALESCE(AVG(latency_ms), 0.0),
+                   COUNT(CASE WHEN error IS NOT NULL OR status_code >= 400 OR status_code = 0 THEN 1 END)
+            FROM calls
+            WHERE agent_name IS NOT NULL
+              AND (?1 IS NULL OR timestamp >= ?1)
+              AND (?2 IS NULL OR timestamp <= ?2)
+              AND (?3 IS NULL OR provider LIKE '%' || ?3 || '%' ESCAPE '\\')
+              AND (?4 IS NULL OR model LIKE '%' || ?4 || '%' ESCAPE '\\')
+            GROUP BY agent_name
+            ORDER BY SUM(cost_usd) DESC NULLS LAST";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![since, until, provider_filter, model_filter],
+            |row| {
+                Ok(AgentStats {
+                    agent_name: row.get(0)?,
+                    calls: row.get(1)?,
+                    total_input_tokens: row.get(2)?,
+                    total_output_tokens: row.get(3)?,
+                    total_cost_usd: row.get(4)?,
+                    avg_latency_ms: row.get(5)?,
+                    error_count: row.get(6)?,
+                })
+            },
+        )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Per-workflow aggregated summary. Respects since/until/provider filters.
+    #[allow(dead_code)]
+    pub fn query_workflow_summary(&self, filter: &QueryFilter) -> Result<Vec<WorkflowSummary>> {
+        let model_filter: Option<String> = filter
+            .model
+            .as_deref()
+            .map(|m| m.replace('%', "\\%").replace('_', "\\_"));
+        let provider_filter: Option<String> = filter
+            .provider
+            .as_deref()
+            .map(|p| p.replace('%', "\\%").replace('_', "\\_"));
+        let since: Option<String> = filter.since.clone();
+        let until: Option<String> = filter.until.clone();
+
+        let sql = "
+            SELECT workflow_id,
+                   COUNT(*) as calls,
+                   COALESCE(SUM(cost_usd), 0.0),
+                   COALESCE(SUM(latency_ms), 0),
+                   COUNT(DISTINCT agent_name),
+                   COUNT(CASE WHEN error IS NOT NULL OR status_code >= 400 OR status_code = 0 THEN 1 END),
+                   MIN(timestamp),
+                   MAX(timestamp)
+            FROM calls
+            WHERE workflow_id IS NOT NULL
+              AND (?1 IS NULL OR timestamp >= ?1)
+              AND (?2 IS NULL OR timestamp <= ?2)
+              AND (?3 IS NULL OR provider LIKE '%' || ?3 || '%' ESCAPE '\\')
+              AND (?4 IS NULL OR model LIKE '%' || ?4 || '%' ESCAPE '\\')
+            GROUP BY workflow_id
+            ORDER BY MIN(timestamp) DESC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![since, until, provider_filter, model_filter],
+            |row| {
+                Ok(WorkflowSummary {
+                    workflow_id: row.get(0)?,
+                    calls: row.get(1)?,
+                    total_cost_usd: row.get(2)?,
+                    total_latency_ms: row.get(3)?,
+                    agents: row.get(4)?,
+                    error_count: row.get(5)?,
+                    first_call: row.get(6)?,
+                    last_call: row.get(7)?,
+                })
+            },
+        )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     /// Flush the WAL to the main database file and defragment.
     /// Returns `(bytes_before, bytes_after)` from the filesystem.
     pub fn vacuum(&self) -> Result<(u64, u64)> {
@@ -1362,6 +1602,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 
@@ -1401,7 +1644,7 @@ mod tests {
             .unwrap();
         // idx_calls_timestamp + idx_calls_model + idx_calls_trace_id + idx_calls_prompt_hash + idx_calls_provider = 5
         // (Excludes SQLite auto-generated indexes such as the PRIMARY KEY index.)
-        assert_eq!(idx_count, 5, "all five indexes should exist after init");
+        assert_eq!(idx_count, 7, "all seven indexes should exist after init");
     }
 
     // -------------------------------------------------------------------------

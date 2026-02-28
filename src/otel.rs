@@ -37,6 +37,9 @@ use uuid::Uuid;
 
 use crate::store::CallRecord;
 
+/// Default service name used in OTel resource attributes.
+pub const DEFAULT_SERVICE_NAME: &str = "opentrace";
+
 /// Fire-and-forget OTLP span exporter.
 ///
 /// Cloneable via `Arc` — share one exporter across tasks.
@@ -44,20 +47,34 @@ pub struct OtelExporter {
     /// OTLP HTTP base URL, e.g. `http://localhost:4318`.
     endpoint: String,
     client: Client,
+    /// Service name used in OTel resource attributes (defaults to "opentrace").
+    service_name: String,
 }
 
 impl OtelExporter {
     /// Create a new exporter.  `endpoint` is the OTLP HTTP base URL.
+    #[allow(dead_code)]
     pub fn new(endpoint: String) -> Self {
+        Self::with_service_name(endpoint, None, None)
+    }
+
+    /// Create a new exporter with optional custom service name and timeout.
+    pub fn with_service_name(
+        endpoint: String,
+        service_name: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Self {
+        let timeout = timeout_secs.unwrap_or(5);
         let client = Client::builder()
             // Short timeout — OTel export is best-effort and must not slow
             // down the main request path.
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(timeout))
             .build()
             .unwrap_or_default();
         OtelExporter {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             client,
+            service_name: service_name.unwrap_or(DEFAULT_SERVICE_NAME).to_string(),
         }
     }
 
@@ -74,7 +91,10 @@ impl OtelExporter {
         let span_id = base64_8();
 
         let operation = derive_operation(&r.endpoint);
-        let span_name = format!("{} {}", operation, r.model);
+        let span_name = match r.span_name {
+            Some(ref sn) => sn.clone(),
+            None => format!("{} {}", operation, r.model),
+        };
 
         let mut attrs: Vec<Value> = vec![
             // gen_ai.* semantic conventions (OTel standard)
@@ -108,6 +128,18 @@ impl OtelExporter {
         }
         if let Some(ref err) = r.error {
             attrs.push(json!({"key": "error.type", "value": {"stringValue": err}}));
+        }
+
+        // Agent / workflow / span_name attributes
+        if let Some(ref agent) = r.agent_name {
+            attrs.push(json!({"key": "gen_ai.agent.name", "value": {"stringValue": agent}}));
+            attrs.push(json!({"key": "llm.agent_name", "value": {"stringValue": agent}}));
+        }
+        if let Some(ref wf) = r.workflow_id {
+            attrs.push(json!({"key": "gen_ai.workflow.id", "value": {"stringValue": wf}}));
+        }
+        if let Some(ref sn) = r.span_name {
+            attrs.push(json!({"key": "gen_ai.span.name", "value": {"stringValue": sn}}));
         }
 
         let is_error = r.status_code == 0 || r.status_code >= 400 || r.error.is_some();
@@ -154,13 +186,13 @@ impl OtelExporter {
             "resourceSpans": [{
                 "resource": {
                     "attributes": [
-                        {"key": "service.name",    "value": {"stringValue": "opentrace"}},
+                        {"key": "service.name",    "value": {"stringValue": self.service_name}},
                         {"key": "service.version", "value": {"stringValue": env!("CARGO_PKG_VERSION")}}
                     ]
                 },
                 "scopeSpans": [{
                     "scope": {
-                        "name":    "opentrace",
+                        "name":    self.service_name,
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "spans": [span]
@@ -296,6 +328,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

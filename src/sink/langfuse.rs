@@ -19,16 +19,31 @@ pub struct LangfuseSink {
     client: reqwest::Client,
 }
 
+/// Default timeout for Langfuse HTTP requests (seconds).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
 impl LangfuseSink {
     /// Create a new sink.
     ///
     /// `base_url` defaults to `https://cloud.langfuse.com` for cloud;
     /// override for self-hosted deployments.
+    #[allow(dead_code)]
     pub fn new(base_url: &str, public_key: &str, secret_key: &str) -> Self {
+        Self::with_timeout(base_url, public_key, secret_key, None)
+    }
+
+    /// Create a new sink with optional custom timeout (seconds).
+    pub fn with_timeout(
+        base_url: &str,
+        public_key: &str,
+        secret_key: &str,
+        timeout_secs: Option<u64>,
+    ) -> Self {
+        let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         let credentials = format!("{}:{}", public_key, secret_key);
         let auth_header = format!("Basic {}", base64_encode(credentials.as_bytes()));
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(timeout))
             .build()
             .unwrap_or_default();
         LangfuseSink {
@@ -58,33 +73,48 @@ impl LangfuseSink {
             "DEFAULT"
         };
 
+        let mut metadata = json!({
+            "provider": record.provider,
+            "endpoint": record.endpoint,
+            "status_code": record.status_code,
+            "cost_usd": record.cost_usd,
+            "latency_ms": record.latency_ms
+        });
+        if let Some(ref agent) = record.agent_name {
+            metadata["agent_name"] = json!(agent);
+        }
+        if let Some(ref wf) = record.workflow_id {
+            metadata["workflow_id"] = json!(wf);
+        }
+
+        let mut body = json!({
+            "id": record.id,
+            "traceId": record.id,
+            "name": "llm-call",
+            "startTime": record.timestamp,
+            "endTime": end_time,
+            "model": record.model,
+            "input": req_body,
+            "output": resp_body,
+            "usage": {
+                "input": input_tokens,
+                "output": output_tokens,
+                "total": total_tokens
+            },
+            "metadata": metadata,
+            "level": level
+        });
+
+        // Use workflow_id as Langfuse traceId when present (correlates calls)
+        if let Some(ref wf) = record.workflow_id {
+            body["traceId"] = json!(wf);
+        }
+
         let payload = json!({
             "batch": [{
                 "id": Uuid::new_v4().to_string(),
                 "type": "generation-create",
-                "body": {
-                    "id": record.id,
-                    "traceId": record.id,
-                    "name": "llm-call",
-                    "startTime": record.timestamp,
-                    "endTime": end_time,
-                    "model": record.model,
-                    "input": req_body,
-                    "output": resp_body,
-                    "usage": {
-                        "input": input_tokens,
-                        "output": output_tokens,
-                        "total": total_tokens
-                    },
-                    "metadata": {
-                        "provider": record.provider,
-                        "endpoint": record.endpoint,
-                        "status_code": record.status_code,
-                        "cost_usd": record.cost_usd,
-                        "latency_ms": record.latency_ms
-                    },
-                    "level": level
-                }
+                "body": body
             }]
         });
 
@@ -200,6 +230,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 

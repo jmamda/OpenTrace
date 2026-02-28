@@ -11,12 +11,17 @@ use std::sync::Mutex;
 
 use crate::store::CallRecord;
 
-/// Histogram bucket upper bounds (ms). Index 4 is always +Inf.
-const LATENCY_BOUNDS_MS: &[u64] = &[100, 500, 1_000, 5_000];
-const LE_LABELS: &[&str] = &["100", "500", "1000", "5000", "+Inf"];
+/// Default histogram bucket upper bounds (ms).
+pub const DEFAULT_LATENCY_BOUNDS_MS: &[u64] = &[100, 500, 1_000, 5_000];
 
 /// Inner mutable state — protected by a single Mutex so scrapes are consistent.
 struct MetricsInner {
+    /// Custom latency bucket bounds (ms). The +Inf bucket is always appended.
+    latency_bounds: Vec<u64>,
+    /// Pre-computed le labels including "+Inf" for Prometheus output.
+    le_labels: Vec<String>,
+    /// Number of buckets including +Inf.
+    num_buckets: usize,
     /// calls_total{model, provider, status_class} → count
     calls: HashMap<(String, String, String), u64>,
     /// tokens_total{model, provider, type="input"} → tokens
@@ -25,15 +30,17 @@ struct MetricsInner {
     output_tokens: HashMap<(String, String), u64>,
     /// cost_usd_total{model, provider} → USD
     cost_usd: HashMap<(String, String), f64>,
-    /// latency_ms histogram buckets[model] = [le100, le500, le1000, le5000, +Inf]
+    /// latency_ms histogram buckets[model] = [le1, le2, ..., +Inf]
     /// Each bucket holds the *cumulative* count (calls with latency <= le).
-    latency_buckets: HashMap<String, [u64; 5]>,
+    latency_buckets: HashMap<String, Vec<u64>>,
     latency_sum: HashMap<String, f64>,
     latency_count: HashMap<String, u64>,
     /// ttft_ms histogram (streaming calls only)
-    ttft_buckets: HashMap<String, [u64; 5]>,
+    ttft_buckets: HashMap<String, Vec<u64>>,
     ttft_sum: HashMap<String, f64>,
     ttft_count: HashMap<String, u64>,
+    /// Per-agent call counter: agent_name → count
+    agent_calls: HashMap<String, u64>,
     /// Dropped records counter (synced from the DB meta table periodically).
     dropped_records: u64,
     /// Budget alerting state (only populated when --budget-alert-usd is set).
@@ -58,8 +65,23 @@ impl Default for MetricsState {
 
 impl MetricsState {
     pub fn new() -> Self {
+        Self::with_latency_buckets(None)
+    }
+
+    /// Create a metrics state with optional custom latency histogram bucket bounds.
+    /// If `None`, uses `DEFAULT_LATENCY_BOUNDS_MS`.
+    pub fn with_latency_buckets(custom_bounds: Option<&[u64]>) -> Self {
+        let bounds: Vec<u64> = custom_bounds
+            .unwrap_or(DEFAULT_LATENCY_BOUNDS_MS)
+            .to_vec();
+        let mut le_labels: Vec<String> = bounds.iter().map(|b| b.to_string()).collect();
+        le_labels.push("+Inf".to_string());
+        let num_buckets = le_labels.len();
         MetricsState {
             inner: Mutex::new(MetricsInner {
+                latency_bounds: bounds,
+                le_labels,
+                num_buckets,
                 calls: HashMap::new(),
                 input_tokens: HashMap::new(),
                 output_tokens: HashMap::new(),
@@ -70,6 +92,7 @@ impl MetricsState {
                 ttft_buckets: HashMap::new(),
                 ttft_sum: HashMap::new(),
                 ttft_count: HashMap::new(),
+                agent_calls: HashMap::new(),
                 dropped_records: 0,
                 budget_spent_usd: 0.0,
                 budget_limit_usd: 0.0,
@@ -135,20 +158,32 @@ impl MetricsState {
             }
         }
 
+        // Snapshot bounds to avoid borrow conflicts with mutable bucket entries.
+        let bounds: Vec<u64> = inner.latency_bounds.clone();
+        let num_buckets = inner.num_buckets;
+
         // latency_ms histogram — cumulative buckets
         {
             let buckets = inner
                 .latency_buckets
                 .entry(r.model.clone())
-                .or_insert([0u64; 5]);
-            for (i, &bound) in LATENCY_BOUNDS_MS.iter().enumerate() {
+                .or_insert_with(|| vec![0u64; num_buckets]);
+            for (i, &bound) in bounds.iter().enumerate() {
                 if r.latency_ms <= bound {
                     buckets[i] += 1;
                 }
             }
-            buckets[4] += 1; // +Inf always
+            buckets[num_buckets - 1] += 1; // +Inf always
             *inner.latency_sum.entry(r.model.clone()).or_insert(0.0) += r.latency_ms as f64;
             *inner.latency_count.entry(r.model.clone()).or_insert(0) += 1;
+        }
+
+        // Per-agent call counter
+        if let Some(ref agent) = r.agent_name {
+            *inner
+                .agent_calls
+                .entry(agent.clone())
+                .or_insert(0) += 1;
         }
 
         // ttft_ms histogram
@@ -156,13 +191,13 @@ impl MetricsState {
             let buckets = inner
                 .ttft_buckets
                 .entry(r.model.clone())
-                .or_insert([0u64; 5]);
-            for (i, &bound) in LATENCY_BOUNDS_MS.iter().enumerate() {
+                .or_insert_with(|| vec![0u64; num_buckets]);
+            for (i, &bound) in bounds.iter().enumerate() {
                 if ttft <= bound {
                     buckets[i] += 1;
                 }
             }
-            buckets[4] += 1;
+            buckets[num_buckets - 1] += 1;
             *inner.ttft_sum.entry(r.model.clone()).or_insert(0.0) += ttft as f64;
             *inner.ttft_count.entry(r.model.clone()).or_insert(0) += 1;
         }
@@ -229,11 +264,13 @@ impl MetricsState {
         lat_models.sort();
         for model in &lat_models {
             let buckets = &inner.latency_buckets[*model];
-            for (i, le) in LE_LABELS.iter().enumerate() {
-                out.push_str(&format!(
-                    "opentrace_latency_ms_bucket{{model=\"{}\",le=\"{}\"}} {}\n",
-                    model, le, buckets[i]
-                ));
+            for (i, le) in inner.le_labels.iter().enumerate() {
+                if i < buckets.len() {
+                    out.push_str(&format!(
+                        "opentrace_latency_ms_bucket{{model=\"{}\",le=\"{}\"}} {}\n",
+                        model, le, buckets[i]
+                    ));
+                }
             }
             out.push_str(&format!(
                 "opentrace_latency_ms_sum{{model=\"{}\"}} {:.0}\n",
@@ -254,11 +291,13 @@ impl MetricsState {
         ttft_models.sort();
         for model in &ttft_models {
             let buckets = &inner.ttft_buckets[*model];
-            for (i, le) in LE_LABELS.iter().enumerate() {
-                out.push_str(&format!(
-                    "opentrace_ttft_ms_bucket{{model=\"{}\",le=\"{}\"}} {}\n",
-                    model, le, buckets[i]
-                ));
+            for (i, le) in inner.le_labels.iter().enumerate() {
+                if i < buckets.len() {
+                    out.push_str(&format!(
+                        "opentrace_ttft_ms_bucket{{model=\"{}\",le=\"{}\"}} {}\n",
+                        model, le, buckets[i]
+                    ));
+                }
             }
             out.push_str(&format!(
                 "opentrace_ttft_ms_sum{{model=\"{}\"}} {:.0}\n",
@@ -270,6 +309,20 @@ impl MetricsState {
                 model,
                 inner.ttft_count.get(*model).unwrap_or(&0)
             ));
+        }
+
+        // --- opentrace_agent_calls_total -------------------------------------
+        if !inner.agent_calls.is_empty() {
+            out.push_str("# HELP opentrace_agent_calls_total Total LLM calls per agent\n");
+            out.push_str("# TYPE opentrace_agent_calls_total counter\n");
+            let mut agent_sorted: Vec<_> = inner.agent_calls.iter().collect();
+            agent_sorted.sort_by(|a, b| a.0.cmp(b.0));
+            for (agent, count) in agent_sorted {
+                out.push_str(&format!(
+                    "opentrace_agent_calls_total{{agent=\"{}\"}} {}\n",
+                    agent, count
+                ));
+            }
         }
 
         // --- opentrace_dropped_records_total ---------------------------------
@@ -328,6 +381,9 @@ mod tests {
             parent_id: None,
             prompt_hash: None,
             tags: None,
+            agent_name: None,
+            workflow_id: None,
+            span_name: None,
         }
     }
 
