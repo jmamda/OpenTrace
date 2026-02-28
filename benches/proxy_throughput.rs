@@ -287,6 +287,8 @@ fn bench_store_query_filtered(c: &mut Criterion) {
         provider: None,
         status: None,
         status_range: None,
+        agent: None,
+        workflow: None,
     };
 
     // Parameterised by result-set limit so we can compare different sizes.
