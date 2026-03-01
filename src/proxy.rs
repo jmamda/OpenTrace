@@ -75,12 +75,31 @@ pub struct ProxyState {
     pub price_overrides: Arc<HashMap<String, (f64, f64)>>,
 }
 
-pub fn router(state: ProxyState) -> Router {
-    Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
+pub fn router(state: ProxyState, api: Option<Router>) -> Router {
+    let proxy = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                Response::builder()
+                    .header("Content-Type", "application/json")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Body::from(format!(
+                        r#"{{"status":"ok","version":"{}"}}"#,
+                        env!("CARGO_PKG_VERSION")
+                    )))
+                    .unwrap()
+            }),
+        )
         .route("/*path", any(handle))
         .route("/", any(handle))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(api_router) = api {
+        // API routes (/_trace/*) take priority — merge before the proxy fallback.
+        api_router.merge(proxy)
+    } else {
+        proxy
+    }
 }
 
 /// Send a record to the DB writer task, incrementing the dropped counter if

@@ -4,6 +4,26 @@ All notable changes to [OpenTrace](https://github.com/jmamda/OpenTrace) are docu
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.8] - 2026-02-28
+
+### Added
+- **Embedded Query API**: `trace start` now serves read-only query endpoints on the proxy port under `/_trace/`, eliminating the need for direct SQLite access or a separate `trace serve` process
+  - `GET /_trace/api/calls` — list calls with filters (model, provider, agent, tag, workflow, errors, since/until)
+  - `GET /_trace/api/stats` — aggregate statistics with model and provider breakdown
+  - `GET /_trace/api/call/:id` — single call detail by UUID prefix
+  - `GET /_trace/api/search?q=` — FTS5 full-text search with BM25 ranking
+  - `GET /_trace/api/heatmap` — daily cost/call aggregates for heatmap visualization
+  - `GET /_trace/api/agents` — per-agent statistics
+  - `GET /_trace/api/workflow/:id` — workflow call timeline with cost totals
+  - `GET /_trace/api/workflows` — workflow summaries list
+  - `GET /_trace/stream` — Server-Sent Events for real-time call updates
+  - `GET /_trace/health` — JSON health response with version, uptime, status
+- `trace status` command — check if proxy is running and display health info
+- `--no-api` / `TRACE_NO_API` flag to disable embedded API endpoints
+- `/health` endpoint now returns JSON `{"status":"ok","version":"..."}` (was plain 200 OK)
+- CORS headers on all embedded API responses
+- Tag filtering via `?tag=` query parameter on API calls endpoint
+
 ## [0.3.7] - 2026-02-28
 
 ### Added
@@ -199,7 +219,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `mpsc::channel(20_000)` background writer for zero-latency request path
 - Graceful shutdown with 5s writer drain
 
-[0.3.7]: https://github.com/jmamda/OpenTrace/compare/v0.3.6...HEAD
+[0.3.8]: https://github.com/jmamda/OpenTrace/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/jmamda/OpenTrace/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/jmamda/OpenTrace/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/jmamda/OpenTrace/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/jmamda/OpenTrace/compare/v0.3.3...v0.3.4

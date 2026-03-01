@@ -79,7 +79,7 @@ async fn start_proxy(upstream_url: String, db_path: &Path) -> u16 {
         price_overrides: std::sync::Arc::new(std::collections::HashMap::new()),
     };
 
-    let app = proxy::router(state);
+    let app = proxy::router(state, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -601,7 +601,7 @@ async fn start_proxy_with_routes(
         max_accumulation_bytes: proxy::DEFAULT_MAX_ACCUMULATION_BYTES,
         price_overrides: std::sync::Arc::new(std::collections::HashMap::new()),
     };
-    let app = proxy::router(state);
+    let app = proxy::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind proxy listener");

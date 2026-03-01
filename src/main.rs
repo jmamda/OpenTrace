@@ -1,3 +1,4 @@
+mod api;
 mod capture;
 mod config;
 mod export_formats;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 #[command(
     name = "trace",
     about = "The strace of LLM calls — local-first observability proxy",
-    version = "0.3.7",
+    version = env!("CARGO_PKG_VERSION"),
     long_about = None,
 )]
 struct Cli {
@@ -145,6 +146,10 @@ enum Commands {
         /// Graceful shutdown timeout in seconds
         #[arg(long)]
         graceful_shutdown_timeout: Option<u64>,
+
+        /// Disable the embedded query API (/_trace/* endpoints)
+        #[arg(long, env = "TRACE_NO_API")]
+        no_api: bool,
     },
 
     /// Query captured calls
@@ -274,6 +279,13 @@ enum Commands {
 
     /// Show DB path and size
     Info,
+
+    /// Check if the trace proxy is running and show health info
+    Status {
+        /// Port to check [default: 4000]
+        #[arg(short, long, env = "TRACE_PORT")]
+        port: Option<u16>,
+    },
 
     /// Delete all captured calls and compact the database
     Clear {
@@ -565,6 +577,7 @@ async fn main() -> Result<()> {
             channel_capacity,
             max_request_body_bytes,
             graceful_shutdown_timeout,
+            no_api,
         } => {
             cmd_start(
                 port,
@@ -593,6 +606,7 @@ async fn main() -> Result<()> {
                 channel_capacity,
                 max_request_body_bytes,
                 graceful_shutdown_timeout,
+                no_api,
                 &cfg,
             )
             .await
@@ -667,6 +681,13 @@ async fn main() -> Result<()> {
             provider,
         ),
         Commands::Info => cmd_info(),
+        Commands::Status { port } => {
+            let start_cfg = cfg.start.as_ref();
+            let resolved_port = port
+                .or_else(|| start_cfg.and_then(|s| s.port))
+                .unwrap_or(4000);
+            cmd_status(resolved_port).await
+        }
         Commands::Clear { yes } => cmd_clear(yes),
         Commands::Export {
             format,
@@ -774,6 +795,7 @@ async fn cmd_start(
     channel_capacity_arg: Option<usize>,
     max_request_body_bytes_arg: Option<usize>,
     graceful_shutdown_timeout_arg: Option<u64>,
+    no_api: bool,
     cfg: &config::TraceConfig,
 ) -> Result<()> {
     // ── Config validation ────────────────────────────────────────────────
@@ -1047,6 +1069,12 @@ async fn cmd_start(
     if let Some(limit) = budget_alert_usd {
         println!("  budget     ${:.2} / {}", limit, budget_period.cyan());
     }
+    if !no_api {
+        println!(
+            "  api        {}",
+            format!("http://{}:{}/_trace/api/", bind, port).cyan()
+        );
+    }
     println!();
     println!("Set your LLM client:");
     if routes.is_empty() {
@@ -1190,6 +1218,10 @@ async fn cmd_start(
 
     let (store_tx, mut store_rx) = mpsc::channel::<store::CallRecord>(channel_capacity);
 
+    // Broadcast channel for SSE subscribers (embedded API).
+    let (event_tx, _) = tokio::sync::broadcast::channel::<store::CallRecord>(256);
+    let event_tx_writer = event_tx.clone();
+
     let metrics_writer = metrics_state.clone();
     let otel_writer = otel_exporter.clone();
     let langfuse_writer = langfuse_sink.clone();
@@ -1202,6 +1234,8 @@ async fn cmd_start(
             if let Err(e) = store.insert(&record) {
                 eprintln!("[trace] db write error: {e}");
             }
+            // Broadcast to SSE subscribers (ignore if no one is listening).
+            let _ = event_tx_writer.send(record.clone());
             if let Some(ref m) = metrics_writer {
                 m.record(&record);
             }
@@ -1414,7 +1448,25 @@ async fn cmd_start(
         });
     }
 
-    let app = proxy::router(state);
+    // Build embedded API router (unless --no-api).
+    let api_router = if no_api {
+        None
+    } else {
+        let api_store = if let Some(ref p) = db_path_override {
+            store::Store::open_at(std::path::Path::new(p))
+                .context("failed to open trace database for API")?
+        } else {
+            store::Store::open().context("failed to open trace database for API")?
+        };
+        let api_state = api::ApiState {
+            store: Arc::new(std::sync::Mutex::new(api_store)),
+            event_tx: event_tx.clone(),
+            start_time: std::time::Instant::now(),
+        };
+        Some(api::api_router(api_state))
+    };
+
+    let app = proxy::router(state, api_router);
     let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -1500,6 +1552,7 @@ fn cmd_query(
         status_range,
         agent,
         workflow,
+        ..Default::default()
     };
     let mut calls = store.query_filtered(limit, &filter)?;
 
@@ -2096,6 +2149,81 @@ fn cmd_stats(
     Ok(())
 }
 
+async fn cmd_status(port: u16) -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/_trace/health", port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.text().await {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    let version = json["version"].as_str().unwrap_or("unknown");
+                    let uptime = json["uptime_seconds"].as_u64().unwrap_or(0);
+                    let status = json["status"].as_str().unwrap_or("unknown");
+                    println!(
+                        "{} trace is {} on port {}",
+                        "●".green(),
+                        "running".green().bold(),
+                        port.to_string().cyan()
+                    );
+                    println!("  version  {}", version.cyan());
+                    let hours = uptime / 3600;
+                    let mins = (uptime % 3600) / 60;
+                    let secs = uptime % 60;
+                    if hours > 0 {
+                        println!(
+                            "  uptime   {}",
+                            format!("{}h {}m {}s", hours, mins, secs).cyan()
+                        );
+                    } else if mins > 0 {
+                        println!("  uptime   {}", format!("{}m {}s", mins, secs).cyan());
+                    } else {
+                        println!("  uptime   {}", format!("{}s", secs).cyan());
+                    }
+                    println!("  status   {}", status.cyan());
+                    println!(
+                        "  api      {}",
+                        format!("http://127.0.0.1:{}/_trace/api/", port).cyan()
+                    );
+                    return Ok(());
+                }
+            }
+            println!(
+                "{} trace is {} on port {} (pre-v0.3.8, no API)",
+                "●".yellow(),
+                "running".yellow().bold(),
+                port.to_string().cyan()
+            );
+            Ok(())
+        }
+        _ => {
+            // Try the old /health endpoint
+            let old_url = format!("http://127.0.0.1:{}/health", port);
+            match client.get(&old_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    println!(
+                        "{} trace is {} on port {} (pre-v0.3.8, no embedded API)",
+                        "●".yellow(),
+                        "running".yellow().bold(),
+                        port.to_string().cyan()
+                    );
+                    Ok(())
+                }
+                _ => {
+                    println!(
+                        "{} trace is {} on port {}",
+                        "○".red(),
+                        "not running".red().bold(),
+                        port.to_string().cyan()
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 fn cmd_info() -> Result<()> {
     let db_path = store::db_path()?;
 
@@ -2174,6 +2302,7 @@ fn cmd_export(
         status_range,
         agent,
         workflow,
+        ..Default::default()
     };
     let records = store.query_all_filtered(&filter)?;
 

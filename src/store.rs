@@ -122,6 +122,8 @@ pub struct QueryFilter {
     pub agent: Option<String>,
     /// Filter by workflow ID (exact match).
     pub workflow: Option<String>,
+    /// Filter by tag (exact match against the `tags` column).
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -541,6 +543,7 @@ impl Store {
             .as_deref()
             .map(|a| a.replace('%', "\\%").replace('_', "\\_"));
         let workflow_filter: Option<String> = filter.workflow.clone();
+        let tag_filter: Option<String> = filter.tag.clone();
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
@@ -557,9 +560,10 @@ impl Store {
               AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
               AND (?6 IS NULL OR agent_name LIKE '%' || ?6 || '%' ESCAPE '\\')
               AND (?7 IS NULL OR workflow_id = ?7)
+              AND (?8 IS NULL OR tags = ?8)
               {status_clause}
             ORDER BY timestamp DESC
-            LIMIT ?8"
+            LIMIT ?9"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -572,6 +576,7 @@ impl Store {
                 provider_filter,
                 agent_filter,
                 workflow_filter,
+                tag_filter,
                 limit_i64
             ],
             row_to_record,
@@ -601,6 +606,7 @@ impl Store {
             .as_deref()
             .map(|a| a.replace('%', "\\%").replace('_', "\\_"));
         let workflow_filter: Option<String> = filter.workflow.clone();
+        let tag_filter: Option<String> = filter.tag.clone();
         let since: Option<String> = filter.since.clone();
         let until: Option<String> = filter.until.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
@@ -616,6 +622,7 @@ impl Store {
               AND (?5 IS NULL OR provider LIKE '%' || ?5 || '%' ESCAPE '\\')
               AND (?6 IS NULL OR agent_name LIKE '%' || ?6 || '%' ESCAPE '\\')
               AND (?7 IS NULL OR workflow_id = ?7)
+              AND (?8 IS NULL OR tags = ?8)
               {status_clause}
             ORDER BY timestamp ASC"
         );
@@ -629,7 +636,8 @@ impl Store {
                 until,
                 provider_filter,
                 agent_filter,
-                workflow_filter
+                workflow_filter,
+                tag_filter
             ],
             row_to_record,
         )?;
@@ -790,6 +798,7 @@ impl Store {
             .as_deref()
             .map(|a| a.replace('%', "\\%").replace('_', "\\_"));
         let workflow_filter: Option<String> = filter.workflow.clone();
+        let tag_filter: Option<String> = filter.tag.clone();
         let status_clause = build_status_clause(&filter.status, &filter.status_range);
 
         let sql = format!(
@@ -802,9 +811,10 @@ impl Store {
               AND (?4 IS NULL OR provider LIKE '%' || ?4 || '%' ESCAPE '\\')
               AND (?5 IS NULL OR agent_name LIKE '%' || ?5 || '%' ESCAPE '\\')
               AND (?6 IS NULL OR workflow_id = ?6)
+              AND (?7 IS NULL OR tags = ?7)
               {status_clause}
             ORDER BY timestamp ASC
-            LIMIT ?7"
+            LIMIT ?8"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -816,6 +826,7 @@ impl Store {
                 provider_filter,
                 agent_filter,
                 workflow_filter,
+                tag_filter,
                 limit_i64
             ],
             row_to_record,
@@ -1528,6 +1539,40 @@ impl Store {
                 })
             },
         )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Workflow summaries ordered by last_call DESC, limited to `limit` rows.
+    /// Unlike `query_workflow_summary` this takes a simple limit instead of a
+    /// full QueryFilter — intended for the embedded API dashboard.
+    pub fn query_workflow_summaries(&self, limit: usize) -> Result<Vec<WorkflowSummary>> {
+        let limit_i64 = limit.min(10_000) as i64;
+        let sql = "
+            SELECT workflow_id, COUNT(*) as calls, COALESCE(SUM(cost_usd), 0) as total_cost_usd,
+                   COALESCE(SUM(latency_ms), 0) as total_latency_ms, COUNT(DISTINCT agent_name) as agents,
+                   SUM(CASE WHEN status_code >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END) as error_count,
+                   MIN(timestamp) as first_call, MAX(timestamp) as last_call
+            FROM calls WHERE workflow_id IS NOT NULL
+            GROUP BY workflow_id ORDER BY last_call DESC LIMIT ?1";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![limit_i64], |row| {
+            Ok(WorkflowSummary {
+                workflow_id: row.get(0)?,
+                calls: row.get(1)?,
+                total_cost_usd: row.get(2)?,
+                total_latency_ms: row.get(3)?,
+                agents: row.get(4)?,
+                error_count: row.get(5)?,
+                first_call: row.get(6)?,
+                last_call: row.get(7)?,
+            })
+        })?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2901,5 +2946,157 @@ mod tests {
         );
         let openai = stats.iter().find(|p| p.provider == "openai").unwrap();
         assert_eq!(openai.calls, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // tag filter
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn query_filtered_tag_exact_match() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("tag-1", "gpt-4o", 200);
+        r1.tags = Some("production".to_string());
+        let mut r2 = make_record("tag-2", "gpt-4o", 200);
+        r2.tags = Some("staging".to_string());
+        let r3 = make_record("tag-3", "gpt-4o", 200);
+        // r3 has no tag
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+        store.insert(&r3).unwrap();
+
+        let filter = QueryFilter {
+            tag: Some("production".to_string()),
+            ..Default::default()
+        };
+        let results = store.query_filtered(100, &filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "tag-1");
+    }
+
+    #[test]
+    fn query_filtered_tag_none_returns_all() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("tn-1", "gpt-4o", 200);
+        r1.tags = Some("production".to_string());
+        let r2 = make_record("tn-2", "gpt-4o", 200);
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+
+        let filter = QueryFilter::default();
+        let results = store.query_filtered(100, &filter).unwrap();
+        assert_eq!(results.len(), 2, "no tag filter should return all records");
+    }
+
+    #[test]
+    fn query_all_filtered_respects_tag() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("at-1", "gpt-4o", 200);
+        r1.tags = Some("canary".to_string());
+        let mut r2 = make_record("at-2", "gpt-4o", 200);
+        r2.tags = Some("stable".to_string());
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+
+        let filter = QueryFilter {
+            tag: Some("canary".to_string()),
+            ..Default::default()
+        };
+        let results = store.query_all_filtered(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "at-1");
+    }
+
+    #[test]
+    fn query_after_respects_tag() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r1 = make_record("qa-1", "gpt-4o", 200);
+        r1.timestamp = "2025-01-01T00:00:00.000Z".to_string();
+        r1.tags = Some("beta".to_string());
+        let mut r2 = make_record("qa-2", "gpt-4o", 200);
+        r2.timestamp = "2025-01-02T00:00:00.000Z".to_string();
+        r2.tags = Some("beta".to_string());
+        let mut r3 = make_record("qa-3", "gpt-4o", 200);
+        r3.timestamp = "2025-01-03T00:00:00.000Z".to_string();
+        r3.tags = Some("alpha".to_string());
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+        store.insert(&r3).unwrap();
+
+        let filter = QueryFilter {
+            tag: Some("beta".to_string()),
+            ..Default::default()
+        };
+        let results = store
+            .query_after("2025-01-01T00:00:00.000Z", &filter, 100)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only qa-2 should match (after ts + beta tag)"
+        );
+        assert_eq!(results[0].id, "qa-2");
+    }
+
+    // -------------------------------------------------------------------------
+    // query_workflow_summaries
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn query_workflow_summaries_basic() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Two calls in workflow "wf-1", one call in "wf-2", one without workflow
+        let mut r1 = make_record("ws-1", "gpt-4o", 200);
+        r1.workflow_id = Some("wf-1".to_string());
+        r1.agent_name = Some("planner".to_string());
+        r1.timestamp = "2025-01-01T00:00:00.000Z".to_string();
+        let mut r2 = make_record("ws-2", "gpt-4o", 500);
+        r2.workflow_id = Some("wf-1".to_string());
+        r2.agent_name = Some("coder".to_string());
+        r2.error = Some("server error".to_string());
+        r2.timestamp = "2025-01-01T00:01:00.000Z".to_string();
+        let mut r3 = make_record("ws-3", "claude-3", 200);
+        r3.workflow_id = Some("wf-2".to_string());
+        r3.agent_name = Some("planner".to_string());
+        r3.timestamp = "2025-01-02T00:00:00.000Z".to_string();
+        let r4 = make_record("ws-4", "gpt-4o", 200); // no workflow_id
+        store.insert(&r1).unwrap();
+        store.insert(&r2).unwrap();
+        store.insert(&r3).unwrap();
+        store.insert(&r4).unwrap();
+
+        let summaries = store.query_workflow_summaries(10).unwrap();
+        assert_eq!(summaries.len(), 2, "only workflows, not bare calls");
+
+        // Ordered by last_call DESC => wf-2 first, wf-1 second
+        assert_eq!(summaries[0].workflow_id, "wf-2");
+        assert_eq!(summaries[0].calls, 1);
+        assert_eq!(summaries[0].agents, 1);
+        assert_eq!(summaries[0].error_count, 0);
+
+        assert_eq!(summaries[1].workflow_id, "wf-1");
+        assert_eq!(summaries[1].calls, 2);
+        assert_eq!(summaries[1].agents, 2);
+        assert_eq!(summaries[1].error_count, 1);
+    }
+
+    #[test]
+    fn query_workflow_summaries_respects_limit() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5u32 {
+            let mut r = make_record(&format!("wl-{i}"), "gpt-4o", 200);
+            r.workflow_id = Some(format!("wf-{i}"));
+            store.insert(&r).unwrap();
+        }
+        let summaries = store.query_workflow_summaries(3).unwrap();
+        assert_eq!(summaries.len(), 3, "limit should cap results");
+    }
+
+    #[test]
+    fn query_workflow_summaries_empty_db() {
+        let store = Store::open_in_memory().unwrap();
+        let summaries = store.query_workflow_summaries(10).unwrap();
+        assert!(summaries.is_empty());
     }
 }

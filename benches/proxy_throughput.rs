@@ -289,6 +289,7 @@ fn bench_store_query_filtered(c: &mut Criterion) {
         status_range: None,
         agent: None,
         workflow: None,
+        ..Default::default()
     };
 
     // Parameterised by result-set limit so we can compare different sizes.

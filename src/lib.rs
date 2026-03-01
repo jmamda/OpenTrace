@@ -1,3 +1,4 @@
+pub mod api;
 pub mod capture;
 pub mod config;
 pub mod export_formats;

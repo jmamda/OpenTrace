@@ -1805,7 +1805,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "trace"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "axum",

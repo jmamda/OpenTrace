@@ -52,9 +52,11 @@
   - [trace prices](#trace-prices--manage-model-pricing)
   - [trace workflow](#trace-workflow--inspect-a-workflow)
   - [trace agents](#trace-agents--per-agent-stats)
+  - [trace status](#trace-status--check-proxy-health)
   - [trace vacuum](#trace-vacuum--compact-the-database)
   - [trace info](#trace-info--database-location)
   - [trace clear](#trace-clear--delete-all-records)
+- [Embedded Query API](#embedded-query-api)
 - [Multi-Agent Orchestration](#multi-agent-orchestration)
 - [Multi-Upstream Routing](#multi-upstream-routing)
 - [Observability Integrations](#observability-integrations)
@@ -108,10 +110,11 @@ trace start
 Startup output:
 
 ```
-trace v0.3.7  listening http://127.0.0.1:4000
+trace v0.3.8  listening http://127.0.0.1:4000
   upstream  https://api.openai.com
   storage   /home/user/.trace/trace.db
   retention 90 days
+  api       http://127.0.0.1:4000/_trace/
 ```
 
 ### 2. Point your app at the proxy
@@ -182,6 +185,7 @@ trace start \
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | -- | Send OTLP HTTP/JSON spans to this endpoint |
 | `--budget-alert-usd` | `TRACE_BUDGET_ALERT_USD` | -- | Emit a stderr warning when spend exceeds this USD amount in the period |
 | `--budget-period` | `TRACE_BUDGET_PERIOD` | `month` | Budget period: `day`, `week`, or `month` |
+| `--no-api` | `TRACE_NO_API` | off | Disable embedded query API endpoints under `/_trace/` |
 | `--route PATH=URL` | -- | -- | Route a path prefix to a different upstream. May be specified multiple times. More specific paths must come first. |
 
 #### Call tagging with `X-Trace-Tag`
@@ -678,6 +682,28 @@ trace agents
 
 ---
 
+### `trace status` -- check proxy health
+
+Check whether the proxy is running and display health information.
+
+```bash
+trace status
+# trace proxy is running on http://127.0.0.1:4000
+#   version   0.3.8
+#   uptime    2h 14m
+#   status    ok
+
+trace status --port 4001   # check a non-default port
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-p, --port PORT` | `4000` | Port to check |
+
+Queries the `/_trace/health` endpoint. Exits with code 1 if the proxy is not reachable.
+
+---
+
 ### `trace vacuum` -- compact the database
 
 Runs a WAL checkpoint and `VACUUM` to shrink the SQLite file on disk. Prints size before and after.
@@ -764,7 +790,7 @@ trace start --port 4000 \
 Startup output:
 
 ```
-trace v0.3.7  listening http://127.0.0.1:4000
+trace v0.3.8  listening http://127.0.0.1:4000
   upstream  https://api.openai.com
   routes    1 rule(s):
               /v1/messages -> https://api.anthropic.com
@@ -793,6 +819,38 @@ upstream = "https://api.anthropic.com"
 - Routes are checked in CLI order first, then config file order
 - Route path must start with `/`; upstream must use `http://` or `https://`
 - Routes cannot be set via a single env var -- use `--route` flags or `[[start.routes]]` in the config
+
+---
+
+## Embedded Query API
+
+Starting with v0.3.8, `trace start` serves read-only query endpoints under `/_trace/` on the proxy port. No separate process or direct SQLite access needed -- any HTTP client can query your call history while the proxy is running.
+
+Disable with `--no-api` or `TRACE_NO_API=1` if you only want the proxy.
+
+| Endpoint | Description |
+|---|---|
+| `GET /_trace/api/calls` | List calls with filters (`?model=`, `?provider=`, `?agent=`, `?tag=`, `?workflow=`, `?errors=true`, `?since=`, `?until=`) |
+| `GET /_trace/api/stats` | Aggregate statistics with model and provider breakdown |
+| `GET /_trace/api/call/:id` | Single call detail by UUID prefix |
+| `GET /_trace/api/search?q=` | FTS5 full-text search with BM25 ranking |
+| `GET /_trace/api/heatmap` | Daily cost/call aggregates for heatmap visualization |
+| `GET /_trace/api/agents` | Per-agent statistics |
+| `GET /_trace/api/workflows` | Workflow summaries list |
+| `GET /_trace/api/workflow/:id` | Workflow call timeline with cost totals |
+| `GET /_trace/stream` | Server-Sent Events for real-time call updates |
+| `GET /_trace/health` | JSON health check: `{"status":"ok","version":"...","uptime":...}` |
+
+All API responses include CORS headers, so browser-based tools can query the proxy directly.
+
+```bash
+# Examples
+curl http://localhost:4000/_trace/api/calls?model=gpt-4o&since=2026-02-20
+curl http://localhost:4000/_trace/api/stats
+curl http://localhost:4000/_trace/api/search?q=timeout
+curl http://localhost:4000/_trace/api/calls?tag=summarize-node
+curl http://localhost:4000/_trace/health
+```
 
 ---
 
@@ -982,6 +1040,7 @@ Unknown models fall back to $1.00/$3.00 per million tokens input/output. Use `tr
 | CI cost gate | Yes | No | No | No |
 | Prometheus / OTel | Yes | No | Partial | Partial |
 | Multi-agent tracking | Yes | No | Partial | Partial |
+| Embedded query API | Yes | No | No | No |
 | Setup time | ~30s | ~5 min | ~5 min | ~30 min |
 
 Helicone, LangSmith, and Langfuse are mature products. The tradeoff is that your prompts, completions, and call metadata leave your infrastructure. For teams with data residency requirements, SOC 2 audits in progress, or a preference for not sharing LLM I/O with a third party, OpenTrace is the alternative.
